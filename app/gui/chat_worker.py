@@ -258,8 +258,8 @@ class ChatWorker(QThread):
             project_env_nudges = 0
             project_plan_nudges = 0
             project_verify_nudges = 0
-            watchdog_nudges = 0      # 「还没做完就别收尾」的打回次数（最多 2 次）
-            judge_nudges = 0         # 用模型当裁判判断完成度的次数（最多 1 次）
+            watchdog_nudges = 0      # 「还没做完就别收尾」的打回次数（最多 4 次）
+            judge_nudges = 0         # 用模型当裁判判断完成度的次数（最多 2 次）
             env_checked = False          # 是否真的做过环境检查
             verified_after_write = False  # 写完代码后是否真的跑过一遍
             fail_counts = {}     # 调用签名 -> 连续失败次数（防死循环）
@@ -424,7 +424,7 @@ class ChatWorker(QThread):
                     gaps = agent_mod.completion_gaps(
                         last_user, tools_used, write_done, verified_after_write,
                         (self.plan.get("steps") or []), _final_preview)
-                    if gaps and watchdog_nudges < 2:
+                    if gaps and watchdog_nudges < 4:
                         watchdog_nudges += 1
                         self.api_messages.append({"role": "assistant", "content": text})
                         self.api_messages.append(
@@ -434,7 +434,7 @@ class ChatWorker(QThread):
                         continue
                     # J) 规则层看不出问题，但任务本身是"复杂任务"时，
                     #    再让模型自己当一次裁判（最多 1 次），避免"看起来做完了其实没做"。
-                    if (not gaps and judge_nudges < 1
+                    if (not gaps and judge_nudges < 2
                             and (agent_mod.needs_project_flow(last_user)
                                  or agent_mod.count_requests(last_user) >= 2)):
                         judge_nudges += 1

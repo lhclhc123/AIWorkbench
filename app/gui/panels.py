@@ -39,7 +39,10 @@ class PlanPanel(QFrame):
         self.hide_btn = QPushButton("隐藏")
         self.hide_btn.setObjectName("cardBtn")
         self.hide_btn.setFixedSize(48, 22)
-        self.hide_btn.clicked.connect(lambda: self.setVisible(False))
+        self.hide_btn.setToolTip(
+            "收起计划内容（只留这一条标题栏）。\n"
+            "收起后 AI 再更新计划也不会自动展开——你点「显示」才会展开。")
+        self.hide_btn.clicked.connect(self._toggle_body)
         head.addWidget(self.hide_btn)
         outer.addLayout(head)
         self.body = QTextBrowser()
@@ -51,6 +54,22 @@ class PlanPanel(QFrame):
         self.body.setMinimumHeight(30)
         outer.addWidget(self.body)
         self.setVisible(False)
+        # 用户手动收起过就不要再自动弹开（用户反馈：点一次隐藏后它老自己冒出来）
+        self._collapsed = False
+        self._last_plan = None
+
+    def _toggle_body(self):
+        self._collapsed = not self._collapsed
+        self._apply_collapsed()
+
+    def _apply_collapsed(self):
+        self.hide_btn.setText("显示" if self._collapsed else "隐藏")
+        self.body.setVisible(not self._collapsed)
+        if self._collapsed:
+            self.setFixedHeight(40)
+        elif self._last_plan is not None:
+            # 展开时按上次内容恢复高度
+            self.set_plan(self._last_plan, force=True)
 
     def refresh_theme(self):
         t = themes.tokens()
@@ -62,10 +81,17 @@ class PlanPanel(QFrame):
         self.progress.setStyleSheet(
             f"color:{t['text_muted']};font-size:11px;background:transparent;")
 
-    def set_plan(self, plan):
+    def set_plan(self, plan, force=False):
         steps = (plan or {}).get("steps") or []
         if not steps:
+            self._last_plan = None
             self.setVisible(False)
+            return
+        self._last_plan = plan
+        # 用户收起过就别自动展开（force=True 表示用户主动点「显示」）
+        if self._collapsed and not force:
+            self.setVisible(True)
+            self.setFixedHeight(40)
             return
         t = themes.tokens()
         done, total, pct = plan_mod.progress(plan)

@@ -48,8 +48,17 @@ class SettingsDialog(QDialog):
         self.search.setChecked(settings.get("enable_search", False))
         self.agent = QCheckBox("默认开启 Agent 模式（允许 AI 操作工作区文件/命令）")
         self.agent.setChecked(settings.get("agent_mode", True))
+        self.confirm_cmd = QCheckBox(
+            "执行命令 / 删除 / 结束进程前先问我（取消勾选 = 全部自动放行，"
+            "危险命令仍会被拦截）")
+        self.confirm_cmd.setChecked(settings.get("confirm_commands", True))
+        self.confirm_cmd.setToolTip(
+            "AI 每跑一条命令就弹一次确认框会很烦。\n"
+            "只读命令（查版本、列目录等）本来就不会弹框；\n"
+            "这里取消勾选后，其余命令也不再弹框，直接执行。")
         layout.addWidget(self.search)
         layout.addWidget(self.agent)
+        layout.addWidget(self.confirm_cmd)
 
         layout.addWidget(QLabel("API 密钥（仅保存在本工作区 settings.json，不会上传）："))
         self.keys = {}
@@ -78,6 +87,7 @@ class SettingsDialog(QDialog):
         s["selected_model"] = self.model.currentData()
         s["enable_search"] = self.search.isChecked()
         s["agent_mode"] = self.agent.isChecked()
+        s["confirm_commands"] = self.confirm_cmd.isChecked()
         s["theme"] = self.theme.currentData() or "light"
         keys = dict(s.get("api_keys", {}))
         for name, le in self.keys.items():

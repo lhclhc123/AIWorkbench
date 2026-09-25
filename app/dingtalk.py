@@ -661,8 +661,30 @@ class DingTalkClient:
             f"群会话 ID：{conv[:14]}…" if conv else
             "没填 openConversationId（要往群里发消息就填它）")
 
-        # 7) 平台边界说明（不重要但必须讲清楚）
-        add("7. 读取个人聊天会话列表", False,
+        # 7) Stream 长连接（收消息）——用户最容易"看着像连不上"的一项，
+        #    这里把真实状态和常见原因说清楚，别让用户自己猜。
+        if not (cid and sec):
+            add("7. Stream 长连接（收消息）", False,
+                "没填 AppKey/AppSecret，Stream 起不来。"
+                "到「钉钉开放平台 → 应用 → 机器人」确认已创建并开启了"
+                "「Stream 模式」的机器人。")
+        elif self._stream_running:
+            add("7. Stream 长连接（收消息）", True,
+                "已连接（正在监听机器人收到的消息）")
+        else:
+            try:
+                import dingtalk_stream  # noqa: F401
+                add("7. Stream 长连接（收消息）", False,
+                    "当前**没在运行**。到集成页勾选「接收消息」后点"
+                    "「连接/断开 Stream」，或重启本程序（启动时会自动连）。\n"
+                    "若点了还是连不上，多半是：① 应用没开「机器人」能力的 Stream 模式；"
+                    "② 版本是旧 exe（请换成 dist_v9\\AIWorkbench\\AIWorkbench.exe）。")
+            except Exception:
+                add("7. Stream 长连接（收消息）", False,
+                    "缺少 dingtalk_stream 依赖（程序打包异常，请重新下载最新版）")
+
+        # 8) 平台边界说明（不重要但必须讲清楚）
+        add("8. 读取个人聊天会话列表", False,
             "钉钉开放平台**不提供**读取个人聊天记录/会话列表的接口（这是平台限制）。"
             "能拿到的是：机器人收发的消息（Stream 长连接）、通讯录、群信息。")
 

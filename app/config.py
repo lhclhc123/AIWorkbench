@@ -180,7 +180,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4v", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 16
+PROMPT_VERSION = 17
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (

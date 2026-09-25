@@ -811,8 +811,13 @@ def faked_tool_result(text):
 # 工具结果回喂后附的话：只要求"基于真实结果直接回答"，
 # 不再复述一堆格式纪律（实测会把模型带偏去评论指令本身，而不是回答用户）
 ANSWER_NOW_HINT = (
-    "以上是工具执行后回传的真实结果。请直接基于这些结果回答用户的问题；\n"
-    "数据已经够了就不要再调用工具。绝对不要编造结果，也不要评论这些说明文字。"
+    "以上是工具执行后回传的真实结果，可以继续用它们干活。\n"
+    "判断标准只有一条：**用户交代的事到底做完了没有**。\n"
+    "  · 还没做完 -> 继续调用工具（换方法、换路径也要做），不要急着回答；\n"
+    "  · 确实做完了 -> 再给最终答复，并写清产出在哪、怎么用。\n"
+    "绝对不要编造结果，也不要评论这些说明文字。\n"
+    "注意：不要因为「已经调用过几次工具」就收工，那是偷懒；"
+    "没做完就停下来等于没做。"
 )
 
 # 模型不去答问题，反而对着系统说明"表态"——必须打回
@@ -1200,6 +1205,39 @@ _SYSTEM_WRITE_GUARD = [
 ]
 _PROG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""),
                          "Programs", "WorkBuddy")
+
+
+# ---------------------------------------------------------------------------
+# 只读命令白名单：这类命令不改任何东西，不该每次都弹确认框打扰用户。
+# （用户反馈"不管执行什么命令都弹一堆小窗口"，其中一多半就是查版本/列目录）
+# ---------------------------------------------------------------------------
+_READONLY_CMD_PATTERNS = [
+    r"^\s*python\s+(-V|--version|-c\s+[\"']?import\b)",
+    r"^\s*python3?\s+-m\s+pip\s+(list|show|freeze)\b",
+    r"^\s*pip\s+(list|show|freeze)\b",
+    r"^\s*(dir|ls|echo|type|cat|where|which|ver|whoami|hostname)\b",
+    r"^\s*git\s+(status|log|diff|branch|show|remote\s+-v)\b",
+    r"^\s*tasklist\b",
+    r"^\s*(systeminfo|ipconfig)\s*/all\b",
+]
+# 只要带了这些"会改东西/会串命令"的符号，就一律不算只读，必须问
+_NOT_READONLY_TOKENS = (">", ">>", "|", "&", "&&", "del ", "rm ", "format",
+                        "shutdown", "taskkill", "move ", "copy ", "ren ")
+
+
+def is_readonly_command(cmd):
+    """这条命令是不是"只看看不动手"——是就不用弹确认框。"""
+    c = (cmd or "").strip()
+    if not c:
+        return False
+    low = c.lower()
+    for t in _NOT_READONLY_TOKENS:
+        if t in low:
+            return False
+    for pat in _READONLY_CMD_PATTERNS:
+        if re.match(pat, low, re.IGNORECASE):
+            return True
+    return False
 
 
 def _is_system_path(path):

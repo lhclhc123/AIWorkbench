@@ -44,6 +44,9 @@ RADIUS_CARD = 12
 # 自动化测试（离屏）时不要弹模态框，否则会一直等人点确定。
 _NO_MODAL = bool(os.environ.get("AIWORKBENCH_TEST"))
 
+# 只读命令（查版本、列目录、看 git 状态…）不弹确认框，直接放行。
+_is_readonly_command = agent_mod.is_readonly_command
+
 
 class TitleWorker(QThread):
     """后台用免费模型给对话生成简短标题。"""
@@ -1485,9 +1488,38 @@ class MainWindow(QMainWindow):
                                             on_log=self._dingtalk_log)
             self.page_integrations.set_dingtalk_status(("✅ " if ok else "❌ ") + msg)
             if ok:
-                QTimer.singleShot(2500, lambda: self.page_integrations.set_dingtalk_status(
-                    "Stream 状态：" + ("已连接" if self.ding._stream_running else "连接中…")))
+                # 连接是异步的：别只等 2.5 秒就下结论（以前会一直显示"连接中…"，
+                # 用户看起来就像"连不上"）。这里持续刷新 12 次 × 2 秒，
+                # 直到真的连上或超时，并把最后一条日志也显示出来。
+                self._dt_tick = {"n": 0}
+
+                def tick():
+                    d = getattr(self, "_dt_tick", None)
+                    if not d:
+                        return
+                    d["n"] += 1
+                    live = bool(getattr(self.ding, "_stream_running", False))
+                    tail = (self._dt_last_log or "").strip()
+                    if live:
+                        self.page_integrations.set_dingtalk_status(
+                            "✅ Stream 已连接，正在接收机器人消息")
+                        self._dt_tick = None
+                        return
+                    if d["n"] >= 12:
+                        self.page_integrations.set_dingtalk_status(
+                            "❌ Stream 连不上（已等 24 秒）。\n"
+                            "看下面日志最后一行；常见原因是应用没开机器人的 Stream 模式。"
+                            + (("\n最后一条日志：" + tail) if tail else ""))
+                        self._dt_tick = None
+                        return
+                    self.page_integrations.set_dingtalk_status(
+                        f"⏳ Stream 连接中…（{d['n'] * 2}s）"
+                        + ((" · " + tail) if tail else ""))
+                    QTimer.singleShot(2000, tick)
+
+                QTimer.singleShot(2000, tick)
         else:
+            self._dt_tick = None
             self.ding.stop_stream()
             self.page_integrations.set_dingtalk_status("Stream 已断开。")
 
@@ -1497,6 +1529,10 @@ class MainWindow(QMainWindow):
             self.ding.start_stream(self._dingtalk_on_message, on_log=self._dingtalk_log)
 
     def _dingtalk_log(self, msg):
+        try:
+            self._dt_last_log = str(msg)[:160]
+        except Exception:
+            self._dt_last_log = ""
         try:
             self.statusBar().showMessage("钉钉：" + str(msg)[:110], 6000)
         except Exception:
@@ -1895,7 +1931,16 @@ class MainWindow(QMainWindow):
         return "\n\n".join(p for p in parts if p)
 
     def _on_plan_changed(self, plan):
+        # 计划面板显隐/变高会改变聊天区可视高度，Qt 会把滚动位置重置到顶部
+        # （用户反馈："一弹出来对话就自动蹦到最顶端"）。这里先记住位置再还原。
+        sb = self.chat_scroll.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 40
+        old = sb.value()
         self.plan_panel.set_plan(plan)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(old, max(sb.maximum(), 0)))
         if self.conv is not None:
             self.conv["plan"] = plan
             try:
@@ -2032,19 +2077,38 @@ class MainWindow(QMainWindow):
         self._render()
 
     def _on_confirm(self, cmd):
+        # ① 设置里关掉了确认 -> 直接放行（危险命令在 agent 层已被拦截）
+        if not self.settings.get("confirm_commands", True):
+            self.worker.confirm(True)
+            return
+        # ② 只读命令不问：查版本、列目录、看状态这类，每问一次都是打扰
+        if _is_readonly_command(cmd):
+            self.worker.confirm(True)
+            return
+        # ③ 本次会话已经点过"全部允许"
+        if getattr(self, "_confirm_all_session", False):
+            self.worker.confirm(True)
+            return
+
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("确认执行操作")
         box.setText("AI 请求在你的电脑上执行以下操作：")
         box.setInformativeText(cmd)
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setDefaultButton(QMessageBox.StandardButton.No)
+        yes = box.addButton("允许", QMessageBox.ButtonRole.YesRole)
+        allb = box.addButton("本次会话全部允许", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("拒绝", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(yes)
+        box.setEscapeButton(QMessageBox.StandardButton.Cancel)
         box.setWindowFlags(box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
         box.adjustSize()
         center = self.geometry().center()
         box.move(center.x() - box.width() // 2, center.y() - box.height() // 2)
-        ok = box.exec() == QMessageBox.StandardButton.Yes
-        self.worker.confirm(ok)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is allb:
+            self._confirm_all_session = True
+        self.worker.confirm(clicked in (yes, allb))
 
     # ================= 消息级操作 =================
     def _regenerate(self):
