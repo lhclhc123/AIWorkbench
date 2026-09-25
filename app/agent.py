@@ -1225,6 +1225,28 @@ _NOT_READONLY_TOKENS = (">", ">>", "|", "&", "&&", "del ", "rm ", "format",
                         "shutdown", "taskkill", "move ", "copy ", "ren ")
 
 
+# ---------------------------------------------------------------------------
+# 会「新开一个窗口」的命令：这类命令才是用户看到的"啪一下冒出来、不到一秒又消失"。
+# 默认拦掉并告诉 AI 该用什么替代（它拿不到输出，开了也没意义）。
+# ---------------------------------------------------------------------------
+_WINDOW_SPAWN_PATTERNS = [
+    (r"(^|[\s&|])start\s+(?!/[bB])", "start（会另起一个窗口运行）"),
+    (r"cmd(\.exe)?\s+/k", "cmd /k（会打开一个常驻的命令行窗口）"),
+    (r"(^|\s|&)explorer(\.exe)?\s", "explorer（会打开资源管理器窗口）"),
+    (r"(^|\s|&)notepad(\.exe)?\s", "notepad（会打开记事本窗口）"),
+    (r"(^|\s|&)msiexec\s", "msiexec（会弹出安装界面）"),
+]
+
+
+def window_spawning(cmd):
+    """返回这条命令会新开窗口的原因，不开窗则返回空字符串。"""
+    c = (cmd or "")
+    for pat, why in _WINDOW_SPAWN_PATTERNS:
+        if re.search(pat, c, re.IGNORECASE):
+            return why
+    return ""
+
+
 def is_readonly_command(cmd):
     """这条命令是不是"只看看不动手"——是就不用弹确认框。"""
     c = (cmd or "").strip()
@@ -2060,6 +2082,17 @@ class AgentRunner:
                     return "[错误] 命令为空"
                 if _is_dangerous(cmd):
                     return "[拒绝] 该命令过于危险，已被拦截（删除/格式化/关机等）。"
+                # 会新开窗口的命令一律拦掉：这类命令才是"啪一下冒个窗口又消失"的元凶
+                # （start / cmd /k / explorer 都会另起一个可见窗口，而且往往瞬间退出）
+                _wn = window_spawning(cmd)
+                _st = getattr(self, "settings", None) or {}
+                if _wn and _st.get("block_new_windows", True):
+                    return ("[拒绝] 这条命令会新开一个窗口："
+                            f"{_wn}\n"
+                            "新开的窗口你看不清就消失了，也拿不到输出。请改成：\n"
+                            "· 要运行脚本 -> 直接用 run_python，或 `python xxx.py`\n"
+                            "· 要打开文件/文件夹 -> 用 open_path 工具\n"
+                            "· 确实要弹窗口 -> 让用户在设置里关掉「禁止弹出新窗口」")
                 if confirm_cb is not None:
                     if not confirm_cb(cmd):
                         return "[取消] 用户拒绝执行该命令。"

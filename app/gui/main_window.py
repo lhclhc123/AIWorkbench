@@ -604,7 +604,7 @@ class MainWindow(QMainWindow):
 
     # ================= 工作区 =================
     def _make_runner(self):
-        return agent_mod.AgentRunner(
+        r = agent_mod.AgentRunner(
             self.workspace.files_dir,
             vision_cb=self._vision,
             workspace_path=self.workspace.path,
@@ -617,6 +617,9 @@ class MainWindow(QMainWindow):
             reminder_cb=self._add_reminder,
             subagent_cb=self._run_subagent,
             keys=self.settings.get("api_keys", {}))
+        # 让工具层也能读到设置（比如「禁止弹出新窗口」开关）
+        r.settings = self.settings
+        return r
 
     # ================= 工作总结 + 自动记忆（每轮结束都会跑） =================
     def _on_wrapup(self, data):

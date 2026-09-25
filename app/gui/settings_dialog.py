@@ -59,6 +59,13 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.search)
         layout.addWidget(self.agent)
         layout.addWidget(self.confirm_cmd)
+        self.block_win = QCheckBox(
+            "禁止 AI 弹出新窗口（拦掉 start / cmd /k / explorer / 记事本 这类命令）")
+        self.block_win.setChecked(settings.get("block_new_windows", True))
+        self.block_win.setToolTip(
+            "这类命令会另起一个可见窗口，往往一闪就消失、也拿不到输出。\n"
+            "默认拦掉；真需要弹窗口再取消勾选。")
+        layout.addWidget(self.block_win)
 
         layout.addWidget(QLabel("API 密钥（仅保存在本工作区 settings.json，不会上传）："))
         self.keys = {}
@@ -88,6 +95,7 @@ class SettingsDialog(QDialog):
         s["enable_search"] = self.search.isChecked()
         s["agent_mode"] = self.agent.isChecked()
         s["confirm_commands"] = self.confirm_cmd.isChecked()
+        s["block_new_windows"] = self.block_win.isChecked()
         s["theme"] = self.theme.currentData() or "light"
         keys = dict(s.get("api_keys", {}))
         for name, le in self.keys.items():
