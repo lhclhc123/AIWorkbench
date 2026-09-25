@@ -92,6 +92,10 @@ class MainWindow(QMainWindow):
     _dingtalk_dws_log = pyqtSignal(str)
     _dingtalk_dws_convs = pyqtSignal(list)
     _dingtalk_dws_msgs = pyqtSignal(str, list)
+    # 自动更新：下载进度 / 完成(zip 路径) / 失败(原因)
+    _update_progress = pyqtSignal(int, int)
+    _update_done = pyqtSignal(str)
+    _update_fail = pyqtSignal(str)
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
@@ -381,6 +385,10 @@ class MainWindow(QMainWindow):
         self._dingtalk_dws_msgs.connect(self.page_integrations.show_dws_messages)
         self.page_integrations.update_check.connect(lambda: self._do_update_check(False))
         self.page_integrations.update_saved.connect(self._save_update_settings)
+        self.page_integrations.update_apply.connect(self._update_apply)
+        self._update_progress.connect(self._update_on_progress)
+        self._update_done.connect(self._update_on_done)
+        self._update_fail.connect(self._update_on_fail)
 
         self.page_settings = SettingsPage()
         self.stack.addWidget(self.page_settings)
@@ -1370,14 +1378,33 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     return f"[错误] 发送失败：{e}"
 
+        if act in ("send_file", "dws_send_file", "发文件", "发文件dws", "发送文件"):
+            target = str(args.get("target") or args.get("to") or "").strip()
+            path = str(args.get("path") or args.get("file") or "").strip()
+            if not target or not path:
+                return ("[错误] 需要 target（群名/姓名/openConversationId）和 "
+                        "path（要发送的本地文件完整路径）")
+            if not os.path.isabs(path):
+                cand = os.path.join(self.workspace.files_dir, path)
+                path = cand if os.path.isfile(cand) else os.path.abspath(path)
+            try:
+                name = self.ding.dws_send_file(target, path)
+                return (f"[成功] 文件「{name}」已直接发到钉钉会话「{target}」，"
+                        f"对方在钉钉里点开就能收到。完整路径：{path}")
+            except Exception as e:
+                return (f"[错误] 发文件失败：{e}\n"
+                        f"提示：文件必须真实存在；target 用 conversations 里查到的"
+                        f"群名/姓名/openConversationId。")
+
         if act in ("dws_login", "dws登录", "dws授权"):
             return ("登录需要在「集成 → 钉钉」点「用 dws 登录钉钉」按钮，"
-                    "由浏览器完成授权。请到那里操作。")
+                    "由浏览器完成授权（页面报错就改点「设备码登录」）。"
+                    "请到那里操作。")
 
         return ("[错误] 不认识的 action：" + act +
                 "。可用：status / selftest / contacts / send / work_notice / "
                 "group_send / group / whoami / conversations / messages / "
-                "dws_send / dws_status")
+                "dws_send / send_file / dws_status")
 
     def _save_dingtalk(self, cfg):
         self.settings["dingtalk"] = cfg
@@ -1817,16 +1844,143 @@ class MainWindow(QMainWindow):
         if silent:
             self.statusBar().clearMessage()
             if info.get("ok") and info.get("has_update"):
-                self._info(
+                if _NO_MODAL:
+                    self.statusBar().showMessage(
+                        f"发现新版本 {info.get('tag')}（当前 {ver.VERSION}）", 15000)
+                    return
+                r = QMessageBox.question(
+                    self, "发现新版本",
                     f"AI 工作台有新版本 {info.get('tag')}（当前 {ver.VERSION}）。\n\n"
-                    f"发布页：{info.get('html_url')}\n（可以到「关于」页看更新说明）",
-                    "发现新版本", 15000)
+                    f"要现在自动下载并安装吗？\n"
+                    f"（下载完成后本程序会退出、自动替换文件并重新启动）",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if r == QMessageBox.StandardButton.Yes:
+                    self._update_apply()
             return
         self._open_page("integrations")
         self.nav.select("integrations")
         self.statusBar().showMessage(
             ("有更新：" + str(info.get("tag"))) if info.get("has_update")
             else ("已是最新" if info.get("ok") else "检查更新失败（见集成页说明）"), 6000)
+
+    # ---------- 自动更新：下载 -> 解压 -> 换文件 -> 重启 ----------
+    def _update_apply(self):
+        """下载新版本压缩包并自动应用。UI 线程只管弹进度，下载在后台线程。"""
+        info = getattr(self, "_pending_update", None)
+        if not (info and info.get("ok") and info.get("has_update")):
+            self._info("当前没有待安装的更新。先点「立即检查更新」看看。", "自动更新")
+            return
+        asset = updater.pick_asset(info, prefer=(".zip", ".exe"))
+        if not asset:
+            self._info(f"这个 Release 没有附件，请到发布页手动下载：\n{info.get('html_url')}",
+                       "自动更新")
+            return
+        import tempfile as _tf
+        dest = os.path.join(_tf.gettempdir(), "AIWorkbench_update_" + asset["name"])
+        from PyQt6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog(f"正在下载 {asset['name']} …", "", 0, 100, self)
+        dlg.setWindowTitle("自动更新")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setCancelButton(None)
+        self._upd_dlg = dlg
+        mb = asset.get("size", 0) / 1048576
+        if mb:
+            dlg.setLabelText(f"正在下载 {asset['name']}（约 {mb:.1f} MB）…")
+        import threading
+
+        def worker():
+            try:
+                updater.download(asset["url"], dest,
+                                 progress=lambda d, t: self._update_progress.emit(d, t))
+                self._update_done.emit(dest)
+            except Exception as e:
+                self._update_fail.emit(f"{type(e).__name__}: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_on_progress(self, done, total):
+        dlg = getattr(self, "_upd_dlg", None)
+        if not dlg:
+            return
+        if total > 0:
+            dlg.setValue(min(99, int(done * 100 / total)))
+            dlg.setLabelText(f"正在下载更新… {done / 1048576:.1f} / {total / 1048576:.1f} MB")
+
+    def _update_on_fail(self, err):
+        dlg = getattr(self, "_upd_dlg", None)
+        if dlg:
+            dlg.close()
+            self._upd_dlg = None
+        self._info(f"更新下载失败：{err}\n\n可以到发布页手动下载安装：\n"
+                   f"https://github.com/{ver.GITHUB_REPO}/releases", "自动更新")
+
+    def _update_on_done(self, zip_path):
+        dlg = getattr(self, "_upd_dlg", None)
+        if dlg:
+            dlg.setValue(100)
+            dlg.close()
+            self._upd_dlg = None
+        try:
+            self._finish_update(zip_path)
+        except Exception as e:
+            self._info(f"应用更新失败：{e}\n\n请到发布页手动下载：\n"
+                       f"https://github.com/{ver.GITHUB_REPO}/releases", "自动更新")
+
+    def _finish_update(self, zip_path):
+        """解压新包，用 PowerShell 在本程序退出后覆盖安装目录并重启。
+
+        用 -EncodedCommand（UTF-16LE base64）传脚本，彻底避开中文路径在
+        bat/ps1 文件里的编码坑。"""
+        import sys as _sys
+        import zipfile as _zf
+        import tempfile as _tf
+        import base64 as _b64
+        app_dir = os.path.dirname(_sys.executable) if getattr(_sys, "frozen", False) \
+            else os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        tmp_root = os.path.join(_tf.gettempdir(), f"AIWorkbench_upd_{int(time.time())}")
+        with _zf.ZipFile(zip_path) as z:
+            z.extractall(tmp_root)
+        # 在解压结果里找「直接装着 AIWorkbench.exe 的那一层」
+        src = None
+        for root, _dirs, files in os.walk(tmp_root):
+            if any(f.lower() in ("aiworkbench.exe", "aiworkbench") for f in files):
+                src = root
+                break
+        if not src:
+            raise RuntimeError("压缩包里没找到 AIWorkbench.exe，无法自动安装")
+        src = src.replace("'", "''")
+        dst = app_dir.replace("'", "''")
+        exe = os.path.join(app_dir, "AIWorkbench.exe").replace("'", "''")
+        ps = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "Start-Sleep -Seconds 2\n"
+            "$ok = $false\n"
+            f"for ($i = 0; $i -lt 40; $i++) {{\n"
+            f"  try {{ Copy-Item -Path '{src}\\*' -Destination '{dst}' -Recurse -Force\n"
+            "      $ok = $true; break }\n"
+            "  catch { Start-Sleep -Milliseconds 500 }\n"
+            "}\n"
+            "if ($ok) {\n"
+            "  Start-Sleep -Milliseconds 800\n"
+            f"  Start-Process -FilePath '{exe}'\n"
+            "}\n"
+            f"Remove-Item -LiteralPath '{tmp_root}' -Recurse -Force -ErrorAction SilentlyContinue\n"
+            f"Remove-Item -LiteralPath '{zip_path}' -Force -ErrorAction SilentlyContinue\n"
+        )
+        encoded = _b64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        from .. import winproc
+        winproc.popen(["powershell", "-NoProfile", "-EncodedCommand", encoded],
+                      creationflags=0x08000000)
+        if _NO_MODAL:
+            self.statusBar().showMessage("更新包已就绪，退出后将自动替换并重启", 8000)
+            QApplication.quit()
+            return
+        QMessageBox.information(
+            self, "自动更新",
+            "更新包已下载并准备好。\n点「确定」后本程序会关闭，"
+            "几秒后自动替换文件并重新启动新版本。")
+        QApplication.quit()
 
     def _info(self, text, title="提示", ms=5000):
         """统一的信息提示：正常运行时是弹窗，自动化测试时只写状态栏（不阻塞）。"""

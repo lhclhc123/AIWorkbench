@@ -979,8 +979,9 @@ class DingTalkClient:
         node, dws = find_dws()
         return bool(dws)
 
-    def _run_dws(self, args, timeout=60, want_json=True):
-        """统一跑 dws 命令。want_json=True 时解析并返回 Python 对象。"""
+    def _run_dws(self, args, timeout=60, want_json=True, cwd=None):
+        """统一跑 dws 命令。want_json=True 时解析并返回 Python 对象。cwd 用于
+        发文件等场景（dws 的 --file 只接受其工作目录内的相对路径）。"""
         node, dws = find_dws()
         if not dws:
             raise DingTalkError(
@@ -991,6 +992,8 @@ class DingTalkClient:
         cmd = ([node, dws] if node else [dws]) + list(args)
         kw = dict(capture_output=True, text=True, encoding="utf-8",
                   errors="ignore", timeout=timeout)
+        if cwd:
+            kw["cwd"] = cwd
         if IS_WIN:
             kw["creationflags"] = 0x08000000
             kw["startupinfo"] = _hide_startup()
@@ -1113,6 +1116,39 @@ class DingTalkClient:
         """给自检用的：直接返回 dws 原始会话列表 JSON（含完整字段）。"""
         return self._run_dws(
             ["chat", "+conversation-list", "--page-size", str(n), "--format", "json"])
+
+    def dws_send_file(self, target, path):
+        """用 dws 以「我本人」身份把本地文件直接发到钉钉（群聊或单聊）。
+
+        走 `dws chat +messages-send --as user --msg-type file --file <相对路径>`，
+        dws 会自己完成媒体上传，对方在钉钉里收到的就是一条可直接打开的文件消息
+        （不是什么"点击下载"的假链接）。
+        target：群名 / 姓名 / openConversationId；先按群名解析，失败再按姓名解析。
+        返回实际发送的文件名。
+        """
+        path = os.path.abspath(str(path or "").strip())
+        if not os.path.isfile(path):
+            raise DingTalkError(f"文件不存在，没法发：{path}")
+        target = str(target or "").strip()
+        if not target:
+            raise DingTalkError("需要 target（群名 / 姓名 / openConversationId）")
+        d = os.path.dirname(path)
+        fname = os.path.basename(path)
+        base = ["chat", "+messages-send", "--as", "user",
+                "--msg-type", "file", "--file", fname]
+        if target.startswith("cid"):
+            attempts = [["--group", target]]
+        else:
+            # --chat-query 按群名解析；--user-query 按姓名解析单聊
+            attempts = [["--chat-query", target], ["--user-query", target]]
+        last = None
+        for extra in attempts:
+            try:
+                self._run_dws(base + extra, timeout=300, cwd=d)
+                return fname
+            except DingTalkError as e:
+                last = e
+        raise last or DingTalkError("发送失败")
 
 
 def config_from_settings(settings):

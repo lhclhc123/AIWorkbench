@@ -13,6 +13,8 @@
 import os
 import subprocess
 import sys
+import tempfile
+import time
 
 IS_WIN = sys.platform == "win32"
 
@@ -101,11 +103,29 @@ def no_window_kwargs():
     return kw
 
 
+def _log_spawn(args, kw):
+    """把每次子进程生成记到 %TEMP%/aiworkbench_spawns.log。
+    用途：用户反馈「闪窗」时，能对着日志定位到底是哪条命令、
+    当时挂没挂上隐藏控制台、用了什么 flags。失败静默（绝不能影响功能）。"""
+    try:
+        cmd = args if isinstance(args, str) else " ".join(map(str, args))
+        line = (f"{time.strftime('%m-%d %H:%M:%S')} "
+                f"console={_has_console()} hidden={_console_ready} "
+                f"flags={kw.get('creationflags', 0) & 0xFFFFFFFF:#x} "
+                f"shell={bool(kw.get('shell'))} :: {cmd}")
+        with open(os.path.join(tempfile.gettempdir(), "aiworkbench_spawns.log"),
+                  "a", encoding="utf-8", errors="ignore") as f:
+            f.write(line[:400] + "\n")
+    except Exception:
+        pass
+
+
 def run(args, **kw):
     """等价 subprocess.run，但不弹窗。调用方显式传的 kw 优先级更高。"""
     ensure_hidden_console()
     merged = no_window_kwargs()
     merged.update(kw)
+    _log_spawn(args, merged)
     return subprocess.run(args, **merged)
 
 
@@ -114,4 +134,5 @@ def popen(args, **kw):
     ensure_hidden_console()
     merged = no_window_kwargs()
     merged.update(kw)
+    _log_spawn(args, merged)
     return subprocess.Popen(args, **merged)

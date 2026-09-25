@@ -449,6 +449,7 @@ class IntegrationPage(QWidget):
     dingtalk_dws_messages = pyqtSignal(str)        # openConversationId
     dingtalk_dws_send = pyqtSignal(str, str)       # target(群名/姓名/cid), content
     update_check = pyqtSignal()
+    update_apply = pyqtSignal()      # 下载并自动安装待安装的更新
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -652,6 +653,12 @@ class IntegrationPage(QWidget):
         self.dt_dws_log.setWordWrap(True)
         self.dt_dws_log.setObjectName("PageSub")
         f5.addWidget(self.dt_dws_log)
+        hint5 = QLabel("💡 如果浏览器授权页面一直显示「出错」或打不开（本机代理/安全软件"
+                       "拦截了本地回调），请改点上面的「🔑 设备码登录」——它会给你一个"
+                       "链接和一串码，在任意浏览器里打开输入即可，不走本地回调。")
+        hint5.setWordWrap(True)
+        hint5.setObjectName("PageSub")
+        f5.addWidget(hint5)
 
         self.dt_dws_list = QListWidget()
         self.dt_dws_list.setMinimumHeight(140)
@@ -895,8 +902,12 @@ class IntegrationPage(QWidget):
         save.clicked.connect(self._save_update)
         check = QPushButton("立即检查更新")
         check.clicked.connect(self.update_check.emit)
+        apply_btn = QPushButton("⬇️ 下载并自动安装更新")
+        apply_btn.setToolTip("检查到新版本后点这个：自动下载 → 退出 → 替换文件 → 重启新版本")
+        apply_btn.clicked.connect(self.update_apply.emit)
         row.addWidget(save)
         row.addWidget(check)
+        row.addWidget(apply_btn)
         row.addStretch(1)
         v.addLayout(row)
 

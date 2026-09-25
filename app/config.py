@@ -180,7 +180,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4v", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 18
+PROMPT_VERSION = 19
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -270,7 +270,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "- file_op：文件操作，参数 op（copy/move/rename/delete）、src、dst（copy/move/rename 必填）。\n"
     "  删除会移入回收站并要求用户确认；目标已存在时会被拒绝以免覆盖。\n"
     "- open_path：用系统默认程序打开文件或文件夹，参数 path。\n"
-    "- run_command：执行 shell 命令，参数 command（会请用户确认）。\n"
+    "- run_command：执行 shell 命令，参数 command（会请用户确认）、可选 timeout（秒，\n"
+    "  5~600）。**PyInstaller 打包、批量下载这类长命令必须带 timeout=600**，\n"
+    "  否则 60 秒就会被掐断。\n"
     "\n"
     "【文档生成（重点能力）】\n"
     "- create_document：把 **Markdown 正文**写成真正的 Word / Excel / PPT / PDF 文件。\n"
@@ -368,6 +370,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "                    可选 limit。这是通过内置的 dws 工作台 CLI（你本人 OAuth 授权）做到的，**不需要企业应用**。\n"
     "  · messages     —— 读某个会话的消息，参数 open_conversation_id（必填，先用 conversations 取）；可选 limit。\n"
     "  · dws_send     —— 发消息，参数 target（群名 / 姓名 / openConversationId）、text（必填）。\n"
+    "  · send_file    —— **把本地文件直接发到钉钉**（群聊/单聊），参数 target（群名/姓名/cid）、\n"
+    "                    path（文件完整路径）。对方收到的是能直接打开的文件消息。\n"
+    "                    【铁律】用户要「把 XX 文件发给我/发到钉钉」时必须用 send_file；\n"
+    "                    绝不发「[下载链接]」「点击下载」这类没有真实链接的占位文本；\n"
+    "                    文件还没生成就先真正生成，绝不能谎称已生成。\n"
     "  · dws_status   —— 看 dws（个人授权）是否已登录。\n"
     "  **关于读取会话列表（重要，别再答错）**：钉钉开放平台的「服务端 API（企业应用）」确实不提供\n"
     "  读取个人聊天/会话列表的接口；但本程序内置的 dws 工作台 CLI 走「你本人授权登录」，\n"
@@ -437,6 +444,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "- 命令执行、删除文件、结束进程会请用户确认；格式化/关机等危险命令会被系统直接拒绝，不要尝试绕过。\n"
     "- 任务全部完成后，用一段话总结：做了什么、改了哪些文件（给出完整路径）、结果在哪、怎么验证。\n"
     "- 工具返回 [错误] 时**绝不允许编造结果**，如实说明失败原因并给出下一步建议。\n"
+    "- **【最高禁令】绝不允许伪造工具结果**：不许在回复里自己写「[成功] …」「已确认落盘」\n"
+    "  这类看起来像工具返回的文字——那不是真的。文件/程序是否生成，只以**工具真实返回**为准；\n"
+    "  没看到 [成功] 就是没成功，就老老实实告诉用户并继续做，绝不谎报「已完成」。\n"
+    "- 发钉钉时**绝不发送**「[下载链接]」「点击下载」「附件稍后补」这类占位文本；\n"
+    "  要发文件就用 dingtalk 工具的 action=send_file 直接把文件发过去。\n"
     "- 不需要工具时正常回答，绝对不要输出 tool_call 标签。\n"
     "\n"
     "# 三、开发项目 / 程序时的完整工作流（硬性，必须照做）\n"

@@ -2097,14 +2097,21 @@ class AgentRunner:
                     if not confirm_cb(cmd):
                         return "[取消] 用户拒绝执行该命令。"
                 try:
+                    try:
+                        to = float(args.get("timeout") or 60)
+                    except Exception:
+                        to = 60.0
+                    to = max(5, min(to, 600))   # 打包 exe 这类长命令可给到 10 分钟
                     proc = _winproc.run(cmd, shell=True, cwd=self.files_dir,
-                                        capture_output=True, timeout=60)
+                                        capture_output=True, timeout=to)
                     out = _decode(proc.stdout) + _decode(proc.stderr)
                     if len(out) > 8000:
                         out = out[:8000] + "\n...（输出已截断）"
-                    return f"命令：`{cmd}`\n退出码：{proc.returncode}\n输出：\n```\n{out}\n```"
+                    return (f"命令：`{cmd}`\n退出码：{proc.returncode}\n"
+                            f"超时上限：{int(to)} 秒\n输出：\n```\n{out}\n```")
                 except subprocess.TimeoutExpired:
-                    return "[错误] 命令执行超时（>60s）"
+                    return ("[错误] 命令执行超时。如果是 PyInstaller 打包这类长命令，"
+                            "请在 arguments 里带 timeout=600 再试一次。")
                 except Exception as e:
                     return f"[错误] 命令执行失败：{e}"
 
