@@ -83,7 +83,19 @@ def selftest():
                          folders, worklog)                              # noqa
         from app.gui import (main_window, chat_worker, panels,           # noqa
                              widgets, pages, voice_bar)
-        return "应用模块（v9.2 共 26 个）全部导入成功"
+        from app import version as _v
+        return f"应用模块（v{_v.VERSION} 共 26 个）全部导入成功"
+
+    def _seed_keys():
+        """内置种子密钥有没有随包带上（决定首次启动能不能直接用免费模型）。"""
+        from app import config
+        got = {k: v for k, v in (config.DEFAULT_API_KEYS or {}).items() if v}
+        if not got:
+            # 不算失败（用户可以自己填 Key），但必须说清楚
+            return ("未内置（仓库版不含密钥密文）"
+                    "——首次启动请在设置里填自己的 Key，"
+                    "或用 tools/gen_keyblobs.py 生成本地密文")
+        return "内置 " + ", ".join(sorted(got))
 
     def _security():
         from app import security as sec, config
@@ -297,6 +309,7 @@ def selftest():
 
     chk("第三方依赖", _versions)
     chk("应用模块导入", _app_modules)
+    chk("内置种子密钥", _seed_keys)
     chk("密钥保护（混淆/封装/DPAPI）", _security)
     chk("语音识别 + 语音合成", _asr_tts)
     chk("钉钉 + 自动更新", _dingtalk_updater)
