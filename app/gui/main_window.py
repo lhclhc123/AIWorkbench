@@ -88,6 +88,10 @@ class MainWindow(QMainWindow):
     _dingtalk_probe_ready = pyqtSignal(list)
     _dingtalk_contacts_ready = pyqtSignal(str, list)
     _dingtalk_login_done = pyqtSignal(object, str, dict)
+    # dws 工作台 CLI（个人授权，能读会话列表/消息）
+    _dingtalk_dws_log = pyqtSignal(str)
+    _dingtalk_dws_convs = pyqtSignal(list)
+    _dingtalk_dws_msgs = pyqtSignal(str, list)
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
@@ -368,6 +372,13 @@ class MainWindow(QMainWindow):
         self._dingtalk_probe_ready.connect(self._on_dingtalk_selftest)
         self._dingtalk_contacts_ready.connect(self._on_dingtalk_contacts)
         self._dingtalk_login_done.connect(self._on_dingtalk_login_done)
+        self.page_integrations.dingtalk_dws_login.connect(self._dingtalk_dws_login)
+        self.page_integrations.dingtalk_dws_conversations.connect(self._dingtalk_dws_conversations)
+        self.page_integrations.dingtalk_dws_messages.connect(self._dingtalk_dws_messages)
+        self.page_integrations.dingtalk_dws_send.connect(self._dingtalk_dws_send)
+        self._dingtalk_dws_log.connect(self.page_integrations.show_dws_login_log)
+        self._dingtalk_dws_convs.connect(self.page_integrations.show_dws_conversations)
+        self._dingtalk_dws_msgs.connect(self.page_integrations.show_dws_messages)
         self.page_integrations.update_check.connect(lambda: self._do_update_check(False))
         self.page_integrations.update_saved.connect(self._save_update_settings)
 
@@ -1307,9 +1318,66 @@ class MainWindow(QMainWindow):
             return ("还没做过扫码授权登录。可以到「集成 → 钉钉 → 扫码授权登录」"
                     "点一下，用浏览器扫码。")
 
+        # ---- dws 工作台 CLI（个人授权，能读会话列表/消息，群聊+单聊）----
+        if act in ("dws_status", "dws状态"):
+            st = self.ding.dws_auth_status()
+            if st.get("authenticated"):
+                return f"dws 已登录：{st.get('user_name')} @ {st.get('corp_name')}"
+            return "dws 未登录（可走「集成 → 钉钉 → 用 dws 登录钉钉」授权）。"
+
+        if act in ("conversations", "会话列表", "list_conversations", "我的会话"):
+            if not self.ding.dws_available():
+                return ("没找到 dws（钉钉工作台 CLI）。它随 WorkBuddy 自带，"
+                        "或 npm i -g dingtalk-workspace-cli。")
+            st = self.ding.dws_auth_status()
+            if not st.get("authenticated"):
+                return ("dws 还没登录。请到「集成 → 钉钉」点「用 dws 登录钉钉」完成授权，"
+                        "之后就能列出并读取你的会话列表（群聊+单聊）。")
+            try:
+                convs = self.ding.dws_list_conversations(int(args.get("limit") or 20))
+            except Exception as e:
+                return f"[错误] 读会话列表失败：{e}"
+            if not convs:
+                return "没有会话，或登录后缺少 chat 业务权限。"
+            return "我的钉钉会话列表：\n" + "\n".join(
+                f"· {n}（openConversationId={c}）" for n, c in convs)
+
+        if act in ("messages", "读消息", "read_messages", "消息"):
+            cid = str(args.get("open_conversation_id") or args.get("cid") or "").strip()
+            if not cid:
+                return "[错误] 需要 open_conversation_id（先用 conversations 列出）"
+            try:
+                msgs = self.ding.dws_read_messages(cid, int(args.get("limit") or 20))
+            except Exception as e:
+                return f"[错误] 读消息失败：{e}"
+            if not msgs:
+                return "这个会话没有可读到消息（可能没权限）。"
+            return "最近消息：\n" + "\n".join(
+                f"[{t}] {s}：{x}" for s, x, t in msgs)
+
+        if act in ("dws_send", "dws_dm", "dws发送", "发消息dws"):
+            target = str(args.get("target") or args.get("to") or "").strip()
+            text = str(args.get("text") or args.get("content") or "").strip()
+            if not target or not text:
+                return "[错误] 需要 target（群名/姓名/openConversationId）和 text"
+            try:
+                self.ding.dws_send_group(target, text)
+                return f"[成功] 已发到会话「{target}」"
+            except Exception:
+                try:
+                    self.ding.dws_dm(target, text)
+                    return f"[成功] 已作为单聊发给「{target}」"
+                except Exception as e:
+                    return f"[错误] 发送失败：{e}"
+
+        if act in ("dws_login", "dws登录", "dws授权"):
+            return ("登录需要在「集成 → 钉钉」点「用 dws 登录钉钉」按钮，"
+                    "由浏览器完成授权。请到那里操作。")
+
         return ("[错误] 不认识的 action：" + act +
                 "。可用：status / selftest / contacts / send / work_notice / "
-                "group_send / group / whoami")
+                "group_send / group / whoami / conversations / messages / "
+                "dws_send / dws_status")
 
     def _save_dingtalk(self, cfg):
         self.settings["dingtalk"] = cfg
@@ -1483,6 +1551,97 @@ class MainWindow(QMainWindow):
             pi.set_dingtalk_status(f"✅ 已发到群（{r.get('target')}）")
         except Exception as e:
             pi.set_dingtalk_status(f"❌ 发群失败：{e}")
+
+    # ---------------- dws 工作台 CLI（个人授权，能读会话列表/消息） ----------------
+    def _dingtalk_dws_login(self, device):
+        pi = self.page_integrations
+        if not self.ding.dws_available():
+            pi.show_dws_login_log("没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
+                                  "或自行 npm i -g dingtalk-workspace-cli。")
+            return
+        st = self.ding.dws_auth_status()
+        if st.get("authenticated"):
+            pi.show_dws_login_log(
+                f"dws 已经登录过：{st.get('user_name')} @ {st.get('corp_name')}。"
+                "可继续用；要换账号请先在系统里退出 dws。")
+        try:
+            p = self.ding.dws_login_start(
+                device=bool(device),
+                on_line=lambda line: self._dingtalk_dws_log.emit(line))
+        except Exception as e:
+            pi.show_dws_login_log(f"发起登录失败：{e}")
+            return
+        pi.show_dws_login_log("已在后台启动 dws 授权登录，请在浏览器 / 钉钉里完成授权…")
+        import threading
+
+        def _watch():
+            try:
+                p.wait(timeout=600)
+            except Exception:
+                pass
+            try:
+                st2 = self.ding.dws_auth_status()
+                if st2.get("authenticated"):
+                    self._dingtalk_dws_log.emit(
+                        f"✅ 登录成功：{st2.get('user_name')} @ {st2.get('corp_name')}")
+                else:
+                    self._dingtalk_dws_log.emit("登录未完成 / 已超时，可重试。")
+            except Exception as e:
+                self._dingtalk_dws_log.emit(f"查询登录状态失败：{e}")
+        threading.Thread(target=_watch, daemon=True).start()
+
+    def _dingtalk_dws_conversations(self):
+        pi = self.page_integrations
+        if not self.ding.dws_available():
+            pi.show_dws_login_log("没找到 dws，无法读取会话列表。")
+            return
+        st = self.ding.dws_auth_status()
+        if not st.get("authenticated"):
+            pi.show_dws_login_log("dws 还没登录，请先点「用 dws 登录钉钉」。")
+            return
+        import threading
+
+        def worker():
+            try:
+                convs = self.ding.dws_list_conversations(30)
+            except Exception as e:
+                self._dingtalk_dws_convs.emit([])
+                self._dingtalk_dws_log.emit(f"读会话列表失败：{e}")
+                return
+            self._dingtalk_dws_convs.emit(convs)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dingtalk_dws_messages(self, cid):
+        if not cid:
+            return
+        import threading
+
+        def worker():
+            try:
+                msgs = self.ding.dws_read_messages(cid, 30)
+            except Exception as e:
+                self._dingtalk_dws_msgs.emit(cid, [])
+                self._dingtalk_dws_log.emit(f"读消息失败：{e}")
+                return
+            self._dingtalk_dws_msgs.emit(cid, msgs)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _dingtalk_dws_send(self, target, content):
+        if not target or not content:
+            return
+        import threading
+
+        def worker():
+            try:
+                self.ding.dws_send_group(target, content)
+                self._dingtalk_dws_log.emit(f"✅ 已发到会话「{target}」")
+            except Exception:
+                try:
+                    self.ding.dws_dm(target, content)
+                    self._dingtalk_dws_log.emit(f"✅ 已作为单聊发给「{target}」")
+                except Exception as e2:
+                    self._dingtalk_dws_log.emit(f"❌ 发送失败：{e2}")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _toggle_dingtalk_stream(self, cfg, enable):
         self.ding.update(cfg)

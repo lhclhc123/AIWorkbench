@@ -443,6 +443,11 @@ class IntegrationPage(QWidget):
     dingtalk_contacts = pyqtSignal(dict)
     dingtalk_login = pyqtSignal(dict)
     dingtalk_group_send = pyqtSignal(dict, str)
+    # —— dws（钉钉工作台 CLI：个人授权，能读会话列表/消息，群聊+单聊）——
+    dingtalk_dws_login = pyqtSignal(bool)          # True=设备码登录，False=浏览器登录
+    dingtalk_dws_conversations = pyqtSignal()
+    dingtalk_dws_messages = pyqtSignal(str)        # openConversationId
+    dingtalk_dws_send = pyqtSignal(str, str)       # target(群名/姓名/cid), content
     update_check = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -617,6 +622,60 @@ class IntegrationPage(QWidget):
         f4.addWidget(self.dt_probe)
         v.addWidget(box4)
 
+        # ---------------- dws 工作台 CLI：个人授权，能读会话列表/消息 ----------------
+        box5 = QGroupBox("钉钉工作台 CLI（dws · 个人授权，能读会话列表）")
+        f5 = QVBoxLayout(box5)
+        tip5 = QLabel(
+            "这条路<b>不需要企业应用</b>：用你本人的钉钉账号在浏览器里授权一次，"
+            "就能像 WorkBuddy 那样<b>列出并读取你的会话列表和消息</b>（群聊 + 单聊），"
+            "也能发消息。底层是官方 DingTalk Workspace CLI（dws）。")
+        tip5.setWordWrap(True)
+        tip5.setObjectName("PageSub")
+        f5.addWidget(tip5)
+
+        lrow = QHBoxLayout()
+        self.dt_dws_login = QPushButton("🌐 用 dws 登录钉钉")
+        self.dt_dws_login.setToolTip("打开浏览器用你的钉钉账号 OAuth 授权；授权后可读写你的会话/消息")
+        self.dt_dws_login.clicked.connect(lambda: self.dingtalk_dws_login.emit(False))
+        self.dt_dws_login_device = QPushButton("🔑 设备码登录")
+        self.dt_dws_login_device.setToolTip("无法开浏览器时用：命令行输出授权链接+码，你去浏览器输入")
+        self.dt_dws_login_device.clicked.connect(lambda: self.dingtalk_dws_login.emit(True))
+        self.dt_dws_convs = QPushButton("📋 查看我的会话列表")
+        self.dt_dws_convs.clicked.connect(lambda: self.dingtalk_dws_conversations.emit())
+        lrow.addWidget(self.dt_dws_login)
+        lrow.addWidget(self.dt_dws_login_device)
+        lrow.addWidget(self.dt_dws_convs)
+        lrow.addStretch(1)
+        f5.addLayout(lrow)
+
+        self.dt_dws_log = QLabel("")
+        self.dt_dws_log.setWordWrap(True)
+        self.dt_dws_log.setObjectName("PageSub")
+        f5.addWidget(self.dt_dws_log)
+
+        self.dt_dws_list = QListWidget()
+        self.dt_dws_list.setMinimumHeight(140)
+        self.dt_dws_list.itemDoubleClicked.connect(self._dws_open_conversation)
+        f5.addWidget(self.dt_dws_list)
+
+        self.dt_dws_msgs = QTextBrowser()
+        self.dt_dws_msgs.setMinimumHeight(140)
+        f5.addWidget(self.dt_dws_msgs)
+
+        srow = QHBoxLayout()
+        self.dt_dws_target = QLineEdit()
+        self.dt_dws_target.setPlaceholderText("发给谁：群名 / 姓名 / openConversationId")
+        self.dt_dws_content = QLineEdit()
+        self.dt_dws_content.setPlaceholderText("消息内容…（回车发送）")
+        self.dt_dws_content.returnPressed.connect(self._dws_send)
+        self.dt_dws_send = QPushButton("发送")
+        self.dt_dws_send.clicked.connect(self._dws_send)
+        srow.addWidget(self.dt_dws_target, 2)
+        srow.addWidget(self.dt_dws_content, 3)
+        srow.addWidget(self.dt_dws_send)
+        f5.addLayout(srow)
+        v.addWidget(box5)
+
         self.dt_status = QLabel("")
         self.dt_status.setWordWrap(True)
         self.dt_status.setObjectName("PageSub")
@@ -753,6 +812,58 @@ class IntegrationPage(QWidget):
 
     def set_dingtalk_status(self, text):
         self.dt_status.setText(text)
+
+    # ---------------- dws 工作台 CLI 的界面响应 ----------------
+    def _dws_open_conversation(self, item):
+        cid = item.data(Qt.ItemDataRole.UserRole)
+        if cid:
+            self.dingtalk_dws_messages.emit(cid)
+
+    def _dws_send(self):
+        target = self.dt_dws_target.text().strip()
+        content = self.dt_dws_content.text().strip()
+        if not target or not content:
+            self.show_dws_login_log("请填写「发给谁」和消息内容。")
+            return
+        self.dingtalk_dws_send.emit(target, content)
+        self.dt_dws_content.clear()
+
+    def show_dws_conversations(self, convs):
+        """convs = [(会话名, openConversationId), ...]"""
+        self.dt_dws_list.clear()
+        if not convs:
+            self.show_dws_login_log("没有会话，或 dws 还没登录 / 没权限。")
+            return
+        for name, cid in convs:
+            it = QListWidgetItem(name or "(未命名会话)")
+            it.setData(Qt.ItemDataRole.UserRole, cid)
+            self.dt_dws_list.addItem(it)
+        self.show_dws_login_log(f"共 {len(convs)} 个会话，双击可查看消息。")
+
+    def show_dws_messages(self, cid, msgs):
+        """msgs = [(发送者, 文本, 时间), ...]"""
+        t = themes.tokens()
+        if not msgs:
+            self.dt_dws_msgs.setHtml(
+                f"<span style='color:{t['text_muted']}'>这个会话没有可读到消息"
+                f"（可能没权限，或用设备码登录后需要再授权 chat 业务权限）。</span>")
+            return
+        rows = []
+        for sender, text, ts in msgs:
+            rows.append(
+                f"<div style='margin:4px 0;'>"
+                f"<span style='color:{t['accent']};font-weight:bold;'>"
+                f"{_esc(str(sender))}</span> "
+                f"<span style='color:{t['text_muted']};font-size:11px;'>{_esc(str(ts))}</span><br>"
+                f"<span style='color:{t['text']};'>{_esc(str(text))}</span></div>")
+        self.dt_dws_msgs.setHtml("".join(rows))
+
+    def show_dws_login_log(self, line):
+        cur = self.dt_dws_log.text()
+        if cur:
+            self.dt_dws_log.setText(cur + "\n" + str(line))
+        else:
+            self.dt_dws_log.setText(str(line))
 
     # ------------------------------ 自动更新 ------------------------------
     def _build_update(self):

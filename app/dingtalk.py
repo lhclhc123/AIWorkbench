@@ -12,11 +12,16 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
 
+IS_WIN = sys.platform.startswith("win")
 UA = "AIWorkbench/9.0"
 TIMEOUT = 15
 
@@ -133,6 +138,79 @@ def _get_json(url, headers=None, timeout=TIMEOUT, params=None):
     req = urllib.request.Request(url + qs, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", "ignore"))
+
+
+# ---------------------------------------------------------------------------
+# dws —— 钉钉工作台 CLI（官方 open-dingtalk/dingtalk-workspace-cli）
+# ---------------------------------------------------------------------------
+# 关键事实（实测验证，2026-09-25）：
+#   dws 走「个人账号 OAuth 授权」登录，能列出并读取当前用户自己的
+#   会话列表/消息，包含**群聊和单聊**（例如 `dws chat +conversation-list`）。
+#   这正是 WorkBuddy 钉钉连接器的真实做法，也证明 AIWorkbench 之前
+#   self_test 里写的「平台不提供读取会话列表接口」是错的——那条限制只
+#   针对「企业内部应用服务端 API」，dws 这条路不受限。
+def _find_node():
+    """找一个可用的 node 可执行文件（优先 WorkBuddy 自带的托管 node）。"""
+    env = os.environ.get("AIWORKBENCH_NODE_PATH")
+    if env and os.path.exists(env):
+        return env
+    home = os.path.expanduser("~")
+    for ver in ("22.22.2-3", "22.22.2", "22.0.0"):
+        for name in ("node.exe", "node"):
+            p = os.path.join(home, ".workbuddy", "binaries", "node",
+                             "versions", ver, name)
+            if os.path.exists(p):
+                return p
+    return shutil.which("node")
+
+
+def find_dws():
+    """返回 (node_exe, dws_entry)。
+
+    dws_entry 可能是：
+      - 一个 node 脚本（.../dingtalk-workspace-cli/bin/dws.js）→ 用 node 跑
+      - 一个包装脚本/命令（dws / dws.cmd，PATH 里）→ 直接执行
+    找不到时返回 (None, None)。
+    """
+    # 1. 显式环境变量（用户自己指定 dws.js 路径）
+    js = os.environ.get("AIWORKBENCH_DWS_JS")
+    if js and os.path.exists(js):
+        node = os.environ.get("AIWORKBENCH_NODE_PATH") or _find_node()
+        if node:
+            return node, js
+    # 2. WorkBuddy 自带的 dws 安装位置（最常见：用户本机装了 WorkBuddy）
+    home = os.path.expanduser("~")
+    base = os.path.join(home, ".workbuddy", "binaries", "node",
+                        "cli-connector-packages", "node_modules",
+                        "dingtalk-workspace-cli", "bin", "dws.js")
+    if os.path.exists(base):
+        node = _find_node()
+        if node:
+            return node, base
+    # 3. PATH 里的 dws / dws.cmd（全局 npm i -g dingtalk-workspace-cli）
+    for cand in ("dws.cmd", "dws"):
+        p = shutil.which(cand)
+        if p and os.path.exists(p):
+            return None, p
+    return None, None
+
+
+def _hide_startup():
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return si
+
+
+def _extract_json(text):
+    """dws 偶尔会在 JSON 前混一两行日志，从第一个 { 取到最后一个 }。"""
+    s = text.find("{")
+    if s < 0:
+        return text
+    e = text.rfind("}")
+    if e <= s:
+        return text[s:]
+    return text[s:e + 1]
 
 
 DEFAULT_CONFIG = {
@@ -683,10 +761,36 @@ class DingTalkClient:
                 add("7. Stream 长连接（收消息）", False,
                     "缺少 dingtalk_stream 依赖（程序打包异常，请重新下载最新版）")
 
-        # 8) 平台边界说明（不重要但必须讲清楚）
-        add("8. 读取个人聊天会话列表", False,
-            "钉钉开放平台**不提供**读取个人聊天记录/会话列表的接口（这是平台限制）。"
-            "能拿到的是：机器人收发的消息（Stream 长连接）、通讯录、群信息。")
+        # 8) dws 工作台 CLI：个人授权登录，可读取会话列表/消息（群聊+单聊）
+        #    这是 WorkBuddy 钉钉连接器的真实做法。之前 self_test 写的
+        #    「平台不提供读取会话列表」是错的——那条限制只针对「企业内部应用
+        #    服务端 API」，而 dws（个人 OAuth 授权的工作台 CLI）不受此限制。
+        if self.dws_available():
+            try:
+                st = self.dws_auth_status()
+                if st.get("authenticated"):
+                    try:
+                        lst = self.dws_conversation_list_full(5)
+                        convs = (lst or {}).get("conversations") or []
+                        names = "、".join(c.get("conversationName", "")
+                                         for c in convs[:5])
+                        add("8. dws 会话列表（个人授权）", True,
+                            f"已用账号「{st.get('user_name','')}」登录，"
+                            f"实测拉到 {len(convs)} 个会话：{names} …")
+                    except Exception as e:
+                        add("8. dws 会话列表（个人授权）", True,
+                            f"已登录，拉会话列表时出错（多半缺 chat 业务权限）：{e}")
+                else:
+                    add("8. dws 会话列表（个人授权）", False,
+                        "dws 已安装但未登录。点「用 dws 登录钉钉」按钮，"
+                        "浏览器完成 OAuth 授权后即可读取你的会话列表/消息（群聊+单聊）。")
+            except Exception as e:
+                add("8. dws 会话列表（个人授权）", False, f"dws 调用失败：{e}")
+        else:
+            add("8. dws 会话列表（个人授权）", False,
+                "没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
+                "或 npm i -g dingtalk-workspace-cli。它能以你本人授权"
+                "读取/管理会话列表和消息（群聊+单聊）。")
 
         return out
 
@@ -868,6 +972,147 @@ class DingTalkClient:
         except Exception:
             pass
         self._stream_running = False
+
+
+    # ---------------- dws（钉钉工作台 CLI：个人授权，可读会话列表/消息） ----------------
+    def dws_available(self):
+        node, dws = find_dws()
+        return bool(dws)
+
+    def _run_dws(self, args, timeout=60, want_json=True):
+        """统一跑 dws 命令。want_json=True 时解析并返回 Python 对象。"""
+        node, dws = find_dws()
+        if not dws:
+            raise DingTalkError(
+                "没有找到 dws（钉钉工作台 CLI）。它随 WorkBuddy 一起装在 "
+                "~/.workbuddy/binaries/node/cli-connector-packages/；\n"
+                "若你本机装了 WorkBuddy 可直接用。也可手动安装："
+                "npm i -g dingtalk-workspace-cli")
+        cmd = ([node, dws] if node else [dws]) + list(args)
+        kw = dict(capture_output=True, text=True, encoding="utf-8",
+                  errors="ignore", timeout=timeout)
+        if IS_WIN:
+            kw["creationflags"] = 0x08000000
+            kw["startupinfo"] = _hide_startup()
+        try:
+            p = subprocess.run(cmd, **kw)
+        except FileNotFoundError as e:
+            raise DingTalkError(f"执行 dws 失败：{e}")
+        out = p.stdout or ""
+        if want_json and "--format" in args:
+            try:
+                return json.loads(_extract_json(out))
+            except Exception:
+                if p.returncode != 0:
+                    raise DingTalkError("dws 返回：" + (out or p.stderr)[:400])
+                raise DingTalkError("无法解析 dws 输出：" + out[:400])
+        if p.returncode != 0 and not out.strip():
+            raise DingTalkError("dws 报错：" + (p.stderr or "")[:400])
+        return out
+
+    def dws_auth_status(self):
+        """返回 dws 登录状态 dict：含 authenticated / user_name / corp_name。"""
+        try:
+            return self._run_dws(["auth", "status", "--format", "json"])
+        except DingTalkError:
+            return {"authenticated": False, "error": "dws 不可调用"}
+
+    def dws_login_start(self, device=False, on_line=None):
+        """后台启动 dws 授权登录（浏览器或设备流），把输出实时回调给 GUI。
+
+        返回 subprocess.Popen 对象（登录完成后进程会自动退出）。
+        """
+        node, dws = find_dws()
+        if not dws:
+            raise DingTalkError("没有找到 dws，无法发起授权登录")
+        cmd = ([node, dws] if node else [dws]) + ["auth", "login"] \
+            + (["--device"] if device else [])
+        si = _hide_startup() if IS_WIN else None
+        p = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="ignore",
+            creationflags=(0x08000000 if IS_WIN else 0),
+            startupinfo=si)
+
+        def _reader():
+            try:
+                for line in p.stdout:
+                    if on_line:
+                        try:
+                            on_line(line.rstrip("\n"))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                p.wait()
+            except Exception:
+                pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+        return p
+
+    def dws_list_conversations(self, n=10):
+        """列出当前用户的会话（群聊 + 单聊）。返回 [(名称, openConversationId)]。"""
+        data = self._run_dws(
+            ["chat", "+conversation-list", "--page-size", str(n), "--format", "json"])
+        convs = (data or {}).get("conversations") or []
+        return [(c.get("conversationName", ""), c.get("openConversationId", ""))
+                for c in convs]
+
+    def dws_recent_conversations(self, start=None, n=10):
+        """列出某时间之后活跃的会话。start 形如 '2026-09-01' 或 ISO 时间。"""
+        args = ["chat", "+recent-conversations", "--page-size", str(n), "--format", "json"]
+        if start:
+            args += ["--start", start]
+        data = self._run_dws(args)
+        convs = (data or {}).get("conversations") or []
+        return [(c.get("conversationName", ""), c.get("openConversationId", ""))
+                for c in convs]
+
+    def dws_unread(self):
+        """列出未读会话（含未读消息）。"""
+        data = self._run_dws(["chat", "+unread-chats", "--format", "json"])
+        return (data or {}).get("conversations") or data or []
+
+    def dws_read_messages(self, open_conversation_id, n=20):
+        """读取某个会话的最近消息。返回 [(发送者, 文本, 时间)]。"""
+        data = self._run_dws(
+            ["chat", "+chat-messages", "--group", open_conversation_id,
+             "--page-size", str(n), "--format", "json"])
+        msgs = (data or {}).get("messages") or []
+        out = []
+        for m in msgs:
+            out.append((m.get("senderName", "") or m.get("sender", ""),
+                        m.get("content", "") or m.get("text", ""),
+                        m.get("sendTime", "") or m.get("time", "")))
+        return out
+
+    def dws_dm(self, name, content):
+        """按姓名给某人发单聊文本消息（dws 自动解析唯一接收人）。"""
+        content = (content or "").strip()
+        if not content:
+            raise DingTalkError("消息内容为空")
+        _throttle()
+        data = self._run_dws(
+            ["chat", "+dm", "--to", name, "--content", content, "--format", "json"])
+        return data
+
+    def dws_send_group(self, name_or_cid, content):
+        """按群名或 openConversationId 往群里发文本消息。"""
+        content = (content or "").strip()
+        if not content:
+            raise DingTalkError("消息内容为空")
+        _throttle()
+        data = self._run_dws(
+            ["chat", "+send-to-group", "--group", name_or_cid,
+             "--content", content, "--format", "json"])
+        return data
+
+    def dws_conversation_list_full(self, n=10):
+        """给自检用的：直接返回 dws 原始会话列表 JSON（含完整字段）。"""
+        return self._run_dws(
+            ["chat", "+conversation-list", "--page-size", str(n), "--format", "json"])
 
 
 def config_from_settings(settings):

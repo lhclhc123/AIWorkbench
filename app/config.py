@@ -180,7 +180,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4v", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 17
+PROMPT_VERSION = 18
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -356,17 +356,26 @@ DEFAULT_SYSTEM_PROMPT = (
     "- dingtalk_status：查看钉钉通道当前配置状态，无参数。推送失败前先用它确认配置。\n"
     "- dingtalk：钉钉连接器的高级操作，参数 action：\n"
     "  · status       —— 看配置与连通状态\n"
-    "  · selftest     —— **逐项真调钉钉接口做自检**（凭据/通讯录/机器人/工作通知/群），\n"
+    "  · selftest     —— **逐项真调钉钉接口做自检**（凭据/通讯录/机器人/工作通知/群/dws会话列表），\n"
     "                    用户说\"钉钉连不上 / 帮我看看钉钉\"时先跑这个，再据结果定位问题。\n"
     "  · contacts     —— 读通讯录，可选 dept_id（默认 1）、keyword（按姓名/工号过滤）、limit。\n"
     "                    用户问\"XX 的钉钉 ID / 我们部门都有谁 / 他的 userId\"时用它。\n"
-    "  · send         —— 发钉钉消息，参数 text（必须）、可选 title、at_all。\n"
+    "  · send         —— 发钉钉消息（企业应用通道），参数 text（必须）、可选 title、at_all。\n"
     "  · work_notice  —— 发「工作通知」，参数 text、可选 user_ids（逗号分隔）、to_all。\n"
-    "  · group_send   —— 往群里发，参数 text、可选 open_conversation_id。\n"
+    "  · group_send   —— 往群里发（企业应用机器人），参数 text、可选 open_conversation_id。\n"
     "  · whoami       —— 看有没有做过扫码授权登录。\n"
-    "  **注意：接收人必须是 userId（形如 manager815），不能填昵称；**\n"
-    "  拿不准就先 contacts 查一遍。钉钉开放平台不提供读取个人聊天记录/会话列表的接口，\n"
-    "  别向用户承诺这个能力；能读的是通讯录、群信息与机器人收发的消息。\n"
+    "  · conversations —— **列出我本人的钉钉会话（群聊 + 单聊）**，返回会话名与 openConversationId；\n"
+    "                    可选 limit。这是通过内置的 dws 工作台 CLI（你本人 OAuth 授权）做到的，**不需要企业应用**。\n"
+    "  · messages     —— 读某个会话的消息，参数 open_conversation_id（必填，先用 conversations 取）；可选 limit。\n"
+    "  · dws_send     —— 发消息，参数 target（群名 / 姓名 / openConversationId）、text（必填）。\n"
+    "  · dws_status   —— 看 dws（个人授权）是否已登录。\n"
+    "  **关于读取会话列表（重要，别再答错）**：钉钉开放平台的「服务端 API（企业应用）」确实不提供\n"
+    "  读取个人聊天/会话列表的接口；但本程序内置的 dws 工作台 CLI 走「你本人授权登录」，\n"
+    "  可以读取并管理你的会话列表和消息（群聊 + 单聊）——和 WorkBuddy 的钉钉连接器是同一套做法。\n"
+    "  用户问\"我的钉钉有哪些群 / 看看 XX 的聊天 / 帮我在钉钉里发一条\"时：先 dws_status 确认登录，\n"
+    "  没登录就引导用户到「集成 → 钉钉」点「用 dws 登录钉钉」完成浏览器授权，再调 conversations/messages。\n"
+    "  **注意**：企业应用通道（send / work_notice / group_send）的接收人必须是 userId（形如 manager815），\n"
+    "  不能填昵称；拿不准先 contacts 查。dws_send 则可以填姓名 / 群名 / openConversationId。\n"
     "\n"
     "【图片处理】\n"
     "- image_op：处理图片，参数 path、op、可选参数。\n"
