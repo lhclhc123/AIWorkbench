@@ -1,0 +1,41 @@
+# AI 工作台 —— 运行依赖
+# 装法：python -m pip install -r requirements.txt
+# 本机实测环境：Python 3.12.7 / Windows 10 x64
+
+# ---- 界面 ----
+PyQt6>=6.6
+
+# ---- 网络 ----
+requests>=2.31
+
+# ---- 文档解析（读）----
+python-docx>=1.1
+openpyxl>=3.1
+pdfminer.six>=20231228
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# ---- 文档生成（写）----
+python-pptx>=0.6.23
+reportlab>=4.0
+
+# ---- 图片与图表 ----
+Pillow>=10.0
+mss>=9.0
+
+# ---- 系统交互 ----
+psutil>=5.9
+pyperclip>=1.8
+pywin32>=306 ; sys_platform == "win32"
+
+# ---- Markdown 渲染 ----
+markdown>=3.5
+Pygments>=2.17
+
+# ---- 语音 ----
+pyaudio>=0.2.14
+edge-tts>=7.0
+
+# ---- 钉钉（Stream 长连接模式需要）----
+dingtalk-stream>=0.20
+websocket-client>=1.7

@@ -1,0 +1,39 @@
+# ---- 构建产物 ----
+dist/
+dist_v*/
+dist_old_v*/
+build/
+build_v*_version.txt
+*.spec.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 测试/调试脚本（本机一次性探针，含真实路径、调试输出、临时密钥，全部不进仓库）----
+tests/*
+!tests/README.md
+
+# ---- 本地私有配置（放真实密钥，绝不提交）----
+app/_keyblobs.py
+app/_keyblobs_local.py
+local_keys.json
+settings.local.json
+*.local
+
+# ---- 工作区运行数据（对话、记忆、追踪、设置）----
+.workbuddy/
+conversations/
+traces/
+worklog/
+MEMORY.md
+settings.json
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

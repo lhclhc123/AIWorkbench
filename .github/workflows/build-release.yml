@@ -1,0 +1,78 @@
+name: build-release
+
+# 推一个 v* 标签就自动打包成 exe、压成 zip、发到 Release。
+# 客户端「检查更新」是读 releases.atom / releases/latest，所以发完 Release
+# 老版本就能自动发现自己有新版本（无需 API token）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:        # 也支持在网页上手动点一次
+
+permissions:
+  contents: write           # 创建 Release 需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 单元测试（技能 / 定时 / 子代理 / 别名路由 / 提示词）
+        run: python tests/test_v91.py
+
+      - name: 注入密钥（可选）
+        # 仓库里不放任何真实密钥。想让自己下载到的 exe 开箱可用，
+        # 就在仓库 Settings → Secrets 里配这几个，构建时临时生成
+        # app/_keyblobs.py（混淆密文，无明文；构建完容器就销毁了）。
+        # 不配也能构建，只是首次启动要自己填 Key。
+        env:
+          AIWB_KEY_ZHIPU: ${{ secrets.AIWB_KEY_ZHIPU }}
+          AIWB_KEY_DASHSCOPE: ${{ secrets.AIWB_KEY_DASHSCOPE }}
+          AIWB_KEY_SCNET: ${{ secrets.AIWB_KEY_SCNET }}
+          AIWB_KEY_BAIDU: ${{ secrets.AIWB_KEY_BAIDU }}
+          AIWB_KEY_DEEPSEEK: ${{ secrets.AIWB_KEY_DEEPSEEK }}
+          AIWB_KEY_SILICONFLOW: ${{ secrets.AIWB_KEY_SILICONFLOW }}
+        run: python tools/gen_keyblobs.py --from-env
+
+      - name: 打包
+        run: python build_v9.py
+
+      - name: 冻结后自检（关键：验证 exe 里各项能力真能用）
+        run: |
+          .\dist_v9\AIWorkbench\AIWorkbench.exe --selftest
+          $r = Join-Path $env:TEMP "aiworkbench_selftest.txt"
+          Get-Content $r
+          if (Select-String -Path $r -Pattern "失败 [1-9]" -Quiet) { exit 1 }
+          if (Select-String -Path $r -Pattern "\[FAIL\]" -Quiet) { exit 1 }
+
+      - name: 检查产物里没有明文密钥
+        run: python tests/check_nosecrets.py dist_v9
+
+      - name: 压缩
+        run: |
+          Compress-Archive -Path .\dist_v9\AIWorkbench -DestinationPath .\AIWorkbench.zip -Force
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AIWorkbench.zip
+          generate_release_notes: true
+          body: |
+            AI 工作台 ${{ github.ref_name }}
+
+            下载 AIWorkbench.zip 解压即用（双击 AIWorkbench.exe）。
+            老版本可在「关于」页点「检查更新」，或直接用包内 exe 覆盖旧目录。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
