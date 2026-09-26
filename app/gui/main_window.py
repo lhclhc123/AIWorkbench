@@ -28,7 +28,8 @@ from .. import (config, llm_client, workspace as ws_mod, agent as agent_mod,
                 trace as trace_mod, mcp_client, tts as tts_mod,
                 dingtalk as dt_mod, updater, version as ver,
                 skills as skills_mod, scheduler as _sched_mod,
-                hotkey as _hotkey_mod, worklog as _worklog_mod)
+                hotkey as _hotkey_mod, worklog as _worklog_mod,
+                assistant as assistant_mod)
 from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
 from .panels import PlanPanel
@@ -37,7 +38,7 @@ from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
-                    SkillsPage, TasksPage)
+                    SkillsPage, TasksPage, AssistantPage, PAGES)
 
 RADIUS_CARD = 12
 
@@ -138,6 +139,12 @@ class MainWindow(QMainWindow):
         self._live_card = None
         self._last_model_label = ""
         self._pending_update = None
+        # 助理：钉钉消息 -> AI 处理 -> 结果发回钉钉
+        self.assistant = assistant_mod.AssistantService(
+            self.ding, os.path.join(self.workspace.path, "assistant.json"))
+        self._asst_queue = []       # 待处理的消息
+        self._asst_worker = None    # 正在处理消息的 worker
+        self._asst_cur = None       # 正在处理的那条消息
 
         self.setWindowTitle(f"{ver.APP_NAME} v{ver.VERSION}")
         self.setWindowIcon(make_icon())
@@ -163,6 +170,8 @@ class MainWindow(QMainWindow):
 
         if self.settings.get("check_update_on_start", True):
             QTimer.singleShot(3000, lambda: self._do_update_check(silent=True))
+        # 助理：上次开着就自动恢复
+        QTimer.singleShot(2500, self._assistant_boot)
 
         self._setup_tray()
         QTimer.singleShot(600, self._setup_hotkey)
@@ -349,6 +358,18 @@ class MainWindow(QMainWindow):
 
         self.page_chat = self._build_chat_page()
         self.stack.addWidget(self.page_chat)
+
+        self.page_assistant = AssistantPage()
+        self.stack.addWidget(self.page_assistant)
+        self.page_assistant.toggle.connect(self._assistant_toggle)
+        self.page_assistant.cfg_saved.connect(self._assistant_save_cfg)
+        self.page_assistant.process_one.connect(self._assistant_process_one)
+        self.page_assistant.process_all.connect(self._assistant_process_all)
+        self.page_assistant.resend.connect(self._assistant_resend)
+        self.page_assistant.cleared.connect(lambda: self._asst_queue.clear())
+        self.assistant.incoming.connect(self._assistant_on_incoming)
+        self.assistant.log.connect(lambda s: self.page_assistant.log(str(s)))
+        self.assistant.state.connect(self.page_assistant.set_running)
 
         self.page_skills = SkillsPage()
         self.stack.addWidget(self.page_skills)
@@ -600,9 +621,12 @@ class MainWindow(QMainWindow):
 
     # ================= 页面切换 =================
     def _open_page(self, key):
-        idx = {"chat": 0, "skills": 1, "tasks": 2, "memory": 3, "tools": 4,
-               "integrations": 5, "settings": 6, "about": 7}.get(key, 0)
+        # 索引跟着 PAGES 顺序走，避免以后加页面忘记改映射
+        keys = [k for k, _i, _n in PAGES]
+        idx = keys.index(key) if key in keys else 0
         self.stack.setCurrentIndex(idx)
+        if key == "assistant":
+            self.page_assistant.load_cfg(self.assistant.cfg)
         if key == "skills":
             self.page_skills.bind(self.skills)
         elif key == "tasks":
@@ -702,6 +726,11 @@ class MainWindow(QMainWindow):
         if (tools or files) and not self._wrapup_busy:
             self._wrapup_busy = True
             self._wrapup_llm_async(req, ans, src)
+
+        # 4) 硬保障：用户明确要求「发钉钉」，但这轮模型根本没发 -> 程序自动补发
+        #    （弱模型经常只道歉/只贴文字，这一步保证"要的东西真的到钉钉"）
+        if ui and src == "对话" and self._wants_dingtalk(req) and not self._ding_sent(tools):
+            self._auto_dingtalk_send(req, ans, files)
 
     def _wrapup_llm_async(self, req, ans, src):
         import threading
@@ -1804,6 +1833,237 @@ class MainWindow(QMainWindow):
             agent_mod._toast(title, message)
         except Exception:
             pass
+
+    # ================= 助理（钉钉消息 -> AI -> 发回钉钉） =================
+    def _assistant_toggle(self, start):
+        if start:
+            self._asst_queue.clear()
+            self.assistant.start()
+        else:
+            self.assistant.stop()
+
+    def _assistant_save_cfg(self, cfg):
+        self.assistant.apply_cfg(cfg)
+        self.statusBar().showMessage("助理设置已保存", 4000)
+        self.page_assistant.log(
+            "设置已保存：间隔 %s 秒 / 范围 %s / 自动回复 %s"
+            % (cfg.get("interval"), cfg.get("scope"),
+               "开" if cfg.get("auto_reply") else "关"))
+
+    def _assistant_boot(self):
+        """启动时若上次助理是开着的，自动恢复。"""
+        try:
+            if self.assistant.cfg.get("enabled"):
+                self.assistant.start()
+            self.page_assistant.load_cfg(self.assistant.cfg)
+        except Exception:
+            pass
+
+    def _assistant_on_incoming(self, msg):
+        """服务收到新消息：显示 + 通知 + 按需排队处理。"""
+        mid = self.page_assistant.add_message(msg)
+        self.assistant.mark_processed(mid)
+        who = msg.get("conv") or msg.get("sender") or "钉钉"
+        self.statusBar().showMessage(
+            f"🤝 助理收到消息（{who}）：{str(msg.get('text'))[:40]}", 8000)
+        if self.assistant.cfg.get("auto_reply"):
+            self._asst_queue.append(mid)
+            self._asst_pump()
+        else:
+            self.page_assistant.log("新消息待处理（自动回复关着）：点「处理选中」")
+
+    def _assistant_process_one(self, msgid):
+        if not msgid:
+            self.page_assistant.log("先在列表里选一条消息")
+            return
+        self._asst_queue.append(msgid)
+        self._asst_pump()
+
+    def _assistant_process_all(self):
+        for mid in self.page_assistant.row_msgids():
+            m = self.page_assistant.msgs.get(mid) or {}
+            if m.get("status") in ("待处理", "失败"):
+                self._asst_queue.append(mid)
+        self._asst_pump()
+
+    def _asst_pump(self):
+        """串行处理队列：一次只跑一条，避免和前台对话抢 runner。"""
+        if self._asst_worker is not None and self._asst_worker.isRunning():
+            return
+        # 前台正在对话时先等等，别两边同时用同一个 runner
+        try:
+            if self.worker is not None and self.worker.isRunning():
+                QTimer.singleShot(3000, self._asst_pump)
+                return
+        except Exception:
+            pass
+        if self._asst_queue:
+            self._asst_start(self._asst_queue.pop(0))
+
+    def _asst_start(self, msgid):
+        msg = self.page_assistant.msgs.get(msgid)
+        if not msg:
+            return
+        self._asst_cur = msg
+        self.page_assistant.update_status(msgid, "处理中")
+        system = self.settings.get("system_prompt") or config.SYSTEM_PROMPT
+        prompt = (
+            "【助理模式】这是别人从钉钉发给我的消息，请当作我的助手来处理：\n"
+            "· 能直接做完的就做完（写文件、跑脚本、查资料都行，产出物放工作区 files/ 下）；\n"
+            "· 做完后用**一段话**把最终结果说清楚——这就是要回给对方的原话，"
+            "不要客套、不要步骤流水账，涉及文件时带上完整路径；\n"
+            "· 消息里要文件/程序就真的生成，别只说怎么做。\n\n"
+            f"对方（{msg.get('conv') or msg.get('sender') or '钉钉'}）说：{msg.get('text')}"
+        )
+        api_msgs = [{"role": "system", "content": system},
+                    {"role": "user", "content": prompt}]
+        self.page_assistant.log(f"开始处理：{str(msg.get('text'))[:50]}")
+        self._asst_worker = ChatWorker(
+            self.bg_client, self.runner, api_msgs, True,
+            model_sel=self.settings.get("selected_model") or "auto",
+            enable_search=bool(self.settings.get("enable_search")),
+            max_iter=12)
+        self._asst_worker.finished.connect(lambda out, m=msg: self._asst_finish(m, out))
+        self._asst_worker.error.connect(lambda e, m=msg: self._asst_error(m, e))
+        self._asst_worker.notice.connect(lambda s: self.page_assistant.log(str(s)))
+        self._asst_worker.start()
+
+    def _asst_error(self, msg, err):
+        self.page_assistant.update_status(msg.get("msgid"), "失败", f"[处理出错] {err}")
+        self._asst_worker = None
+        self._asst_cur = None
+        self._asst_pump()
+
+    def _asst_finish(self, msg, out_messages):
+        try:
+            answer = ""
+            for m in reversed(out_messages or []):
+                if m.get("role") == "assistant" and (m.get("content") or "").strip():
+                    answer = m["content"].strip()
+                    break
+            if not answer:
+                answer = "（这轮没有产出可回复的内容）"
+            files = [f.get("path") if isinstance(f, dict) else str(f)
+                     for f in (getattr(self.runner, "written", None) or [])]
+            files = [p for p in files if p and os.path.isfile(p)]
+            self.page_assistant.update_status(msg.get("msgid"), "已回复", answer)
+            if self.assistant.cfg.get("auto_reply"):
+                self._asst_reply(msg, answer, files)
+        except Exception as e:
+            self.page_assistant.log(f"收尾失败：{e}")
+        finally:
+            self._asst_worker = None
+            self._asst_cur = None
+            self._asst_pump()
+
+    def _asst_reply(self, msg, answer, files):
+        """把最终结果（+ 产出文件）发回钉钉；后台线程，不卡界面。"""
+        import threading
+        cid = msg.get("cid") or ""
+        target_name = self._ding_self_name()
+        text = answer if len(answer) <= 1500 else answer[:1500] + "\n…（内容较长，已截断）"
+
+        def worker():
+            try:
+                if cid:
+                    self.ding.dws_send_to_cid(cid, text)
+                    self._asst_log_ui(f"✅ 已把结果发回钉钉（{msg.get('conv') or '会话'}）")
+                else:
+                    self.ding.dws_dm(target_name, text)
+                    self._asst_log_ui("✅ 已把结果作为单聊发给本人")
+            except Exception as e:
+                self._asst_log_ui(f"❌ 结果发回钉钉失败：{e}")
+            for p in files[:5]:
+                try:
+                    if cid:
+                        self.ding.dws_send_file(cid, p)
+                    else:
+                        self.ding.dws_send_file(target_name, p)
+                    self._asst_log_ui(f"📎 已把文件发到钉钉：{os.path.basename(p)}")
+                except Exception as e:
+                    self._asst_log_ui(f"❌ 文件发送失败（{os.path.basename(p)}）：{e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _asst_log_ui(self, line):
+        try:
+            self.page_assistant.log(line)
+            self.statusBar().showMessage(line, 8000)
+        except Exception:
+            pass
+
+    def _assistant_resend(self, msgid):
+        m = self.page_assistant.msgs.get(msgid)
+        if not m or not m.get("result"):
+            self.page_assistant.log("这条还没有可重发的结果")
+            return
+        files = [f.get("path") if isinstance(f, dict) else str(f)
+                 for f in (getattr(self.runner, "written", None) or [])]
+        self._asst_reply(m, m["result"], [p for p in files if p and os.path.isfile(p)])
+
+    def _ding_self_name(self):
+        try:
+            st = self.ding.dws_auth_status()
+            return (st.get("user_name") or "").strip() or "我"
+        except Exception:
+            return "我"
+
+    # ---------- 硬保障：用户要「发钉钉」但 AI 没真发 -> 程序自动补发 ----------
+    def _wants_dingtalk(self, text):
+        t = str(text or "")
+        if not any(k in t for k in ("钉钉", "dingtalk", "dws")):
+            return False
+        return any(k in t for k in ("发我", "发给我", "发给", "发到", "发过去",
+                                    "推送", "传给我", "传我", "发一份", "发个"))
+
+    def _ding_sent(self, tools):
+        return any(str(t) in ("dingtalk", "dingtalk_push", "send_file",
+                              "dws_send", "dws_send_file") for t in (tools or []))
+
+    def _auto_dingtalk_send(self, req, ans, files):
+        """AI 没发钉钉时的兜底：有文件就发文件，没文件就把结论原话发过去。"""
+        import threading
+        real_files = []
+        for f in (files or []):
+            p = f.get("path") if isinstance(f, dict) else str(f)
+            if p and os.path.isfile(p):
+                real_files.append(p)
+        target_name = self._ding_self_name()
+        self_cid = self._ding_self_cid()
+
+        def worker():
+            sent_any = False
+            target = self_cid or target_name
+            for p in real_files[:5]:
+                try:
+                    self.ding.dws_send_file(target, p)
+                    self._asst_log_ui(f"📎 自动补发文件到钉钉：{os.path.basename(p)}")
+                    sent_any = True
+                except Exception as e:
+                    self._asst_log_ui(f"自动补发文件失败：{e}")
+            if not real_files:
+                try:
+                    txt = (ans or "").strip() or "（这轮没有可回复的内容）"
+                    if len(txt) > 1500:
+                        txt = txt[:1500] + "…（已截断）"
+                    if self_cid:
+                        self.ding.dws_send_to_cid(self_cid, txt)
+                    else:
+                        self.ding.dws_dm(target_name, txt)
+                    self._asst_log_ui("📨 自动补发结论到钉钉")
+                    sent_any = True
+                except Exception as e:
+                    self._asst_log_ui(f"自动补发结论失败：{e}")
+            if sent_any:
+                self.wrapup_notice.emit(
+                    "📨 已自动补发到钉钉（你要求发钉钉、模型没发，程序兜底补发）")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ding_self_cid(self):
+        """「自己发给自己」那个会话的 cid（发文件/回消息都用它最稳）。"""
+        try:
+            return self.assistant._self_cid() or ""
+        except Exception:
+            return ""
 
     # ================= 更新 =================
     def _save_update_settings(self, cfg):

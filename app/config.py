@@ -180,7 +180,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4v", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 19
+PROMPT_VERSION = 20
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -383,6 +383,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "  没登录就引导用户到「集成 → 钉钉」点「用 dws 登录钉钉」完成浏览器授权，再调 conversations/messages。\n"
     "  **注意**：企业应用通道（send / work_notice / group_send）的接收人必须是 userId（形如 manager815），\n"
     "  不能填昵称；拿不准先 contacts 查。dws_send 则可以填姓名 / 群名 / openConversationId。\n"
+    "  **【助理页】**：侧栏「助理」页会盯住钉钉发过来的消息（自聊 / 群里@我 / 所有会话），\n"
+    "  自动或手动交给 AI 处理，处理完把最终结果那句话发回钉钉（有产出文件会直接发文件）。\n"
+    "  用户问\"钉钉上有没有新消息 / 帮我处理钉钉消息\"时，让他到「助理」页启动即可。\n"
+    "  **【兜底】**：用户要求「发钉钉/发给我」却发现自己没真发时，程序会自动补发，\n"
+    "  但你别依赖兜底——**能发就立刻真的发**：send_file 发文件、dws_send 发文字。\n"
     "\n"
     "【图片处理】\n"
     "- image_op：处理图片，参数 path、op、可选参数。\n"

@@ -20,6 +20,7 @@ from .. import (themes, plan as plan_mod, security, asr as asr_mod,
 
 PAGES = [
     ("chat", "💬", "对话"),
+    ("assistant", "🤝", "助理"),
     ("skills", "🧩", "技能"),
     ("tasks", "⏰", "定时"),
     ("memory", "🧠", "记忆"),
@@ -429,6 +430,188 @@ _KEY_HINTS = {
 
 def _key_hint(provider_name):
     return _KEY_HINTS.get(provider_name, "API Key")
+
+
+# ===========================================================================
+# 助理（钉钉消息 -> AI 处理 -> 结果发回钉钉）
+# ===========================================================================
+class AssistantPage(QWidget):
+    """盯住钉钉里发过来的消息：显示、交给 AI 处理、把最终结果发回钉钉。"""
+
+    toggle = pyqtSignal(bool)          # True=启动，False=停止
+    cfg_saved = pyqtSignal(dict)       # {"interval":int,"scope":str,"auto_reply":bool}
+    process_one = pyqtSignal(str)      # msgid
+    process_all = pyqtSignal()
+    resend = pyqtSignal(str)           # msgid
+    cleared = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.msgs = {}                 # msgid -> dict
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 18, 18, 18)
+        v.setSpacing(10)
+
+        title = QLabel("🤝 助理")
+        title.setObjectName("PageTitle")
+        v.addWidget(title)
+        tip = QLabel("把消息发到钉钉（最省事：直接发给「你自己」），助理就会在这里显示，"
+                     "自动或手动交给 AI 处理，处理完把<b>最终结果那句话</b>发回钉钉；"
+                     "如果有产出文件（Word / exe / 压缩包），也会直接作为文件发给你。")
+        tip.setWordWrap(True)
+        tip.setObjectName("PageSub")
+        v.addWidget(tip)
+
+        row = QHBoxLayout()
+        self.btn_run = QPushButton("▶ 启动助理")
+        self.btn_run.setMinimumHeight(34)
+        self.btn_run.clicked.connect(self._on_toggle)
+        self.lb_state = QLabel("未运行")
+        self.lb_state.setObjectName("PageSub")
+        row.addWidget(self.btn_run)
+        row.addWidget(self.lb_state)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        box = QGroupBox("设置")
+        form = QFormLayout(box)
+        self.sp_interval = QSpinBox()
+        self.sp_interval.setRange(10, 600)
+        self.sp_interval.setSuffix(" 秒")
+        self.sp_interval.setValue(25)
+        form.addRow("检查间隔：", self.sp_interval)
+
+        self.cb_scope = QComboBox()
+        self.cb_scope.addItem("只听「自己发给自己」的会话（推荐）", "self")
+        self.cb_scope.addItem("群里 @我 的消息", "at_me")
+        self.cb_scope.addItem("所有会话（消息多，慎用）", "all")
+        form.addRow("监听范围：", self.cb_scope)
+
+        self.ck_auto = QCheckBox("处理完自动把结果发回钉钉")
+        self.ck_auto.setChecked(True)
+        form.addRow(self.ck_auto)
+        save = QPushButton("保存设置")
+        save.clicked.connect(self._save_cfg)
+        form.addRow(save)
+        v.addWidget(box)
+
+        lrow = QHBoxLayout()
+        b1 = QPushButton("⚙ 处理选中")
+        b1.clicked.connect(lambda: self.process_one.emit(self.selected_msgid()))
+        b2 = QPushButton("⚡ 全部处理")
+        b2.clicked.connect(self.process_all.emit)
+        b3 = QPushButton("📤 重发结果到钉钉")
+        b3.clicked.connect(lambda: self.resend.emit(self.selected_msgid()))
+        b4 = QPushButton("🗑 清空列表")
+        b4.clicked.connect(self._clear)
+        for b in (b1, b2, b3, b4):
+            lrow.addWidget(b)
+        lrow.addStretch(1)
+        v.addLayout(lrow)
+
+        v.addWidget(QLabel("消息列表："))
+        self.list = QListWidget()
+        self.list.setMinimumHeight(150)
+        self.list.itemClicked.connect(self._show_detail)
+        v.addWidget(self.list, 2)
+
+        v.addWidget(QLabel("AI 处理结果："))
+        self.detail = QTextBrowser()
+        self.detail.setMinimumHeight(140)
+        v.addWidget(self.detail, 2)
+
+        v.addWidget(QLabel("运行日志："))
+        self.logv = QPlainTextEdit()
+        self.logv.setReadOnly(True)
+        self.logv.setMaximumHeight(110)
+        v.addWidget(self.logv)
+
+    # ---------- 对外接口 ----------
+    def set_running(self, running):
+        self.btn_run.setText("⏹ 停止助理" if running else "▶ 启动助理")
+        self.lb_state.setText("运行中…" if running else "未运行")
+
+    def load_cfg(self, cfg):
+        self.sp_interval.setValue(int(cfg.get("interval") or 25))
+        want = cfg.get("scope") or "self"
+        for i in range(self.cb_scope.count()):
+            if self.cb_scope.itemData(i) == want:
+                self.cb_scope.setCurrentIndex(i)
+        self.ck_auto.setChecked(bool(cfg.get("auto_reply", True)))
+        self.set_running(bool(cfg.get("enabled")))
+
+    def add_message(self, msg):
+        mid = msg.get("msgid") or ""
+        self.msgs[mid] = dict(msg, status="待处理", result="")
+        txt = f"[{msg.get('time','')}] {msg.get('conv') or msg.get('sender') or '钉钉'}：{_trim(msg.get('text'), 70)}"
+        it = QListWidgetItem(txt)
+        it.setData(Qt.ItemDataRole.UserRole, mid)
+        self.list.insertItem(0, it)
+        return mid
+
+    def update_status(self, msgid, status, result=None):
+        m = self.msgs.get(msgid)
+        if not m:
+            return
+        m["status"] = status
+        if result is not None:
+            m["result"] = result
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == msgid:
+                icon = {"待处理": "🕐", "处理中": "⏳", "已回复": "✅", "失败": "❌"}.get(status, "•")
+                it.setText(f"{icon} [{m.get('time','')}] {m.get('conv') or m.get('sender') or ''}：{_trim(m.get('text'), 70)}")
+                break
+        if self.selected_msgid() == msgid:
+            self._render(msgid)
+
+    def log(self, line):
+        self.logv.appendPlainText(f"{time.strftime('%H:%M:%S')}  {line}")
+
+    def selected_msgid(self):
+        it = self.list.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else ""
+
+    def row_msgids(self):
+        return [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())]
+
+    # ---------- 内部 ----------
+    def _on_toggle(self):
+        self.toggle.emit(self.btn_run.text().startswith("▶"))
+
+    def _save_cfg(self):
+        self.cfg_saved.emit({
+            "interval": self.sp_interval.value(),
+            "scope": self.cb_scope.currentData(),
+            "auto_reply": self.ck_auto.isChecked(),
+        })
+
+    def _clear(self):
+        self.list.clear()
+        self.msgs.clear()
+        self.detail.clear()
+        self.cleared.emit()
+
+    def _show_detail(self, _item=None):
+        self._render(self.selected_msgid())
+
+    def _render(self, msgid):
+        m = self.msgs.get(msgid)
+        if not m:
+            return
+        t = themes.tokens()
+        html = [f'<div style="color:{t["text_muted"]};font-size:12px;">'
+                f'来自 {_esc(m.get("conv") or m.get("sender"))}　{m.get("time","")}　'
+                f'状态：{_esc(m.get("status"))}</div>',
+                f'<div style="margin-top:6px;"><b>收到：</b><br>{_esc(m.get("text"))}</div>']
+        if m.get("result"):
+            html.append(f'<hr><div><b>AI 结果：</b><br>{_esc(m["result"])}</div>')
+        self.detail.setHtml("".join(html))
+
+
+def _trim(s, n):
+    s = (s or "").replace("\n", " ")
+    return s if len(s) <= n else s[:n] + "…"
 
 
 # ===========================================================================

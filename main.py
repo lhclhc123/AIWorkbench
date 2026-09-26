@@ -336,6 +336,14 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    # 最先把「隐藏控制台」挂上：之后所有子进程（python / cmd / node / dws）都继承它，
+    # 执行任务时就不会闪黑窗口。放在启动最开始——真有闪窗也只发生在启动瞬间，
+    # 不会在干活过程中反复冒出来。
+    try:
+        from app import winproc as _wp
+        _wp.ensure_hidden_console()
+    except Exception:
+        pass
     # 高 DPI 适配（避免高分屏上文字/控件过小）
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     # 全局中文字体，确保 QTextBrowser / QPlainTextEdit 能显示中文

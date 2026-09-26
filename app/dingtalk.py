@@ -1080,16 +1080,56 @@ class DingTalkClient:
 
     def dws_read_messages(self, open_conversation_id, n=20):
         """读取某个会话的最近消息。返回 [(发送者, 文本, 时间)]。"""
+        out = []
+        for m in self.dws_read_messages_raw(open_conversation_id, n):
+            out.append((m.get("sender") or m.get("senderName") or "",
+                        self._msg_text(m),
+                        m.get("createTime") or m.get("sendTime") or m.get("time") or ""))
+        return out
+
+    @staticmethod
+    def _msg_text(m):
+        """把一条消息压成可读文本（含文件名，便于助理看到「发来一个文件」）。"""
+        t = (m.get("text") or m.get("content") or "").strip()
+        names = []
+        for r in (m.get("resourceRefs") or []):
+            nm = r.get("name") or ""
+            if nm:
+                names.append(nm)
+        if names:
+            t = (t + " " if t else "") + "【附件】" + "、".join(names)
+        return t
+
+    def dws_read_messages_raw(self, open_conversation_id, n=20):
+        """读某会话最近消息的**原始**结构（带 messageId / 发送者 / AI 发送标记），
+        供「助理」做去重、过滤（跳过 AI 自己发的）。"""
         data = self._run_dws(
             ["chat", "+chat-messages", "--group", open_conversation_id,
              "--page-size", str(n), "--format", "json"])
-        msgs = (data or {}).get("messages") or []
-        out = []
-        for m in msgs:
-            out.append((m.get("senderName", "") or m.get("sender", ""),
-                        m.get("content", "") or m.get("text", ""),
-                        m.get("sendTime", "") or m.get("time", "")))
-        return out
+        return (data or {}).get("messages") or []
+
+    def dws_send_to_cid(self, cid, text):
+        """按 openConversationId 直接回一条消息（群聊、单聊都行）。"""
+        text = (text or "").strip()
+        if not text:
+            raise DingTalkError("消息内容为空")
+        _throttle()
+        return self._run_dws(
+            ["chat", "+messages-send", "--as", "user", "--chat-id", cid,
+             "--text", text, "--format", "json"])
+
+    def dws_at_me(self, n=10):
+        """查最近「@我」的消息（群聊里点名叫我的）。解析失败时返回 []。"""
+        try:
+            data = self._run_dws(["chat", "+at-me", "--page-size", str(n),
+                                  "--format", "json"])
+        except DingTalkError:
+            return []
+        if isinstance(data, dict):
+            for k in ("messages", "items", "list"):
+                if isinstance(data.get(k), list):
+                    return data[k]
+        return data if isinstance(data, list) else []
 
     def dws_dm(self, name, content):
         """按姓名给某人发单聊文本消息（dws 自动解析唯一接收人）。"""

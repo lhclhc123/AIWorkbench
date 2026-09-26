@@ -50,7 +50,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='D:\\软件\\WorkBuddy工作空间\\2026-09-19-22-59-39\\AIWorkbench\\build_v96_version.txt',
+    version='D:\\软件\\WorkBuddy工作空间\\2026-09-19-22-59-39\\AIWorkbench\\build_v97_version.txt',
 )
 coll = COLLECT(
     exe,
