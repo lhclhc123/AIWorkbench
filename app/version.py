@@ -3,9 +3,9 @@
 
 APP_NAME = "AI 工作台"
 APP_ID = "AIWorkbench"
-VERSION = "9.7.0"
-VERSION_TUPLE = (9, 7, 0)
-BUILD_DATE = "2026-09-25"
+VERSION = "9.7.1"
+VERSION_TUPLE = (9, 7, 1)
+BUILD_DATE = "2026-09-26"
 
 # 自动更新检查依赖的 GitHub 仓库（可在设置里改）
 GITHUB_REPO = "lhclhc123/AIWorkbench"

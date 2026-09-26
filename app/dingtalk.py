@@ -21,6 +21,15 @@ import time
 import urllib.parse
 import urllib.request
 
+# ⚠️ 所有子进程一律走 winproc（它统一处理"不弹黑窗口"）。
+# 这里曾经手写 creationflags=CREATE_NO_WINDOW —— 那恰好是**反的**：
+# 本程序是 windowed exe，靠 ensure_hidden_console() 挂一个隐藏控制台让整条
+# 进程链静默；再传 CREATE_NO_WINDOW 等于让子进程"不继承控制台"，
+# 于是它下面再起的孙进程（node 里再 spawn 的 cmd/浏览器辅助进程）又会新建
+# 可见控制台 —— 表现就是"连续弹出好几个小窗口又消失"。
+# 助理页每 25 秒轮询一次 dws，所以这个问题会被放大。
+from . import winproc as _winproc  # noqa: E402
+
 IS_WIN = sys.platform.startswith("win")
 UA = "AIWorkbench/9.0"
 TIMEOUT = 15
@@ -994,11 +1003,8 @@ class DingTalkClient:
                   errors="ignore", timeout=timeout)
         if cwd:
             kw["cwd"] = cwd
-        if IS_WIN:
-            kw["creationflags"] = 0x08000000
-            kw["startupinfo"] = _hide_startup()
         try:
-            p = subprocess.run(cmd, **kw)
+            p = _winproc.run(cmd, **kw)
         except FileNotFoundError as e:
             raise DingTalkError(f"执行 dws 失败：{e}")
         out = p.stdout or ""
@@ -1030,12 +1036,9 @@ class DingTalkClient:
             raise DingTalkError("没有找到 dws，无法发起授权登录")
         cmd = ([node, dws] if node else [dws]) + ["auth", "login"] \
             + (["--device"] if device else [])
-        si = _hide_startup() if IS_WIN else None
-        p = subprocess.Popen(
+        p = _winproc.popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="ignore",
-            creationflags=(0x08000000 if IS_WIN else 0),
-            startupinfo=si)
+            text=True, encoding="utf-8", errors="ignore")
 
         def _reader():
             try:

@@ -28,7 +28,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['numpy', 'matplotlib', 'cv2', 'tkinter', 'moviepy', 'imageio', 'pandas', 'scipy', 'IPython', 'notebook', 'PyQt6.QtWebEngineCore', 'PyQt6.QtQuick', 'PyQt6.QtMultimedia', 'PyQt5', 'PyQt5.sip', 'PySide2', 'PySide6', 'qtpy', 'pygame', 'pygame.locals', 'Pythonwin', 'pythonwin', 'pywin32_testutil', 'win32ui', 'win32com.test', 'win32com.test.util'],
+    excludes=['numpy', 'matplotlib', 'cv2', 'tkinter', 'moviepy', 'imageio', 'pandas', 'scipy', 'IPython', 'notebook', 'PyQt6.QtWebEngineCore', 'PyQt6.QtQuick', 'PyQt6.QtMultimedia', 'PyQt5', 'PyQt5.sip', 'PySide2', 'PySide6', 'qtpy', 'pygame', 'pygame.locals', 'Pythonwin', 'pythonwin', 'pywin32_testutil', 'win32ui', 'win32com.test', 'win32com.test.util', 'PyInstaller', 'pylint', 'pytest', 'setuptools.command'],
     noarchive=False,
     optimize=0,
 )
@@ -50,7 +50,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='D:\\软件\\WorkBuddy工作空间\\2026-09-19-22-59-39\\AIWorkbench\\build_v97_version.txt',
+    version='D:\\软件\\WorkBuddy工作空间\\2026-09-19-22-59-39\\AIWorkbench\\build_v971_version.txt',
 )
 coll = COLLECT(
     exe,

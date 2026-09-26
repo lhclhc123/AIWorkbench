@@ -38,7 +38,7 @@ KNOWN_TOOLS = (
     # 写 / 生成
     "write_file", "create_document", "file_op", "open_path", "archive",
     # 执行 / 系统
-    "run_command", "run_python", "list_processes", "kill_process",
+    "run_command", "run_python", "build_exe", "list_processes", "kill_process",
     "clipboard", "screenshot", "notify",
     # 联网
     "web_search", "download_file", "http_request",
@@ -60,6 +60,12 @@ KNOWN_TOOLS = (
     # MCP
     "mcp_list", "mcp_call",
 )
+
+# 「真的产出了文件」的写入类工具。
+# ★ 只此一份，别再在 chat_worker / main_window 里各抄一遍（会漂移）——
+#   它决定 write_done（假成功防御）、完成度看门狗、以及工作总结里的「成功/未完成」。
+WRITE_TOOLS = ("write_file", "create_document", "archive",
+               "download_file", "screenshot", "build_exe")
 
 # 模型偶尔会用「别名 / 技能名 / 近似名」当工具名（实测：会把技能 slug
 # 直接当工具名调）。这里做一次友好归一，既能自动路由，也能让日志/界面
@@ -83,6 +89,10 @@ TOOL_ALIAS = {
     "summary": "write_worklog", "diary": "write_worklog",
     "工作总结": "write_worklog", "read_log": "read_worklog",
     "worklog_read": "read_worklog", "list_log": "read_worklog",
+    # 打包 exe（模型爱用的各种叫法）
+    "pack": "build_exe", "package": "build_exe", "make_exe": "build_exe",
+    "pyinstaller": "build_exe", "build": "build_exe", "compile_exe": "build_exe",
+    "打包": "build_exe", "打包exe": "build_exe", "编译exe": "build_exe",
 }
 
 # 每轮工具结果回喂时附带，强制模型继续用标准格式
@@ -304,6 +314,35 @@ def _json_objects(text, limit=40):
     return objs
 
 
+def _degraded_call(text):
+    """退化写法：`工具名` 紧跟一个 JSON 参数对象。
+
+    实测事故（glm-4-flash 真实输出，2026-09-26）：
+        接下来，我会调用 build_exe 工具。build_exe
+        {"script": "files/hello_demo.py", "name": "HelloDemo", "onefile": true}
+    这里的 `"name"` 是**exe 的名字**，不是工具名。原先解析器先跑「带 name 字段的
+    JSON」那一步，把这个 JSON 当成了工具调用，于是解析出
+    `{"name":"HelloDemo","arguments":{}}` —— 工具名错、参数全丢，
+    用户看到的就是「他说要执行，实际啥也没执行」。
+
+    修法：先认「已知工具名 + 紧跟 JSON」这种**无歧义**的形式。
+    """
+    for s, _e, obj in _json_objects(text):
+        if not isinstance(obj, dict):
+            continue
+        # 形如 `xxx {"arguments": {...}}` 时把外层 arguments 脱掉
+        if set(obj.keys()) == {"arguments"} and isinstance(obj.get("arguments"), dict):
+            obj = obj["arguments"]
+        head = text[:s]
+        # 去掉紧挨着的「工具 / 调用 / 冒号 / 括号」等连接词
+        head = re.sub(r"[（(\[【]?\s*(?:工具|调用|tool)?\s*[:：\-]?\s*$", "",
+                      head, flags=re.I)
+        m = re.search(r"([A-Za-z_]\w*)\s*$", head)
+        if m and m.group(1) in KNOWN_TOOLS:
+            return {"name": m.group(1), "arguments": obj}
+    return None
+
+
 def parse_tool_call(text):
     """从助手文本里尽力提取工具调用，返回 {name, arguments} 或 None。
 
@@ -334,11 +373,26 @@ def _parse_tool_call_once(text):
 
     stripped = re.sub(r"```(?:\w+)?", "", text)
 
+    # 1.5) 「已知工具名 + 紧跟 JSON」的退化写法（必须排在「带 name 的 JSON」前面，
+    #      否则 JSON 里那个 `name` 字段会被误当成工具名，参数全丢）
+    _dg = _degraded_call(stripped)
+    if _dg:
+        return _dg
+
     # 2) 带 name 的 JSON 对象
+    #    ⚠️ JSON 里的 "name" 不一定是工具名 —— 所以「name 是已知工具」的优先；
+    #    不是已知工具的（可能是技能 slug）只留作最后兜底，不要立刻采信。
+    fallback_call = None
     for _s, _e, obj in _json_objects(stripped):
         call = _coerce(obj)
-        if call:
+        if not call:
+            continue
+        if call["name"] in KNOWN_TOOLS or call["name"] in TOOL_ALIAS:
             return call
+        if call["name"] == "arguments":
+            continue          # {"arguments":{...}} 这类外层壳，不是工具名
+        if fallback_call is None:
+            fallback_call = call
 
     # 3) 裸参数 JSON + 上下文里出现的工具名（参数键必须像工具参数，避免误伤普通回答）
     _ARG_KEYS = {"path", "command", "content"}
@@ -367,6 +421,10 @@ def _parse_tool_call_once(text):
     m2 = re.search(r"[\[（(]\s*工具\s+([A-Za-z_]\w*)\s*[\]）)]", stripped)
     if m2 and m2.group(1) in KNOWN_TOOLS:
         return {"name": m2.group(1), "arguments": {}}
+    # 6) 实在没有更像的：把「带 name 字段的 JSON」当兜底返回
+    #    （覆盖技能 slug 被当工具名的老情况；不做这一步会把原来能跑的用例弄坏）
+    if fallback_call:
+        return fallback_call
     return None
 
 
@@ -413,6 +471,17 @@ FAKE_WRITE_HINT = (
     "注意：你刚才回复里声称「已经创建/写入了文件」，但你实际上**没有调用过任何写入工具**，"
     "文件并不存在。不要在没执行工具的情况下声称完成了操作。\n"
     "现在请真正调用工具把文件写出来；写完之后，你只能依据工具回传的「真实路径」来回答用户。"
+)
+
+# 用户明确要 exe / 打包，但模型没调 build_exe（实测：它会自己拼 pyinstaller 命令、
+# 挑到没装 PyInstaller 的 Python 而失败，或者干脆只贴一段教程、谎称"已打包"）
+BUILD_EXE_HINT = (
+    "用户要的是**打包出真正的 .exe**，而你还没有调用 build_exe 工具。\n"
+    "不要自己拼 pyinstaller 命令行（本机有多个 Python，很容易挑到没装 PyInstaller 的那个），\n"
+    "也不要只给用户一段打包教程。请立刻真的调用：\n"
+    "<tool_call>{\"name\":\"build_exe\",\"arguments\":{\"script\":\"入口.py\",\"onefile\":true}}</tool_call>\n"
+    "（GUI 程序加 \"console\":false；要图标加 \"icon\":\"x.ico\"。）\n"
+    "**只有 build_exe 返回了 [成功] 和 exe 的真实绝对路径，你才能说打包完成。**"
 )
 
 # 用户意图里暗示"要动真格"的词
@@ -543,6 +612,29 @@ def needs_read_action(user_text):
     return any(w in t for w in _READ_WORDS)
 
 
+# 用户明确点名要"可执行文件"（≠只要源码）
+_EXE_WORDS = ("exe", "可执行文件", "安装包", "打包", "安装程序")
+# 这些是"我只是在问概念"，不是要真打包
+_EXE_QUESTION = ("什么是", "啥是", "是什么", "解释", "原理", "区别", "介绍一下", "教程")
+# 有这些词才算"真的要我动手打"
+_EXE_ACTION = ("打包", "帮我", "请你", "给我", "做成", "生成", "转成", "导出",
+               "做一个", "做一个exe", "弄成", "搞成")
+
+
+def needs_exe(user_text):
+    """用户这句话是不是明确要打包出 exe / 安装包。
+
+    ⚠️ 两道闸：① 只认「exe / 可执行文件 / 安装包 / 打包」这类明确说法
+    （免得"写个程序"也天天被催）；② 「什么是 exe 文件」这种纯概念提问不算。
+    """
+    t = (user_text or "").lower()
+    if not any(w in t for w in _EXE_WORDS):
+        return False
+    if any(q in t for q in _EXE_QUESTION) and not any(a in t for a in _EXE_ACTION):
+        return False
+    return True
+
+
 # ---------- 完成度看门狗：任务没真做完，就不许收尾 ----------
 
 # 最终答复里出现这些话 = 在推卸/放弃，必须打回
@@ -550,7 +642,56 @@ _GIVEUP_PHRASES = (
     "你可以手动", "请您手动", "你自己复制", "请自行", "手动操作", "手动创建",
     "手动复制", "无法直接", "我无法", "我不能", "建议你打开", "由于无法",
     "很抱歉，我无法", "请你自己", "需要你手动",
+    # 实测事故补充：漏了"您"的敬语写法 —— 模型说"您需要手动完成"就没被抓住
+    "需要您手动", "您需要手动", "您可以手动", "请您", "您自己", "请手动",
+    "手动完成", "手动上传", "手动下载", "自行完成", "自行上传", "自行下载",
 )
+
+# 「把交付甩给第三方网盘/云盘」= 变相让用户自己动手。
+# 实测事故：用户说"把打包好的 exe 钉钉发给我"，模型回
+# "我将上传文件到 Google Drive …您需要手动完成" —— 本程序明明能本机生成并直接发送。
+_CLOUD_DUMP = (
+    "google drive", "googledrive", "google 云端硬盘", "谷歌云盘",
+    "dropbox", "onedrive", "wetransfer", "we transfer", "transfer.sh",
+    "file.io", "pastebin", "在线文件共享", "文件共享服务", "在线网盘",
+    "云盘链接", "网盘链接", "上传到网盘", "上传到云盘", "上传到云端", "第三方云盘",
+)
+
+
+def dumped_to_cloud(text):
+    """答复是不是把交付甩给了第三方网盘/云盘服务。"""
+    t = (text or "").lower()
+    return any(p in t for p in _CLOUD_DUMP)
+
+
+def honest_ok(user_text, tools_used, files, answer, tool_outputs=()):
+    """按**真实的执行证据**判定这一轮到底做成没有，返回 (ok, notes)。
+
+    修的真实事故（用户 2026-09-26 反馈「日志还有好大问题」）：
+      21:29 / 21:50 两轮，模型一个工具都没调、还让用户自己去 Google Drive
+      上传文件，工作总结却写了「结果：成功」。
+    老判据 `not any(工具报错) or bool(files)` 在"整轮零工具"时必然为 True
+    —— 越是什么都没干，越容易显示成功。日志必须是能信的证据。
+    """
+    tools = set(tools_used or [])
+    files = list(files or [])
+    reasons = []
+    if any(str(t or "").startswith("[错误]") for t in (tool_outputs or ())):
+        reasons.append("有工具执行报错")
+    if looks_like_giveup(answer):
+        reasons.append("答复在让用户自己动手 / 说自己做不了")
+    if dumped_to_cloud(answer):
+        reasons.append("把交付甩给了网盘/云盘，没有真的发文件")
+    want_action = (wants_real_action(user_text) or needs_write_action(user_text)
+                   or needs_read_action(user_text) or needs_exe(user_text))
+    if want_action and not tools:
+        reasons.append("用户要求真的动手，但整轮一次工具都没调用")
+    if needs_exe(user_text) and "build_exe" not in tools:
+        reasons.append("用户要 exe / 打包，但没有调用 build_exe 打包")
+    if (needs_write_action(user_text) and not files
+            and not (tools & set(WRITE_TOOLS))):
+        reasons.append("用户要写文件，但没有成功写出任何文件")
+    return (not reasons), "；".join(reasons)
 
 
 def looks_like_giveup(text):
@@ -572,6 +713,8 @@ def completion_gaps(user_text, tools_used, write_done, verified_after_write,
 
     if needs_write_action(t) and not write_done:
         gaps.append("用户要写文件，但**没有成功写出任何文件**")
+    if needs_exe(t) and "build_exe" not in tools_used:
+        gaps.append("用户要 exe/打包，但**没有调用 build_exe 真正打包**")
     if needs_project_flow(t):
         if not write_done:
             gaps.append("用户要开发一个程序/项目，但**还没有写出任何代码文件**")
@@ -615,6 +758,10 @@ def completion_gaps(user_text, tools_used, write_done, verified_after_write,
     if not gaps and looks_like_giveup(final_text or ""):
         gaps.append("你的答复在让用户自己动手 / 宣布自己做不了——"
                     "这是不允许的。请换工具、换路径、换方法重试，直到真的做成")
+    if dumped_to_cloud(final_text or ""):
+        gaps.append("你把交付甩给了网盘/云盘，让用户自己上传下载——这是不允许的。"
+                    "本程序能本机生成文件，并可直接用 dingtalk 工具的 action=send_file "
+                    "把文件发到用户钉钉；要发文件就真的发，不要给云盘方案")
 
     return gaps
 
@@ -1355,6 +1502,66 @@ def _find_python():
     ):
         if cand and os.path.isfile(cand):
             return cand
+    return None
+
+
+def _arg_bool(v, default=False):
+    """把模型给的 true/"true"/1/"是" 之类统一成 bool。"""
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on", "是", "真"):
+        return True
+    if s in ("0", "false", "no", "n", "off", "否", "假"):
+        return False
+    return default
+
+
+def _python_candidates():
+    """按优先级列出本机可能可用的 Python 解释器（去重）。
+
+    为什么要列一堆：本机装了多个 Python，**只有一个装了 PyQt6/PyInstaller**。
+    `_find_python()` 只看 PATH，很可能挑到没装 PyInstaller 的那个，
+    于是"打包 exe"永远失败。这里把候选全列出来，再逐个试 import。
+    """
+    out = []
+
+    def add(p):
+        if not p or not os.path.isfile(p):
+            return
+        try:
+            rp = os.path.realpath(p)
+        except Exception:
+            rp = p
+        if rp.lower() not in [os.path.realpath(x).lower() for x in out]:
+            out.append(p)
+
+    add(_find_python())
+    for name in ("python.exe", "python3.exe", "python", "python3"):
+        try:
+            add(shutil.which(name))
+        except Exception:
+            pass
+    add(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python312\python.exe"))
+    add(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python313\python.exe"))
+    add(os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe"))
+    for ver in ("313", "312", "311", "310"):
+        add(rf"C:\Python{ver}\python.exe")
+    return out
+
+
+def _python_with_module(module):
+    """返回第一个能 `import <module>` 成功的解释器路径；都没有则 None。"""
+    for p in _python_candidates():
+        try:
+            r = _winproc.run([p, "-c", f"import {module}"],
+                             capture_output=True, timeout=30)
+            if getattr(r, "returncode", 1) == 0:
+                return p
+        except Exception:
+            continue
     return None
 
 
@@ -2412,6 +2619,138 @@ class AgentRunner:
                         os.remove(tf.name)
                     except Exception:
                         pass
+
+            # ======================== 打包 exe ========================
+            elif name == "build_exe":
+                # 为什么单独做一个工具：以前全靠模型自己写 PyInstaller 命令，
+                # 实测它要么写成 `pyinstaller -F xxx.py`（PATH 里那个 Python 没装
+                # PyInstaller → 报错），要么干脆不执行、直接谎称"已打包完成"。
+                # 这里把整件事做成一次可靠调用，并且**只在 exe 真落盘后**才报成功。
+                script = (args.get("script") or args.get("path")
+                          or args.get("file") or "").strip()
+                if not script:
+                    return ("[错误] 请用 script 指定入口 .py 文件，"
+                            "例如 {\"script\": \"main.py\"}")
+                py_path = _safe_path(self.files_dir, script, allow_outside=True)
+                if not os.path.isfile(py_path):
+                    return (f"[错误] 找不到要打包的脚本：{script}"
+                            f"（解析为 {py_path}）")
+
+                out_name = (args.get("name") or "").strip() \
+                    or os.path.splitext(os.path.basename(py_path))[0]
+                out_name = re.sub(r"[^\w\-.]+", "_", out_name).strip("_.-") or "app"
+                onefile = _arg_bool(args.get("onefile"), True)   # 默认单文件，便于直接发出去
+                want_console = _arg_bool(args.get("console"), True)
+                icon = (args.get("icon") or "").strip()
+
+                # 找一个真装了 PyInstaller 的解释器（本机多个 Python，只有一个装了）
+                exe_py = _python_with_module("PyInstaller")
+                if exe_py:
+                    prefix = [exe_py, "-m", "PyInstaller"]
+                else:
+                    pil = None
+                    for nm in ("pyinstaller.exe", "pyinstaller"):
+                        try:
+                            pil = shutil.which(nm)
+                        except Exception:
+                            pil = None
+                        if pil:
+                            break
+                    if pil:
+                        prefix = [pil]
+                        exe_py = _find_python() or "?"
+                    else:
+                        return ("[错误] 本机没有可用的 PyInstaller，无法打包 exe。\n"
+                                "请先装：`pip install pyinstaller`\n"
+                                "（本机有多个 Python 版本，注意装到实际使用的那个版本上）")
+
+                dist_dir = os.path.join(self.files_dir, "dist")
+                work_dir = os.path.join(tempfile.gettempdir(),
+                                        "aiworkbench_build", out_name)
+                cmd = prefix + [
+                    "--noconfirm", "--clean",
+                    "--name", out_name,
+                    "--distpath", dist_dir,
+                    "--workpath", work_dir,
+                    "--specpath", work_dir,
+                ]
+                if onefile:
+                    cmd.append("--onefile")
+                else:
+                    cmd.append("--onedir")
+                cmd.append("--windowed" if not want_console else "--console")
+                if icon:
+                    ic = _safe_path(self.files_dir, icon, allow_outside=True)
+                    if os.path.isfile(ic):
+                        cmd += ["--icon", ic]
+                extra_raw = args.get("args") or args.get("extra") or ""
+                if extra_raw:
+                    try:
+                        cmd += [x for x in shlex.split(str(extra_raw)) if x]
+                    except Exception:
+                        cmd += str(extra_raw).split()
+                cmd.append(py_path)
+
+                try:
+                    to = float(args.get("timeout") or 900)
+                except Exception:
+                    to = 900.0
+                to = max(60, min(to, 1800))
+                try:
+                    proc = _winproc.run(cmd, cwd=os.path.dirname(py_path),
+                                        capture_output=True, timeout=to)
+                except subprocess.TimeoutExpired:
+                    return (f"[错误] 打包超时（超过 {int(to)} 秒）。"
+                            "如果脚本依赖很多，可以在 arguments 里加大 timeout。")
+                except Exception as e:
+                    return f"[错误] 打包命令执行失败：{e}"
+
+                out = _decode(proc.stdout) + _decode(proc.stderr)
+                rc = getattr(proc, "returncode", 1)
+
+                # 只有真的找到 exe 才算成功（绝不谎报）
+                want = out_name + (".exe" if os.name == "nt" else "")
+                cand = os.path.join(dist_dir, want)
+                if not onefile:
+                    cand = os.path.join(dist_dir, out_name, want)
+                if not os.path.isfile(cand):
+                    hit = ""
+                    for root, _dirs, files in os.walk(dist_dir):
+                        for f in files:
+                            if f.lower() == want.lower():
+                                hit = os.path.join(root, f)
+                                break
+                        if hit:
+                            break
+                    cand = hit
+
+                if not cand or not os.path.isfile(cand):
+                    tail = out[-4000:] if out else "（无输出）"
+                    return (f"[错误] 打包没有产出 exe（PyInstaller 退出码 {rc}）。\n"
+                            f"脚本：{py_path}\n用的解释器：{exe_py}\n"
+                            f"输出：\n```\n{tail}\n```\n"
+                            "常见原因：脚本里有语法错误 / 缺依赖库 / 依赖了不存在的文件。"
+                            "请先修好再重新打包。")
+
+                size = os.path.getsize(cand)
+                self._note_written(cand, size)
+                lines = [
+                    "[成功] 已打出可执行文件（真实落盘）：",
+                    f"· exe：{cand}",
+                    f"· 大小：{_human_size(size)}",
+                    f"· 入口脚本：{py_path}",
+                    f"· 解释器：{exe_py}",
+                ]
+                if onefile:
+                    lines.append("· 模式：单文件（--onefile），这一个文件拷到哪都能双击运行")
+                else:
+                    lines.append("· 模式：文件夹（--onedir），**必须整个 "
+                                 f"{os.path.dirname(cand)} 目录一起拷**，只拷 exe 会缺依赖")
+                lines.append(f"· PyInstaller 退出码：{rc}")
+                if rc != 0:
+                    lines.append(f"· 退出码非 0，但 exe 已生成；输出尾部：\n"
+                                 f"```\n{out[-1500:]}\n```")
+                return "\n".join(lines)
 
             # ======================== 界面 / 系统交互 ========================
             elif name == "clipboard":

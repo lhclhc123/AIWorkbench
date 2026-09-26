@@ -693,7 +693,8 @@ class MainWindow(QMainWindow):
         try:
             _worklog_mod.append(ws, source=src, request=req, tools=tools,
                                 files=files, summary=ans, ok=ok,
-                                model=data.get("model") or "")
+                                model=data.get("model") or "",
+                                extra_notes=data.get("notes") or "")
         except Exception:
             pass
 
@@ -891,7 +892,7 @@ class MainWindow(QMainWindow):
                 used.append(_nm)
                 tool_done += 1
                 if _nm in ("write_file", "create_document", "archive",
-                           "download_file", "screenshot") \
+                           "download_file", "screenshot", "build_exe") \
                         and str(res).startswith("[成功]"):
                     write_done = True
                 # 未知工具 / 格式不对时，把「可用工具清单」一并回喂，帮它自己纠正
@@ -916,12 +917,17 @@ class MainWindow(QMainWindow):
         """后台线程里的收尾归档（工作总结 + 自动记忆），不碰界面控件。"""
         try:
             files = list(getattr(runner, "written", []) or [])
+            # 判据与前台对话一致（agent.honest_ok），别再各写一套
+            _ok, _notes = agent_mod.honest_ok(prompt, used, files, answer,
+                                              [answer] if str(
+                                                  answer or "").startswith("[错误]") else [])
             self._wrapup({
                 "user": (prompt or "")[:1000],
                 "answer": (answer or "")[:2000],
                 "tools": list(dict.fromkeys(used or [])),
                 "files": files,
-                "ok": not str(answer or "").startswith("[错误]") or bool(files),
+                "ok": _ok,
+                "notes": _notes,
                 "source": source,
                 "model": getattr(self.bg_client, "last_model", "") or "",
             }, ui=False)

@@ -185,14 +185,23 @@ class ChatWorker(QThread):
                 if m.get("role") == "assistant" and m.get("content"):
                     answer = m["content"]
                     break
+            # ---------- 诚实判定「这一轮到底做成没有」 ----------
+            # 修的真实事故（用户 2026-09-26 反馈「日志还有好大问题」）：
+            #   21:29 / 21:50 两轮模型一个工具都没调、还让用户自己去 Google Drive
+            #   上传文件，工作总结却写了「结果：成功」。
+            # 老写法 `not any(工具报错) or bool(files)` 在"整轮零工具"时必然为 True。
+            # 判据统一收在 agent.honest_ok，后台通道也用它，避免两处漂移。
+            _ok, _notes = agent_mod.honest_ok(
+                user_text, tools_used, files, answer,
+                [m.get("content") for m in self.out_messages
+                 if m.get("role") == "tool"])
             self.wrapup.emit({
                 "user": (user_text or "")[:1000],
                 "answer": (answer or "")[:2000],
                 "tools": sorted(set(tools_used or [])),
                 "files": files,
-                "ok": not any(str(m.get("content") or "").startswith(
-                    "[错误]") for m in self.out_messages
-                    if m.get("role") == "tool") or bool(files),
+                "ok": _ok,
+                "notes": _notes,
                 "source": "对话",
                 "model": getattr(self.client, "last_model", "") or "",
             })
@@ -253,6 +262,7 @@ class ChatWorker(QThread):
             write_done = False   # 本轮是否真的执行过 write_file（识别"只读不写"）
             written_paths = []   # 记录本轮真实写入过的相对路径（用于完成自检）
             write_nudges = 0     # 强制真写的纠正次数（最多 1 次）
+            build_nudges = 0     # 用户要 exe 却没打 build_exe 的纠正次数（最多 1 次）
             fence_rescues = 0    # 把"只贴代码块"直接转成落盘的次数（最多 1 次）
             # —— 「独立开发一个成品」五步流程的关卡计数（各最多催 1 次）——
             project_env_nudges = 0
@@ -329,6 +339,17 @@ class ChatWorker(QThread):
                         if _fake_done:
                             hint = (agent_mod.FAKE_WRITE_HINT + "\n\n" + hint)
                         self.api_messages.append({"role": "user", "content": hint})
+                        continue
+                    # A-1b) 用户明确要 exe / 打包，但模型没调 build_exe
+                    #      实测：它会自己拼 pyinstaller 命令（挑到没装 PyInstaller 的 Python 而失败），
+                    #      或者只贴一段打包教程、谎称"已打包完成"，最后钉钉那边啥也没收到。
+                    if (agent_mod.needs_exe(last_user)
+                            and "build_exe" not in tools_used
+                            and build_nudges < 1):
+                        build_nudges += 1
+                        self.api_messages.append({"role": "assistant", "content": text})
+                        self.api_messages.append(
+                            {"role": "user", "content": agent_mod.BUILD_EXE_HINT})
                         continue
                     # A-2c) 项目流程最后一关：写完代码必须**真的跑一遍**才算交付
                     if (_project and write_done and not verified_after_write
@@ -462,8 +483,7 @@ class ChatWorker(QThread):
                     if self._abort:
                         break
                     name = call.get("name")
-                    _is_write = name in ("write_file", "create_document", "archive",
-                                         "download_file", "screenshot")
+                    _is_write = name in agent_mod.WRITE_TOOLS
                     sig = name + "|" + json.dumps(call.get("arguments", {}),
                                                   sort_keys=True, ensure_ascii=False)
                     if fail_counts.get(sig, 0) >= 2:
