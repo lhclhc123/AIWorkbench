@@ -95,7 +95,7 @@ def fs(px, unit="px"):
 def qss(t=None):
     t = t or tokens()
     return f"""
-QWidget {{ font-family: "Microsoft YaHei", "SimHei", "Segoe UI", sans-serif; }}
+QWidget {{ font-family: "Microsoft YaHei", "SimHei", "Segoe UI", "Segoe UI Symbol", "Segoe UI Emoji", sans-serif; }}
 QMainWindow, QDialog {{ background: {t['window_bg']}; }}
 QLabel {{ color: {t['text']}; }}
 
