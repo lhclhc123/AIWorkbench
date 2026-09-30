@@ -660,6 +660,22 @@ def parse_tool_calls(text, limit=4):
     return [single] if single else []
 
 
+_FILE_HINT_RE = re.compile(
+    r"([\w\u4e00-\u9fa5\-]+)\.(py|js|html|css|json|md|txt|csv|docx|xlsx|pptx|pdf)\b",
+    re.IGNORECASE)
+
+
+def filename_stem_from_text(text):
+    """从用户话里找他想要的文件名主干（"帮我写个 calc.py" -> "calc"）。
+
+    用途：A-0 兜底（模型只贴代码块、不调 write_file）时，合成的写入调用
+    应该落到**用户点名的那个文件名**上，而不是笼统的 main.py。
+    （2026-09-30 实测：用户要 calc.py，兜底却写成了 main.py。）
+    """
+    m = _FILE_HINT_RE.search(text or "")
+    return m.group(1) if m else ""
+
+
 def synthesize_write_from_fence(text, default_name=None):
     """模型只丢了一个代码块、压根没调 write_file 时，帮它凑一个写入调用。
 
@@ -991,6 +1007,79 @@ PROJECT_STEP_HINTS = {
         "绝不允许没跑就说「已验证」——那是谎报。"
     ),
 }
+
+# ---------- ★ 程序级「跑失败 -> 回灌真实报错 -> 让它修 -> 再跑」闭环 ----------
+
+VERIFY_FIX_HINT = (
+    "系统刚才**真的运行了**你写的程序，下面是它的真实输出（不是模拟、不是猜测）：\n"
+    "---------- 真实运行输出 ----------\n{output}\n---------- 输出结束 ----------\n"
+    "它**没有通过**。现在按顺序做，一步都不许跳过：\n"
+    "1) 先读懂报错：哪一行、什么异常类型、为什么（看完 traceback，不要凭感觉猜）；\n"
+    "2) 用 read_file 把出问题的那段代码读出来确认（不要凭记忆改）；\n"
+    "3) 用 write_file **真的改文件**（不是只在聊天里贴一段新代码）；\n"
+    "4) 改完**立刻再运行一次**（run_python 跑刚写的那个文件），把真实输出贴出来；\n"
+    "5) 还报错就重复 1~4，**直到真的跑通**（退出码 0、没有 Traceback）。\n"
+    "需要查第三方库用法或报错含义时，可以先 web_search 搜一次再动手改。\n"
+    "⚠️ 绝不许说完「已修复」却没有重新运行；也绝不许把报错说成通过。"
+)
+
+
+def verify_failed(output):
+    """程序代跑的那次验证，到底过没过。
+
+    认三种信号（按可靠性排序）：明确的「结论: FAIL / PASS」→ 退出码非 0
+    → 出现 Traceback。都没有就当作"看不出失败"，不打扰模型。
+    """
+    s = output or ""
+    if "结论: FAIL" in s or "结论：FAIL" in s:
+        return True
+    if "结论: PASS" in s or "结论：PASS" in s:
+        return False
+    if re.search(r"退出码:\s*[1-9]\d*", s):
+        return True
+    if "Traceback (most recent call last)" in s:
+        return True
+    return False
+
+
+def likely_ok(output):
+    """验证输出是否可判定为「通过」（供闭环决定是否收尾）。"""
+    s = output or ""
+    if verify_failed(s):
+        return False
+    return ("结论: PASS" in s or "结论：PASS" in s
+            or re.search(r"退出码:\s*0", s) is not None)
+
+
+# ---------- ★ 中间过程：哪句该留、哪句该折叠 ----------
+
+# 有信息量的信号词（结论 / 判断 / 问题定位这类，用户是想看到的）
+_KEY_WORDS = (
+    "完成", "已修复", "修复", "结论", "发现", "原因", "问题在于", "问题出",
+    "建议", "注意", "警告", "报错", "失败", "跑通", "通过", "结果是", "结果是",
+    "因此", "所以", "方案", "已确认", "确认了", "总结", "关键", "重要",
+    "定位到", "根因", "解决办法", "需要注意",
+)
+_STRUCT_RE = re.compile(r"(?m)^\s*(?:#{1,4}\s|\d+[.)、]\s|[-*•]\s)")
+
+
+def is_key_progress(text):
+    """中间过程里这一句值不值得**默认展开**给用户看。
+
+    用户 2026-09-30 的原话：「中间过程性的那些话并不是每一句都是要隐藏的，
+    就是那些选择性的、有些重点的结论那种留着」。所以：
+      - 短碎语（"我来帮你看看""先调用一下工具"）-> 折叠；
+      - 带结论/原因/建议/报错定位的 -> 默认展开，左侧加一道强调竖线。
+    """
+    s = (text or "").strip()
+    if len(s) < 24:
+        return False
+    if any(w in s for w in _KEY_WORDS):
+        return True
+    # 结构化内容（小标题 / 列表 / 编号）通常就是要点
+    if len(s) >= 70 and _STRUCT_RE.search(s):
+        return True
+    return False
 
 
 # ---------- 多要求任务的「做全」检查 ----------
@@ -2756,8 +2845,18 @@ class AgentRunner:
                     except Exception:
                         to = 60
                     to = max(5, min(to, 300))
+                    # ★ 把工作目录塞进 PYTHONPATH。
+                    #   代码是「先写成 %TEMP% 下的临时 .py 再执行」的，所以
+                    #   sys.path[0] 是 %TEMP% 而**不是**工作目录 ——
+                    #   于是 `import 刚写好的模块` 必然 ModuleNotFoundError
+                    #   （2026-09-30 端到端实测：模型为了这个错空转了 21 轮，
+                    #     把 max_iter 耗尽，连代跑验证都没机会跑，最后只会道歉）。
+                    #   注入 PYTHONPATH 后，写在工作目录里的模块就能直接 import。
+                    env = dict(os.environ)
+                    env["PYTHONPATH"] = (self.files_dir + os.pathsep
+                                         + env.get("PYTHONPATH", ""))
                     proc = _winproc.run([exe, tf.name], cwd=self.files_dir,
-                                        capture_output=True, timeout=to)
+                                        capture_output=True, timeout=to, env=env)
                     out = _decode(proc.stdout) + _decode(proc.stderr)
                     if len(out) > 8000:
                         out = out[:8000] + "\n...（输出已截断）"

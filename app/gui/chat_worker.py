@@ -23,6 +23,44 @@ def _has_real_proof(text):
     return any(m in t for m in _PROOF_MARKERS)
 
 
+_PREVIEW_MAX_LINES = 60
+
+
+def _write_preview(call):
+    """把写入类工具的正文做成 Markdown 代码块，供界面展开查看。
+
+    修的真实 bug（用户 2026-09-30 反馈"写入 python 程序时，不管写多少行，
+    界面都只显示一行"）：write_file 的工具结果只有一行
+    「[成功] 已写入 520 字符，共 20 行 → 完整路径：…」，
+    **写入的正文根本没进展示消息** —— 所以界面上永远只有那一行。
+    现在把正文一并带上，界面的代码卡片就能完整展开。
+    """
+    args = call.get("arguments") or {}
+    if not isinstance(args, dict):
+        return ""
+    body = None
+    for k in ("content", "text", "markdown", "source", "code"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            body = v
+            break
+    if body is None:
+        return ""
+    path = str(args.get("path") or args.get("filename")
+               or args.get("file") or args.get("name") or "")
+    low = path.lower()
+    lang = ("python" if low.endswith(".py")
+            else "markdown" if low.endswith((".md", ".markdown")) else "")
+    lines = body.rstrip("\n").split("\n")
+    total = len(lines)
+    more = ""
+    if total > _PREVIEW_MAX_LINES:
+        lines = lines[:_PREVIEW_MAX_LINES]
+        more = ("\n# …（全文共 %d 行，这里只预览前 %d 行；"
+                "完整内容已写入文件）" % (total, _PREVIEW_MAX_LINES))
+    return "```%s\n%s%s\n```" % (lang, "\n".join(lines), more)
+
+
 class ChatWorker(QThread):
     token = pyqtSignal(str)            # 增量文本
     tool_start = pyqtSignal(str)       # 工具调用描述
@@ -33,6 +71,7 @@ class ChatWorker(QThread):
     plan_changed = pyqtSignal(dict)      # 任务计划有更新（跨线程安全）
     notice = pyqtSignal(str)             # 需要提示用户的事（模型切换、上下文压缩…）
     wrapup = pyqtSignal(dict)            # 本轮结束 -> 交给主窗口写「工作总结 + 自动记忆」
+    phase = pyqtSignal(str, str)         # ★ 实时状态行：("model"/"tool"/"answer"/…, 详情)
 
     def __init__(self, client, runner, api_messages, agent_mode,
                  model_sel="auto", enable_search=False, max_iter=16, plan=None):
@@ -49,6 +88,7 @@ class ChatWorker(QThread):
         self.max_iter = max_iter
         self.plan = dict(plan) if plan else {"steps": []}
         self._abort = False
+        self._answering = False          # 本轮是否已经开始吐字（给状态行用）
         self._confirm_event = threading.Event()
         self._confirm_res = False
         # 真思维链（reasoning_content）累积缓冲：只有支持思维链的模型才会往里写，
@@ -58,6 +98,21 @@ class ChatWorker(QThread):
     def confirm(self, ok: bool):
         self._confirm_res = ok
         self._confirm_event.set()
+
+    def abort(self):
+        """用户点了右下角的方形「停止」：立刻中断本轮。
+
+        只置标志位 —— 循环里的 `if self._abort` 会在下一个可中断点跳出，
+        流式 token 也会停止转发（见 _on_token），所以界面会立即"停下"。
+        已经产生的消息照常收尾（_run_impl 末尾的统一收尾逻辑会跑完）。
+        """
+        self._abort = True
+        try:
+            cb = getattr(self.client, "cancel", None)
+            if callable(cb):
+                cb()
+        except Exception:
+            pass
 
     # ---------- 真思维链（reasoning_content）----------
     def _collect_reason(self, delta):
@@ -76,7 +131,11 @@ class ChatWorker(QThread):
     # ---------- 注入给 AgentRunner 的回调（工具执行时在工作线程内被调用）----------
     def _search_cb(self, query):
         """联网搜索工具的真实实现（走支持联网的端点）。"""
-        return self.client.web_search(query)
+        self.phase.emit("search", str(query or "")[:40])
+        try:
+            return self.client.web_search(query)
+        finally:
+            self.phase.emit("model", "")
 
     def _plan_cb(self, steps, note=None):
         """update_plan 工具的真实实现：更新计划并通知界面刷新。"""
@@ -88,8 +147,13 @@ class ChatWorker(QThread):
                 + plan_mod.to_markdown(self.plan))
 
     def _on_token(self, delta: str):
-        if not self._abort:
-            self.token.emit(delta)
+        if self._abort:
+            return
+        # 第一个字到了：状态行从「正在调用模型」切到「正在生成回复」
+        if not self._answering:
+            self._answering = True
+            self.phase.emit("answer", "")
+        self.token.emit(delta)
 
     def _after_chat(self):
         """把 LLM 客户端攒下的提示（模型被切换等）转给界面，然后清掉。"""
@@ -198,6 +262,16 @@ class ChatWorker(QThread):
                 target = str(p)          # 取最后一个 .py 作为入口
         if not target:
             return ""
+        # 相对路径（如 "calc.py"）先按工作区 files/ 解析成真实存在的文件，
+        # 免得因为 cwd 不对而跑不起来、把"跑不了"误判成"跑不过"。
+        try:
+            if not (os.path.isabs(target) and os.path.exists(target)):
+                cand = agent_mod._safe_path(self.runner.files_dir, target)
+                if cand and os.path.exists(cand):
+                    target = cand
+        except Exception:
+            pass
+        self.phase.emit("verify", "运行 " + os.path.basename(target))
         safe = target.replace("\\", "\\\\").replace("'", "\\'")
         code = (
             "import importlib.util, subprocess, sys\n"
@@ -315,6 +389,7 @@ class ChatWorker(QThread):
             self._maybe_compact()
             # ---------- 普通模式：单轮 ----------
             if not self.agent_mode:
+                self.phase.emit("model", "")
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
                     on_token=self._on_token, on_reasoning=self._collect_reason)
@@ -326,6 +401,7 @@ class ChatWorker(QThread):
                     self.out_messages.append({"role": "thinking", "content": _reason})
                 self.api_messages.append({"role": "assistant", "content": clean})
                 self.out_messages.append({"role": "assistant", "content": clean})
+                self.phase.emit("idle", "")
                 self.finished.emit(self.out_messages)
                 # 普通模式也补一次收尾：写工作总结 + 自动补记忆（"每次都要写"）
                 _u = ""
@@ -359,6 +435,7 @@ class ChatWorker(QThread):
             project_verify_nudges = 0
             watchdog_nudges = 0      # 「还没做完就别收尾」的打回次数（最多 4 次）
             judge_nudges = 0         # 用模型当裁判判断完成度的次数（最多 2 次）
+            fix_rounds = 0           # ★ 程序代跑验证失败后「返修」的次数（最多 2 次）
             env_checked = False          # 是否真的做过环境检查
             verified_after_write = False  # 写完代码后是否真的跑过一遍
             fail_counts = {}     # 调用签名 -> 连续失败次数（防死循环）
@@ -374,6 +451,8 @@ class ChatWorker(QThread):
                 if self._abort:
                     break
 
+                self._answering = False
+                self.phase.emit("model", "")
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
                     on_token=self._on_token, on_reasoning=self._collect_reason)
@@ -389,7 +468,12 @@ class ChatWorker(QThread):
                 #      （实测这是最高频的失败姿势：模型宁可贴代码也不落盘）
                 if (not calls and not write_done and fence_rescues < 1
                         and agent_mod.needs_write_action(last_user)):
-                    synth = agent_mod.synthesize_write_from_fence(text)
+                    # 用用户点名的文件名（"写个 calc.py" -> calc.py），
+                    # 别退化成笼统的 main.py
+                    synth = agent_mod.synthesize_write_from_fence(
+                        text,
+                        default_name=(agent_mod.filename_stem_from_text(last_user)
+                                      or None))
                     if synth:
                         fence_rescues += 1
                         calls = [synth]
@@ -561,24 +645,32 @@ class ChatWorker(QThread):
                     # 所有检查通过 -> 这才是最终答复。若它仍在"对着系统说明表态"，
                     # 换成基于真实工具结果的收尾，绝不把废话交给用户。
                     final = self._clean(text) or text
-                    # ★ 程序级硬保证（不靠模型自觉）：交付时必须带**真实验证证据**。
-                    #   触发条件之一：项目任务写完了却没真跑过验证 ——
-                    #   模型怎么催都不跑（实测 glm-4-flash 有过整轮 0 次执行、
-                    #   只把计划标完成就交差），那就**由程序自己跑一遍**。
-                    #   触发条件之二：虽然跑过，但最终答复里根本没贴证据
-                    #   （实测另一轮跑了 16 次、答复里却只有"我理解了…"的废话）。
-                    #   两者都靠 `_auto_verify()` 把真实输出直接附在答复后面；
-                    #   连跑都跑不起来时才降级为「诚实说明」。
-                    if (_project and write_done
-                            and (not verified_after_write or not _has_real_proof(final))):
+                    # ★★ 程序级「跑 -> 失败 -> 回灌真实报错 -> 让它修 -> 再跑」闭环 ★★
+                    #   不依赖模型自觉：只要这轮是「开发一个成品」且真的写过代码，
+                    #   系统就自己把程序跑起来。跑不过 -> 把**真实报错**塞回上下文，
+                    #   逼模型自己改（最多返修 2 次），改完再跑 —— 这才是真正的多轮 agent。
+                    #   （老写法只代跑一次，失败就写句"没验证过"交差。）
+                    if _project and write_done:
                         auto = self._auto_verify(written_paths)
                         if auto:
                             verified_after_write = True
                             self.out_messages.append({"role": "tool", "content": auto})
                             self.tool_result.emit(auto)
-                            final = (final.rstrip() + "\n\n---\n**程序自动补跑的验证**"
-                                     "（确保交付带真实证据，系统代跑了一遍）：\n\n"
-                                     + auto)
+                            if agent_mod.verify_failed(auto) and fix_rounds < 2:
+                                fix_rounds += 1
+                                self.notice.emit(
+                                    "系统代跑了一遍，**没通过** —— 已把真实报错交回模型"
+                                    f"继续修（第 {fix_rounds} 次返修），改完会重新运行。")
+                                self.api_messages.append(
+                                    {"role": "assistant", "content": text})
+                                self.api_messages.append(
+                                    {"role": "user",
+                                     "content": agent_mod.VERIFY_FIX_HINT.format(
+                                         output=auto[-2400:])})
+                                continue
+                            final = (final.rstrip()
+                                     + "\n\n---\n**程序自动运行的验证结果**"
+                                       "（系统代跑，以下是真实输出）：\n\n" + auto)
                         elif not verified_after_write:
                             final = (final.rstrip()
                                      + "\n\n> ⚠️ **说明**：本轮我只写出了代码文件，"
@@ -629,6 +721,7 @@ class ChatWorker(QThread):
                             {"role": "tool",
                              "content": f"[跳过] {name} 这个调用已连续失败 2 次，已停止重试。"})
                         continue
+                    self.phase.emit("tool", name)
                     self.tool_start.emit(
                         f"{name}  {json.dumps(call.get('arguments', {}), ensure_ascii=False)}")
 
@@ -651,9 +744,26 @@ class ChatWorker(QThread):
                     # 只有真写成功才算 write_done（写入报错时保持 False，好让催办继续）
                     if _is_write and str(result).startswith("[成功]"):
                         write_done = True
+                        # ★ 立刻把「执行器自己记下的真实写入路径」并进 written_paths。
+                        #   老代码只靠下面那个正则从返回文本里抠路径，而正则是
+                        #   `完整路径：(.+?)（` —— **要求后面跟着左括号**，
+                        #   但 write_file 现在返回的是
+                        #   `[成功] 已写入 N 字符，共 M 行 → 完整路径：E:\x.py`
+                        #   （结尾没有括号）-> 抠不出来 -> written_paths 为空 ->
+                        #   循环末尾的「代跑验证」因为找不到 .py 而静默跳过
+                        #   （2026-09-30 端到端实测：系统自动补跑=False）。
+                        #   runner.written 是工具层亲手记录的绝对路径，最可靠。
+                        try:
+                            for _f in (self.runner.written or []):
+                                _p = _f.get("path") if isinstance(_f, dict) else _f
+                                if _p and _p not in written_paths:
+                                    written_paths.append(_p)
+                        except Exception:
+                            pass
                     if name == "write_file":
-                        m = re.search(r"完整路径：(.+?)（", result) or \
-                            re.search(r"已写入 (.+?)（", result)
+                        # 兼容两种结尾：`完整路径：x.py（已确认落盘）` 和裸的 `完整路径：x.py`
+                        m = (re.search(r"完整路径：(.+?)(?:（|$)", result, re.M)
+                             or re.search(r"已写入 (.+?)(?:（|$)", result, re.M))
                         if m:
                             written_paths.append(m.group(1).strip())
                     elif name == "create_document":
@@ -701,8 +811,18 @@ class ChatWorker(QThread):
                                 f"{ok_counts[sig]} 次，结果完全相同，属于原地打转。"
                                 f"立刻停止重复它：直接做下一步，"
                                 f"或者给出最终答复（写清文件在哪、怎么运行）。")
-                    # 工具结果作为黄色卡片显示给用户
-                    self.out_messages.append({"role": "tool", "content": result})
+                    # 工具结果作为卡片显示给用户。
+                    # ★ 写入类工具必须**额外带上刚写进去的正文**：老写法只存一行
+                    #   「[成功] 已写入 520 字符，共 20 行 → …」，所以无论写多少行，
+                    #   界面上都只有那一行（用户 2026-09-30 反馈的 bug）。
+                    #   注意：只影响给界面看的 out_messages，回灌给模型的
+                    #   feedback_parts 仍是简短摘要，不浪费 token。
+                    shown = result
+                    if _is_write:
+                        prev = _write_preview(call)
+                        if prev:
+                            shown = result + "\n\n" + prev
+                    self.out_messages.append({"role": "tool", "content": shown})
                     feedback_parts.append(f"（工具 {name} 的真实输出）\n{result}")
 
                 if blocked_repeat:
@@ -789,7 +909,35 @@ class ChatWorker(QThread):
                 if not done:
                     self.out_messages.append({"role": "assistant", "content": warn.strip()})
 
+            # ---------- ★ 兜底代跑：循环无论怎么结束，写过代码就必须有真实输出 ----------
+            #   循环可能因三种原因结束：① 正常收尾（那条路径上已经跑过闭环）
+            #   ② max_iter 耗尽 ③ 用户点了停止。
+            #   后两种以前直接进收尾，**代跑验证压根没机会执行**
+            #   （2026-09-30 实测：模型为 ModuleNotFoundError 空转 21 轮把迭代耗尽，
+            #    用户最后只拿到一句道歉，界面上一条真实输出都没有）。
+            if _project and write_done and not verified_after_write:
+                auto = self._auto_verify(written_paths)
+                if auto:
+                    verified_after_write = True
+                    self.out_messages.append({"role": "tool", "content": auto})
+                    self.tool_result.emit(auto)
+                    _tail = ("\n\n---\n**程序自动运行的验证结果**"
+                             "（系统代跑，以下是真实输出）：\n\n" + auto)
+                    _added = False
+                    for m in reversed(self.out_messages):
+                        if m.get("role") == "assistant":
+                            m["content"] = (m.get("content") or "") + _tail
+                            _added = True
+                            break
+                    if not _added:
+                        self.out_messages.append(
+                            {"role": "assistant",
+                             "content": "这轮没跑完就停下了，我先把程序跑了一遍，"
+                                        "真实输出如下：\n\n" + auto})
+
+            self.phase.emit("idle", "")
             self.finished.emit(self.out_messages)
             self._emit_wrapup(last_user, tools_used, written_paths)
         except Exception as e:
+            self.phase.emit("idle", "")
             self.error.emit(str(e))

@@ -34,7 +34,8 @@ from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
 from .panels import PlanPanel
 from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
-                      strip_tool_markup, BODY_WIDTH, ChatInput, file_write_stats)
+                      strip_tool_markup, BODY_WIDTH, ChatInput, file_write_stats,
+                      StatusLine, tool_verb)
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
@@ -507,7 +508,7 @@ class MainWindow(QMainWindow):
         self.chat_container = QWidget()
         self.chat_layout = QVBoxLayout(self.chat_container)
         self.chat_layout.setContentsMargins(12, 12, 12, 12)
-        self.chat_layout.setSpacing(14)
+        self.chat_layout.setSpacing(10)
         self.chat_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.chat_scroll.setWidget(self.chat_container)
         right.addWidget(self.chat_scroll, 1)
@@ -578,7 +579,8 @@ class MainWindow(QMainWindow):
         self.send_btn.setObjectName("InputIconPrimary")
         self.send_btn.setFixedSize(36, 32)
         self.send_btn.setToolTip("发送（Enter）")
-        self.send_btn.clicked.connect(self._send)
+        # 同一个按钮两种身份：空闲=发送，生成中=停止（见 _on_send_clicked）
+        self.send_btn.clicked.connect(self._on_send_clicked)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
@@ -595,6 +597,11 @@ class MainWindow(QMainWindow):
         card_v.addWidget(self.input)
         card_v.addLayout(bottom)
 
+        # 状态行「模型现在正在干什么」：放在输入卡片正上方（仿 WorkBuddy）。
+        # 由 ChatWorker.phase 信号驱动：正在调用模型 / 正在执行 run_python /
+        # 正在生成回复 / 正在联网搜索 / 正在运行验证。
+        self.state_line = StatusLine()
+        right.addWidget(self.state_line)
         right.addWidget(self.input_card)
 
         body.addLayout(right, 1)
@@ -2647,7 +2654,7 @@ class MainWindow(QMainWindow):
             # （模型需要时仍可自己显式调 web_search 工具）。
             enable_search=(bool(self.settings.get("enable_search", True))
                            and agent_mod.needs_web_search(text)),
-            max_iter=24,
+            max_iter=28,
             plan=self.conv.get("plan"),
         )
         self.worker.token.connect(self._on_token)
@@ -2659,13 +2666,64 @@ class MainWindow(QMainWindow):
         self.worker.plan_changed.connect(self._on_plan_changed)
         self.worker.notice.connect(self._on_notice)
         self.worker.wrapup.connect(self._on_wrapup)
+        self.worker.phase.connect(self._on_phase)
         self.running = True
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("…")
+        # 生成中：右下角按钮变成红色方形「停止」，点一下就能打断模型
+        self._set_stop_mode(True)
+        self.state_line.set_phase("model", "")
         self._open_page("chat")
         # 发新消息必须强制贴底
         self._render(stick=True)
         self.worker.start()
+
+    def _on_send_clicked(self):
+        """右下角按钮：空闲=发送；生成中=停止（打断模型）。"""
+        if self.running:
+            self._interrupt()
+        else:
+            self._send()
+
+    def _interrupt(self):
+        """打断当前生成。"""
+        w = self.worker
+        if w is None or not self.running:
+            return
+        try:
+            w.abort()
+        except Exception:
+            pass
+        self.state_line.set_phase("stop", "正在收尾")
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("…")
+        self.statusBar().showMessage("已停止本轮生成，正在收尾…", 4000)
+
+    def _set_stop_mode(self, stop):
+        """切换右下角按钮的形态：生成中=红色方形停止键，空闲=蓝色圆形发送键。"""
+        t = themes.tokens()
+        try:
+            if stop:
+                self.send_btn.setText("■")
+                self.send_btn.setToolTip("停止生成（点一下打断模型）")
+                self.send_btn.setEnabled(True)
+                self.send_btn.setStyleSheet(
+                    f"QPushButton{{background:{t['danger']};color:#ffffff;"
+                    "border:none;border-radius:9px;font-size:13px;padding:0px;}"
+                    f"QPushButton:hover{{background:{t['danger']};}}")
+            else:
+                self.send_btn.setText("➤")
+                self.send_btn.setToolTip("发送（Enter）")
+                self._style_input_area()
+        except Exception:
+            pass
+
+    def _on_phase(self, kind, detail):
+        """模型阶段变化 -> 状态行。"""
+        try:
+            if kind == "tool":
+                detail = tool_verb(detail)
+            self.state_line.set_phase(kind, detail or "")
+        except Exception:
+            pass
 
     def _on_notice(self, text):
         self.statusBar().showMessage(text[:160], 12000)
@@ -2738,9 +2796,13 @@ class MainWindow(QMainWindow):
 
     def _finish_run(self):
         self.running = False
+        self._set_stop_mode(False)          # 按钮恢复成圆形发送键
         self.send_btn.setEnabled(bool(self.input.toPlainText().strip())
                                  or bool(self.attachments))
-        self.send_btn.setText("➤")
+        try:
+            self.state_line.set_phase("idle", "")
+        except Exception:
+            pass
         self.statusBar().clearMessage()
         self._refresh_chips()
         self._load_conversations()
@@ -2885,6 +2947,12 @@ class MainWindow(QMainWindow):
             if w is not None:
                 if hasattr(w, "stop"):
                     w.stop()
+                # ★ 先 setParent(None) 立刻脱离父子关系，再 deleteLater。
+                #   只调 deleteLater 的话，控件要等事件循环才真正销毁，
+                #   在那之前它仍然是 chat_container 的子控件、**仍会按原位绘制** ——
+                #   所以重建时会出现「旧卡片 / 欢迎页和新消息叠在一起」的残影
+                #   （2026-09-30 截图复现）。
+                w.setParent(None)
                 w.deleteLater()
 
     def _scroll_to_bottom(self, force=False):
@@ -2935,11 +3003,24 @@ class MainWindow(QMainWindow):
             label = tool_label(content) if role == "tool" else None
             # 文件写入卡片：从工具结果文本解析 +N / -N
             stats = file_write_stats(content) if role == "tool" else None
+            # 中间过程分级：带结论 / 原因 / 建议 / 报错定位的那几句默认**展开**
+            # （左侧加一道强调竖线），"我来帮你看看"这种流水话才折叠。
+            # 用户原话："中间过程性的那些话并不是每一句都是要隐藏的，
+            #           那些重点的结论那种留着"。
+            emphasis = False
+            if role == "thinking":
+                emphasis = agent_mod.is_key_progress(content)
             # 折叠状态跨重建保持：优先用用户手动设置过的值
             saved = self._card_collapsed.get(self._card_key(m, i, role))
+            if saved is None and role == "thinking":
+                saved = not emphasis          # 重点默认展开
             card = MessageCard.from_text(role, content, footer_text=footer,
                                         label=label, index=i,
-                                        stats=stats, collapsed=saved)
+                                        stats=stats, collapsed=saved,
+                                        emphasis=emphasis)
+            # 分组留白：过程卡片贴紧，正式消息之间留出呼吸感
+            card.setContentsMargins(
+                0, 2 if role in ("tool", "thinking") else 8, 0, 0)
             if role in ("assistant", "user", "tool"):
                 card.copy_requested.connect(lambda _=False, c=m: self._copy_msg(c))
                 card.delete_requested.connect(

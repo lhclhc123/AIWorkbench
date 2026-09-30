@@ -133,6 +133,101 @@ def file_write_stats(content):
     return add, 0
 
 
+def tool_mark(content):
+    """工具胶囊右侧的状态点：✓ 成功 / ✕ 异常 / ⏭ 跳过。"""
+    s = (content or "").lstrip()
+    for pre in ("[错误]", "[拒绝]", "[取消]"):
+        if s.startswith(pre):
+            return "✕"
+    if s.startswith("[跳过]") or "已连续失败" in s:
+        return "⏭"
+    return "✓"
+
+
+# 工具名 -> 中文短名（胶囊上显示的动词，仿 WorkBuddy 的「正在做 X」）
+_TOOL_VERB = {
+    "run_python": "执行代码", "run_command": "执行命令", "write_file": "写入文件",
+    "read_file": "读取文件", "list_dir": "列出目录", "web_search": "联网搜索",
+    "fetch_url": "抓取网页", "http_request": "HTTP 请求", "download_file": "下载文件",
+    "create_document": "生成文档", "read_document": "解析文档", "update_plan": "更新计划",
+    "remember": "记住", "recall": "回忆", "build_exe": "打包程序", "screenshot": "截屏",
+    "system_info": "读取系统信息", "list_processes": "查看进程", "use_skill": "调用技能",
+}
+
+
+def tool_verb(name):
+    """工具名 -> 中文短名（状态行显示「正在执行代码」这种）。"""
+    return _TOOL_VERB.get((name or "").strip(), (name or "工具"))
+
+
+class StatusLine(QWidget):
+    """输入框正上方的一行细状态条：「模型现在正在干什么」。
+
+    WorkBuddy 里这一行一直在，用户随时知道是"在调模型 / 在跑工具 / 在写回复"，
+    不用猜是不是卡住了。这里用 QLabel 拼，跟着主题走，空闲时淡下来。
+    """
+
+    _PHASES = {
+        "idle":   ("●", "就绪"),
+        "model":  ("🧠", "正在调用模型"),
+        "answer": ("✍️", "正在生成回复"),
+        "tool":   ("🔧", "正在执行"),
+        "search": ("🔍", "正在联网搜索"),
+        "verify": ("🧪", "正在运行验证"),
+        "write":  ("📝", "正在写文件"),
+        "stop":   ("⏹", "已停止"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        t = themes.tokens()
+        self._kind = "idle"
+        self._detail = ""
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 6, 0)
+        lay.setSpacing(6)
+        self.icon = QLabel("●")
+        self.icon.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
+        self.label = QLabel("就绪")
+        self.label.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
+        lay.addWidget(self.icon)
+        lay.addWidget(self.label)
+        lay.addStretch(1)
+        self._n = 0
+        self._t = QTimer(self)
+        self._t.timeout.connect(self._tick)
+
+    def set_phase(self, kind, detail=""):
+        """kind 见 _PHASES；detail 是补充（如工具名）。"""
+        t = themes.tokens()
+        kind = kind if kind in self._PHASES else "idle"
+        self._kind, self._detail = kind, detail or ""
+        icon, text = self._PHASES[kind]
+        busy = kind not in ("idle", "stop")
+        color = t["accent_text"] if busy else t["text_muted"]
+        self.icon.setText(icon)
+        self.label.setText(("%s %s" % (text, self._detail)).strip())
+        self.icon.setStyleSheet(f"color:{color};font-size:12px;")
+        self.label.setStyleSheet(f"color:{color};font-size:12px;")
+        if busy and not self._t.isActive():
+            self._n = 0
+            self._t.start(420)
+        elif not busy:
+            self._t.stop()
+        if not busy:
+            self.label.setText(("%s %s" % (self._PHASES[kind][1],
+                                           self._detail)).strip())
+
+    def _tick(self):
+        self._n = (self._n + 1) % 4
+        _, text = self._PHASES[self._kind]
+        self.label.setText(("%s %s" % (text, self._detail)).strip()
+                           + "·" * self._n)
+
+    def stop(self):
+        self._t.stop()
+
+
 class ChatInput(QPlainTextEdit):
     """聊天输入框：Enter 发送，Shift+Enter 换行。
 
@@ -372,7 +467,7 @@ class MessageCard(QWidget):
 
     def __init__(self, role, prose_html="", blocks=None, raw_text="", parent=None,
                  footer_text="", label=None, timestamp="", index=-1, actions=True,
-                 stats=None, collapsed=None):
+                 stats=None, collapsed=None, emphasis=False):
         super().__init__(parent)
         t = themes.tokens()
         self.role = role
@@ -381,6 +476,7 @@ class MessageCard(QWidget):
         self._prose = prose_html or ""
         self._blocks = blocks or []
         self._stats = stats                    # (新增行数, 删除行数) 或 None
+        self._emphasis = bool(emphasis)        # 关键中间结论（保留可见 + 左侧竖线）
         self._label = label if label else _ROLE_LABEL.get(role, role)
         self._collapsible = role in _COLLAPSIBLE_ROLES
         # 折叠初值：工具 / 深度思考默认收起；也可由外部显式指定（用于跨重建恢复）
@@ -397,9 +493,19 @@ class MessageCard(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(6)
-        prefix = "◍ " if role == "assistant" else ""
-        label = QLabel(prefix + self._label)
+        _ICO = {"tool": "⚙", "thinking": "💭", "assistant": "◍", "user": ""}
+        prefix = _ICO.get(role, "")
+        label = QLabel((prefix + " " + self._label).strip())
         header.addWidget(label)
+        # 工具胶囊的状态点：✓ 成功 / ✕ 异常 —— 收起时也能一眼看出这步行不行
+        self._mark = QLabel("")
+        if role == "tool":
+            self._mark.setText(tool_mark(raw_text))
+            _ok = self._mark.text() == "✓"
+            self._mark.setStyleSheet(
+                f"color:{t['success'] if _ok else t['danger']};"
+                "font-size:12px;font-weight:bold;")
+            header.addWidget(self._mark)
         if timestamp:
             ts = QLabel(timestamp)
             ts.setStyleSheet(f"color:{t['text_muted']};font-size:10px;")
@@ -411,6 +517,14 @@ class MessageCard(QWidget):
         def _mk(text, tip, slot, width=44):
             b = QPushButton(text)
             b.setObjectName("MsgAction")
+            if role == "user":
+                # 蓝色气泡上的操作按钮：灰字在上面根本看不清，改用浅色
+                # （全局 QSS 里的 MsgAction 是按浅底设计的）。
+                b.setStyleSheet(
+                    "QPushButton{background:transparent;color:#e8f2ff;border:none;"
+                    "font-size:11px;padding:1px 6px;border-radius:6px;}"
+                    "QPushButton:hover{background:rgba(255,255,255,0.24);"
+                    "color:#ffffff;}")
             b.setToolTip(tip)
             b.setFixedHeight(22)
             b.setMinimumWidth(width)
@@ -483,37 +597,53 @@ class MessageCard(QWidget):
         vbox.addWidget(self.footer)
 
         if role == "user":
+            vbox.setContentsMargins(14, 9, 14, 9)
             bubble.setStyleSheet(
-                f"background:{t['user_bg']};border-radius:{RADIUS_BUBBLE}px;")
-            label.setStyleSheet(f"color:{t['user_label']};font-size:12px;font-weight:bold;")
+                f"background:{t['user_bg']};border:none;"
+                f"border-radius:{RADIUS_BUBBLE}px;")
+            label.setStyleSheet(
+                f"color:{t['user_label']};font-size:11px;font-weight:bold;")
             body.setStyleSheet("background:transparent;border:none;color:#ffffff;"
                                f"padding:0px;font-size:{themes.fs(16)};line-height:1.75;")
             outer.addStretch(1)
             outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
             outer.addStretch(0)
-        elif role == "thinking":
-            # 中间过程块：更灰、更小，与最终结论明显区分
-            bubble.setStyleSheet(
-                f"background:{t['chip_bg']};border:1px solid {t['border']};"
-                f"border-radius:{RADIUS_CARD}px;")
+        elif role == "assistant":
+            # ★ 仿 WorkBuddy：助手回复**不加气泡、不描边**，正文直接铺在聊天底色上。
+            #   以前每条回复都套一圈灰底+描边，满屏都是"框"，喧宾夺主（用户 2026-09-30 反馈）。
+            vbox.setContentsMargins(4, 2, 10, 2)
+            bubble.setStyleSheet("background:transparent;border:none;")
             label.setStyleSheet(
-                f"color:{t['text_muted']};font-size:12px;font-weight:bold;")
-            body.setStyleSheet("background:transparent;border:none;color:"
-                               + t["text_muted"] + ";"
-                               f"padding:0px;font-size:{themes.fs(13)};line-height:1.7;")
+                f"color:{t['text_muted']};font-size:11px;font-weight:bold;")
+            body.setStyleSheet("background:transparent;border:none;color:" + t["ai_text"] + ";"
+                               f"padding:0px;font-size:{themes.fs(16)};line-height:1.78;")
             outer.addStretch(0)
             outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
             outer.addStretch(1)
         else:
-            bg = t["ai_bg"] if role == "assistant" else t["tool_bg"]
-            fg = t["ai_text"] if role == "assistant" else t["tool_text"]
-            lg = t["ai_label"] if role == "assistant" else t["tool_label"]
-            bubble.setStyleSheet(
-                f"background:{bg};border:1px solid {t['border']};"
-                f"border-radius:{RADIUS_BUBBLE}px;")
-            label.setStyleSheet(f"color:{lg};font-size:12px;font-weight:bold;")
-            body.setStyleSheet("background:transparent;border:none;color:" + fg + ";"
-                               f"padding:0px;font-size:{themes.fs(16)};line-height:1.75;")
+            # 工具调用 / 中间过程：压成一行灰色**胶囊**，展开才看细节。
+            # `emphasis=True` 的「关键中间结论」用左侧强调竖线 + 正常字色，
+            # 与流水账式的碎语（更灰、更小）区分开 —— 用户要求
+            # "中间的话不是每句都要藏，重点结论要留着"。
+            vbox.setContentsMargins(10, 4, 8, 4)
+            vbox.setSpacing(5)
+            if emphasis:
+                bubble.setStyleSheet(
+                    f"background:{t['chip_bg']};border:none;"
+                    f"border-left:3px solid {t['accent']};border-radius:8px;")
+                label.setStyleSheet(
+                    f"color:{t['accent_text']};font-size:12px;font-weight:bold;")
+                body.setStyleSheet("background:transparent;border:none;color:"
+                                   + t["text"] + ";"
+                                   f"padding:0px;font-size:{themes.fs(14)};line-height:1.72;")
+            else:
+                bubble.setStyleSheet(
+                    f"background:{t['chip_bg']};border:none;border-radius:8px;")
+                label.setStyleSheet(
+                    f"color:{t['text_muted']};font-size:11px;font-weight:bold;")
+                body.setStyleSheet("background:transparent;border:none;color:"
+                                   + t["text_muted"] + ";"
+                                   f"padding:0px;font-size:{themes.fs(13)};line-height:1.7;")
             outer.addStretch(0)
             outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
             outer.addStretch(1)
@@ -523,12 +653,14 @@ class MessageCard(QWidget):
     # ---------- 构造入口 ----------
     @classmethod
     def from_text(cls, role, text, parent=None, footer_text="", label=None,
-                  timestamp="", index=-1, actions=True, stats=None, collapsed=None):
+                  timestamp="", index=-1, actions=True, stats=None, collapsed=None,
+                  emphasis=False):
         from .. import markdown_render
         prose, blocks = markdown_render.render_with_blocks(text)
         return cls(role, prose, blocks, raw_text=text or "", parent=parent,
                    footer_text=footer_text, label=label, timestamp=timestamp,
-                   index=index, actions=actions, stats=stats, collapsed=collapsed)
+                   index=index, actions=actions, stats=stats, collapsed=collapsed,
+                   emphasis=emphasis)
 
     def set_footer(self, text):
         t = themes.tokens()
