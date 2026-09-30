@@ -4,6 +4,9 @@ dist_v*/
 dist_old_v*/
 build/
 build_v*_version.txt
+# PyInstaller 打包时自动改写 spec（内含本机绝对路径 + 版本号文件路径），
+# 属生成物、每版必变 —— 由 build_v*.py 现场生成，不进仓库。
+AIWorkbench.spec
 *.spec.bak
 
 # ---- Python ----

@@ -10,6 +10,19 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from .. import llm_client, agent as agent_mod
 
 
+# 最终答复里「算得上真实验证证据」的标志。
+# 没有这些就说明模型只是在口头说"已完成"（实测有整轮跑了 16 次、
+# 最后答复却只有"我理解了，之前的操作有重复…"这种废话）。
+_PROOF_MARKERS = ("退出码", "PASS", "FAIL", "True", "False", "rc =", "rc=",
+                  "标准输出", "测试通过", "断言")
+
+
+def _has_real_proof(text):
+    """答复里有没有贴出真实的验证证据（而不是只说"已完成"）。"""
+    t = text or ""
+    return any(m in t for m in _PROOF_MARKERS)
+
+
 class ChatWorker(QThread):
     token = pyqtSignal(str)            # 增量文本
     tool_start = pyqtSignal(str)       # 工具调用描述
@@ -167,6 +180,61 @@ class ChatWorker(QThread):
         if not missing:
             return None
         return agent_mod.COMPLETION_HINT.format(gaps="- " + missing[:120])
+
+    def _auto_verify(self, paths):
+        """模型死活不肯自己跑验证时，由程序代跑一遍冒烟测试。
+
+        2026-09-30 实测：glm-4-flash 有过整整一轮 **0 次执行** ——
+        写完 prime.py 就把「自测跑通」标成已完成并交差，催办全打不动。
+        用户的诉求是「你确定他做完会自己跑测试吗」，所以要给一个**硬保证**：
+        模型不跑，程序替它跑，把真实输出（退出码 + stdout/stderr + PASS/FAIL）
+        直接贴进答复。
+
+        返回真实输出字符串；确实没得跑（没有 .py 产物）时返回空串。
+        """
+        target = ""
+        for p in (paths or []):
+            if p and str(p).lower().endswith(".py"):
+                target = str(p)          # 取最后一个 .py 作为入口
+        if not target:
+            return ""
+        safe = target.replace("\\", "\\\\").replace("'", "\\'")
+        code = (
+            "import importlib.util, subprocess, sys\n"
+            f"p = r'{safe}'\n"
+            "print('入口文件:', p)\n"
+            # ① 当脚本直接跑一遍（有 __main__ 自测的会输出来）
+            "r = subprocess.run([sys.executable, p], capture_output=True, text=True,\n"
+            "                   encoding='utf-8', errors='replace', timeout=60)\n"
+            "print('直接运行退出码:', r.returncode)\n"
+            "out = (r.stdout or '').strip()\n"
+            "err = (r.stderr or '').strip()\n"
+            "print('标准输出:', out[-900:] if out else '(空)')\n"
+            "print('标准错误:', err[-400:] if err else '(空)')\n"
+            # ② 再验证能不能被 import（很多模块没有 __main__ 块，直接运行什么都不打印，
+            #    但"能被正常导入"至少证明没有语法错误、没有导入期异常）
+            "try:\n"
+            "    spec = importlib.util.spec_from_file_location('awb_target', p)\n"
+            "    mod = importlib.util.module_from_spec(spec)\n"
+            "    spec.loader.exec_module(mod)\n"
+            "    fns = [n for n in dir(mod)\n"
+            "           if not n.startswith('_')\n"
+            "           and callable(getattr(mod, n))\n"
+            "           and getattr(getattr(mod, n), '__module__', None) == 'awb_target']\n"
+            "    print('可导入: 是；模块里可调用的对象:', fns[:12])\n"
+            "    imp_ok = True\n"
+            "except Exception as e:\n"
+            "    print('可导入: 否 ->', type(e).__name__, e)\n"
+            "    imp_ok = False\n"
+            "ok = (r.returncode == 0) and imp_ok\n"
+            "print('结论: PASS —— 能被 Python 正常执行/导入，无语法或运行时错误'\n"
+            "      if ok else '结论: FAIL —— 执行或导入报错，需要修')\n"
+        )
+        try:
+            return self.runner.execute(
+                {"name": "run_python", "arguments": {"code": code, "timeout": 90}})
+        except Exception as e:                       # noqa: BLE001
+            return f"[自动验证失败] {e}"
 
     def _fallback_summary(self):
         """模型只回了一堆"感谢提醒 / 我明白了"式废话时，
@@ -493,17 +561,30 @@ class ChatWorker(QThread):
                     # 所有检查通过 -> 这才是最终答复。若它仍在"对着系统说明表态"，
                     # 换成基于真实工具结果的收尾，绝不把废话交给用户。
                     final = self._clean(text) or text
-                    # ★ 诚实兜底（硬保证，不靠模型自觉）：
-                    #   项目类任务代码写出来了、却始终没有真的跑过验证 ——
-                    #   宁可当场说明，也绝不让用户以为"测试过了"。
-                    #   （2026-09-30 实测：一轮里模型把「自测跑通」标成已完成，
-                    #     真实情况是一次测试都没跑。）
-                    if _project and write_done and not verified_after_write:
-                        final = (final.rstrip()
-                                 + "\n\n> ⚠️ **说明**：本轮我只写出了代码文件，"
-                                   "**没有真的运行过验证**（没跑测试）。"
-                                   "上面写的「已完成」只代表文件已生成，"
-                                   "**不代表验证通过**；要我再跑一遍就说一声。")
+                    # ★ 程序级硬保证（不靠模型自觉）：交付时必须带**真实验证证据**。
+                    #   触发条件之一：项目任务写完了却没真跑过验证 ——
+                    #   模型怎么催都不跑（实测 glm-4-flash 有过整轮 0 次执行、
+                    #   只把计划标完成就交差），那就**由程序自己跑一遍**。
+                    #   触发条件之二：虽然跑过，但最终答复里根本没贴证据
+                    #   （实测另一轮跑了 16 次、答复里却只有"我理解了…"的废话）。
+                    #   两者都靠 `_auto_verify()` 把真实输出直接附在答复后面；
+                    #   连跑都跑不起来时才降级为「诚实说明」。
+                    if (_project and write_done
+                            and (not verified_after_write or not _has_real_proof(final))):
+                        auto = self._auto_verify(written_paths)
+                        if auto:
+                            verified_after_write = True
+                            self.out_messages.append({"role": "tool", "content": auto})
+                            self.tool_result.emit(auto)
+                            final = (final.rstrip() + "\n\n---\n**程序自动补跑的验证**"
+                                     "（确保交付带真实证据，系统代跑了一遍）：\n\n"
+                                     + auto)
+                        elif not verified_after_write:
+                            final = (final.rstrip()
+                                     + "\n\n> ⚠️ **说明**：本轮我只写出了代码文件，"
+                                       "**没有真的运行过验证**（没跑测试）。"
+                                       "上面写的「已完成」只代表文件已生成，"
+                                       "**不代表验证通过**；要我再跑一遍就说一声。")
                     if agent_mod.is_meta_talk(final) and any(
                             m.get("role") == "tool" for m in self.out_messages):
                         final = self._fallback_summary()
