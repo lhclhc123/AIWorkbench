@@ -130,8 +130,10 @@ class Recorder:
     """
 
     def __init__(self, rate=RATE, channels=CHANNELS, device=None,
-                 silence_seconds=3.0, min_seconds=1.0, max_seconds=300):
-        """silence_seconds：静音多久算"说完了"（默认 3 秒，别太短，否则想词时被掐）。
+                 silence_seconds=10.0, min_seconds=1.0, max_seconds=300):
+        """silence_seconds：静音多久算"说完了"（默认 10 秒）。
+        用户 2026-09-30 明确要求："我说话中间停顿个 10 秒左右再停"——
+        旧默认 3 秒（更早 1.6 秒）在正常说话换气/想词时就会被提前掐断。
         min_seconds：最少录多久才允许自动停（防"嗯"一声就结束）。
         max_seconds：最长录音（默认 5 分钟，到点自动停；也可以手动点停）。
         """

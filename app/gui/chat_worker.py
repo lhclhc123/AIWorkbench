@@ -38,10 +38,27 @@ class ChatWorker(QThread):
         self._abort = False
         self._confirm_event = threading.Event()
         self._confirm_res = False
+        # 真思维链（reasoning_content）累积缓冲：只有支持思维链的模型才会往里写，
+        # 其它模型回调 0 次，行为与以前完全一致。
+        self._reason_buf = []
 
     def confirm(self, ok: bool):
         self._confirm_res = ok
         self._confirm_event.set()
+
+    # ---------- 真思维链（reasoning_content）----------
+    def _collect_reason(self, delta):
+        """收集思维链增量（默认 None 的模型不会调用）。"""
+        if delta and not self._abort:
+            self._reason_buf.append(delta)
+
+    def _take_reason(self, limit=6000):
+        """取走并清空思维链缓冲。过长时截断，避免把对话文件撑爆。"""
+        txt = "".join(self._reason_buf).strip()
+        self._reason_buf = []
+        if len(txt) > limit:
+            txt = txt[:limit] + "\n…（思维链过长，已截断）"
+        return txt
 
     # ---------- 注入给 AgentRunner 的回调（工具执行时在工作线程内被调用）----------
     def _search_cb(self, query):
@@ -232,9 +249,13 @@ class ChatWorker(QThread):
             if not self.agent_mode:
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
-                    on_token=self._on_token)
+                    on_token=self._on_token, on_reasoning=self._collect_reason)
                 self._after_chat()
                 clean = self._clean(text)
+                # 有真思维链就先留一块「深度思考」（单轮问答也能有 CoT）
+                _reason = self._take_reason()
+                if _reason:
+                    self.out_messages.append({"role": "thinking", "content": _reason})
                 self.api_messages.append({"role": "assistant", "content": clean})
                 self.out_messages.append({"role": "assistant", "content": clean})
                 self.finished.emit(self.out_messages)
@@ -287,8 +308,9 @@ class ChatWorker(QThread):
 
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
-                    on_token=self._on_token)
+                    on_token=self._on_token, on_reasoning=self._collect_reason)
                 self._after_chat()
+                _reason = self._take_reason()   # 本轮的思维链（无则空串）
                 if not text:
                     break
 
@@ -352,8 +374,10 @@ class ChatWorker(QThread):
                             {"role": "user", "content": agent_mod.BUILD_EXE_HINT})
                         continue
                     # A-2c) 项目流程最后一关：写完代码必须**真的跑一遍**才算交付
+                    #       （最多催 2 次：实测 glm-4-flash 催 1 次时常常只是
+                    #        把计划标成 done 就收工，第 2 次才真的去跑）
                     if (_project and write_done and not verified_after_write
-                            and project_verify_nudges < 1):
+                            and project_verify_nudges < 2):
                         project_verify_nudges += 1
                         self.api_messages.append({"role": "assistant", "content": text})
                         self.api_messages.append(
@@ -469,12 +493,40 @@ class ChatWorker(QThread):
                     # 所有检查通过 -> 这才是最终答复。若它仍在"对着系统说明表态"，
                     # 换成基于真实工具结果的收尾，绝不把废话交给用户。
                     final = self._clean(text) or text
+                    # ★ 诚实兜底（硬保证，不靠模型自觉）：
+                    #   项目类任务代码写出来了、却始终没有真的跑过验证 ——
+                    #   宁可当场说明，也绝不让用户以为"测试过了"。
+                    #   （2026-09-30 实测：一轮里模型把「自测跑通」标成已完成，
+                    #     真实情况是一次测试都没跑。）
+                    if _project and write_done and not verified_after_write:
+                        final = (final.rstrip()
+                                 + "\n\n> ⚠️ **说明**：本轮我只写出了代码文件，"
+                                   "**没有真的运行过验证**（没跑测试）。"
+                                   "上面写的「已完成」只代表文件已生成，"
+                                   "**不代表验证通过**；要我再跑一遍就说一声。")
                     if agent_mod.is_meta_talk(final) and any(
                             m.get("role") == "tool" for m in self.out_messages):
                         final = self._fallback_summary()
+                    # 最终答复轮的真思维链（reasoning_content）同样要留痕：
+                    # 落一条默认收起的「深度思考」块，且必须排在 assistant **之前**；
+                    # 一轮只会走「中间工具轮」或「最终答复轮」之一，故不会重复。
+                    if _reason:
+                        self.out_messages.append({"role": "thinking", "content": _reason})
                     self.api_messages.append({"role": "assistant", "content": final})
                     self.out_messages.append({"role": "assistant", "content": final})
                     break
+
+                # ---------- 把这一轮的「中间话」留痕（可折叠的「深度思考」块）----------
+                # 以前这段文字只进 api_messages，界面上"生成完就消失"。
+                # 现在额外 append 成 role="thinking"，由界面渲染成默认收起的「深度思考」块。
+                # 优先用模型的**真思维链**（reasoning_content）；没有思维链的模型
+                # （如 glm-4-flash，回调 0 次）则退回用它的中间正文，行为与以前一致。
+                # ⚠️ 绝不能影响 out_messages 里 assistant / tool 的语义：
+                #    工作总结（wrapup -> worklog）、files 统计、假成功防御（honest_ok）
+                #    都只认这两种角色，所以中间过程用独立的 thinking 角色承载。
+                _think = _reason or self._clean(text)
+                if _think:
+                    self.out_messages.append({"role": "thinking", "content": _think})
 
                 # ---------- 真正执行工具（一条回复里可能有多个调用，全部执行）----------
                 feedback_parts = []
@@ -539,9 +591,23 @@ class ChatWorker(QThread):
                         env_checked = True
                     if ok and name == "run_command":
                         env_checked = True
-                    if ok and write_done and name in ("run_python", "run_command",
-                                                      "read_file", "read_document"):
-                        verified_after_write = True
+                    # ★ 「写完代码后真的验证过」必须**确实碰了刚写的那个文件**。
+                    #   老写法：只要 write_done 之后再跑一个 run_python/run_command/
+                    #   read_file 就算"已验证" —— 2026-09-30 实测被这个漏洞坑了：
+                    #   模型写完 prime.py 后跑了一句 `print(sys.version)` 的环境检查，
+                    #   就被判定"已验证过"，于是验证催办 + 完成度看门狗全都不再触发，
+                    #   它直接把计划标 100% 完成，**一次冒烟测试都没跑**。
+                    #   现在要求：执行的代码/命令里出现刚写的文件名（或去掉扩展名的主名），
+                    #   否则不算验证。读文件也不算验证（读一眼不等于测过）。
+                    if ok and write_done and name in ("run_python", "run_command"):
+                        _blob = json.dumps(call.get("arguments", {}) or {},
+                                           ensure_ascii=False)
+                        _names = [os.path.basename(p) for p in written_paths if p]
+                        _stems = [os.path.splitext(n)[0] for n in _names if n]
+                        if (any(n and n in _blob for n in _names)
+                                or any(s and s in _blob for s in _stems)
+                                or any(s and s in str(result) for s in _stems)):
+                            verified_after_write = True
                     fail_counts[sig] = 0 if ok else fail_counts.get(sig, 0) + 1
                     # 同一个调用「成功」了好几次还继续发 —— 说明模型在原地打转
                     # （实测：update_plan / start / run_python 常被重复七八次，
@@ -610,8 +676,12 @@ class ChatWorker(QThread):
                     self.api_messages.append({"role": "user",
                                               "content": agent_mod.WRAPUP_HINT})
                     text = self.client.chat(self.api_messages, self.model_sel,
-                                            self.enable_search, on_token=self._on_token)
+                                            self.enable_search, on_token=self._on_token,
+                                            on_reasoning=self._collect_reason)
                     self._after_chat()
+                    _reason = self._take_reason()
+                    if _reason and text:
+                        self.out_messages.append({"role": "thinking", "content": _reason})
                     text = (text or "").strip()
                 except Exception:
                     text = ""

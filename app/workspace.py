@@ -23,7 +23,9 @@ DEFAULT_SETTINGS = {
     "prompt_version": config.PROMPT_VERSION,
     "selected_model": "auto",
     "model_policy": config.MODEL_FAILURE_POLICY,   # strict | fallback
-    "enable_search": False,
+    # v9.8 起：联网与 Agent 模式「默认开启」（用户要求，仿 WorkBuddy），
+    # 开关入口统一收进「设置」页，聊天页顶部不再放这一排控件。
+    "enable_search": True,
     "agent_mode": True,
     "theme": "light",
     "font_scale": 100,                             # 界面缩放（100 = 标准）
@@ -31,7 +33,7 @@ DEFAULT_SETTINGS = {
     "asr_prefer": "auto",
     "mic_device": -1,                              # -1 = 系统默认
     "voice_auto_send": False,                      # 说完自动发送
-    "voice_silence": 3.0,                          # 静音多少秒算说完（默认 3s，别太短）
+    "voice_silence": 10.0,                         # 静音多少秒算说完（默认 10s，用户要求）
     "voice_max_seconds": 300,                      # 单次录音最长秒数（5 分钟）
     "tts_enabled": False,                          # 自动朗读 AI 回复
     "tts_engine": config.TTS_DEFAULT_ENGINE,

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QTextBrowser, QMessageBox, QListWidget, QListWidgetItem, QComboBox, QCheckBox,
     QLineEdit, QDialog, QDialogButtonBox, QTabWidget, QGroupBox, QFormLayout,
     QSpinBox, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QDoubleSpinBox,
+    QHeaderView, QAbstractItemView, QDoubleSpinBox, QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
@@ -30,9 +30,14 @@ PAGES = [
     ("about", "ℹ", "关于"),
 ]
 
+# 侧栏「常显」的主项；其余页面收进「更多」折叠组。
+# 「工具」是要常看调用轨迹的核心页，所以放在一级；关于等收进「更多」。
+# 采用保守方案：PAGES 一项都不删（功能入口不丢），只是侧栏默认更清爽。
+NAV_PRIMARY = ("chat", "assistant", "tools", "settings")
+
 
 class NavRail(QWidget):
-    """左侧竖直导航栏。"""
+    """左侧竖直导航栏：常显少数主项，其余收进「更多」折叠组。"""
 
     changed = pyqtSignal(str)
 
@@ -54,19 +59,60 @@ class NavRail(QWidget):
 
         self.buttons = {}
         self._current = "chat"
-        for key, icon, name in PAGES:
+
+        def _make_button(key, icon, name):
             b = QPushButton(f"{icon}\n{name}")
             b.setObjectName("NavBtn")
             b.setCheckable(True)
             b.setFixedHeight(58)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda _=False, k=key: self.select(k))
-            v.addWidget(b)
             self.buttons[key] = b
+            return b
+
+        # 1) 主项（常显）
+        for key, icon, name in PAGES:
+            if key in NAV_PRIMARY:
+                v.addWidget(_make_button(key, icon, name))
+
         v.addStretch(1)
+
+        # 2) 「更多」折叠组：技能 / 定时 / 记忆 / 工具 / 集成
+        self._secondary = [p for p in PAGES if p[0] not in NAV_PRIMARY]
+        self.more_btn = None
+        self.more_box = None
+        if self._secondary:
+            self.more_btn = QPushButton("⋯\n更多")
+            self.more_btn.setObjectName("NavBtn")
+            self.more_btn.setCheckable(True)
+            self.more_btn.setFixedHeight(58)
+            self.more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.more_btn.setToolTip("展开 / 收起更多功能")
+            self.more_btn.clicked.connect(self._toggle_more)
+            v.addWidget(self.more_btn)
+
+            self.more_box = QWidget()
+            mv = QVBoxLayout(self.more_box)
+            mv.setContentsMargins(0, 0, 0, 0)
+            mv.setSpacing(6)
+            for key, icon, name in self._secondary:
+                mv.addWidget(_make_button(key, icon, name))
+            self.more_box.setVisible(False)
+            v.addWidget(self.more_box)
+
         self.buttons["chat"].setChecked(True)
 
+    def _toggle_more(self, checked=None):
+        if self.more_box is None:
+            return
+        show = self.more_btn.isChecked() if checked is None else bool(checked)
+        self.more_box.setVisible(show)
+
     def select(self, key):
+        # 选中二级页面时自动展开「更多」，保证入口可见、按钮高亮正确
+        if self.more_box is not None and any(p[0] == key for p in self._secondary):
+            self.more_btn.setChecked(True)
+            self._toggle_more(True)
         if key == self._current:
             return
         self._current = key
@@ -421,10 +467,8 @@ def _esc(s):
 _KEY_HINTS = {
     "zhipu": "智谱 Key（形如 xxxx.yyyy）——对话 / 看图 / 语音识别都用它，已内置一个",
     "scnet": "超算互联网 Key，形如 sk-…",
-    "baidu": "百度千帆 Key，形如 bce-v3/ALTAK-…",
-    "dashscope": "阿里百炼 Key，形如 sk-…（用于 Qwen 系列）",
-    "siliconflow": "硅基流动 Key，形如 sk-…（注册免费，可用于语音识别）",
-    "deepseek": "DeepSeek 官方 Key（需充值）",
+    "dashscope": "阿里百炼 Key，形如 sk-…（免费额度可跑 DeepSeek-V4.1 / Qwen 系列）",
+    "siliconflow": "硅基流动 Key，形如 sk-…（注册免费、实名后可用；★永久免费的 DeepSeek-R1 就在这一档，填了 Key 才能用）",
 }
 
 
@@ -473,6 +517,18 @@ class AssistantPage(QWidget):
         row.addStretch(1)
         v.addLayout(row)
 
+        # 「设置」区做成可折叠，默认收起 —— 把纵向空间让给消息列表。
+        self.settings_toggle = QPushButton("⚙ 设置 ▸")
+        self.settings_toggle.setObjectName("cardBtn")
+        self.settings_toggle.setFixedHeight(28)
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setChecked(False)
+        self.settings_toggle.clicked.connect(self._toggle_settings)
+        srow = QHBoxLayout()
+        srow.addWidget(self.settings_toggle)
+        srow.addStretch(1)
+        v.addLayout(srow)
+
         box = QGroupBox("设置")
         form = QFormLayout(box)
         self.sp_interval = QSpinBox()
@@ -493,6 +549,8 @@ class AssistantPage(QWidget):
         save = QPushButton("保存设置")
         save.clicked.connect(self._save_cfg)
         form.addRow(save)
+        box.setVisible(False)
+        self.cfg_box = box
         v.addWidget(box)
 
         lrow = QHBoxLayout()
@@ -509,22 +567,53 @@ class AssistantPage(QWidget):
         lrow.addStretch(1)
         v.addLayout(lrow)
 
-        v.addWidget(QLabel("消息列表："))
+        # 三段（列表 / 详情 / 日志）用竖向 QSplitter：可拖拽、互不挤压。
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        list_wrap = QWidget()
+        lv = QVBoxLayout(list_wrap)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(4)
+        lv.addWidget(QLabel("消息列表："))
         self.list = QListWidget()
-        self.list.setMinimumHeight(150)
+        self.list.setMinimumHeight(200)      # 至少能看全 8 条
         self.list.itemClicked.connect(self._show_detail)
-        v.addWidget(self.list, 2)
+        lv.addWidget(self.list, 1)
+        splitter.addWidget(list_wrap)
 
-        v.addWidget(QLabel("AI 处理结果："))
+        detail_wrap = QWidget()
+        dv = QVBoxLayout(detail_wrap)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.setSpacing(4)
+        dv.addWidget(QLabel("AI 处理结果："))
         self.detail = QTextBrowser()
-        self.detail.setMinimumHeight(140)
-        v.addWidget(self.detail, 2)
+        self.detail.setMinimumHeight(120)
+        dv.addWidget(self.detail, 1)
+        splitter.addWidget(detail_wrap)
 
-        v.addWidget(QLabel("运行日志："))
+        log_wrap = QWidget()
+        gv = QVBoxLayout(log_wrap)
+        gv.setContentsMargins(0, 0, 0, 0)
+        gv.setSpacing(4)
+        gv.addWidget(QLabel("运行日志："))
         self.logv = QPlainTextEdit()
         self.logv.setReadOnly(True)
-        self.logv.setMaximumHeight(110)
-        v.addWidget(self.logv)
+        self.logv.setMinimumHeight(80)
+        self.logv.setMaximumHeight(180)
+        gv.addWidget(self.logv, 1)
+        splitter.addWidget(log_wrap)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([300, 240, 140])
+        v.addWidget(splitter, 1)
+
+    def _toggle_settings(self, checked=None):
+        """折叠 / 展开「设置」区（默认收起）。"""
+        show = self.settings_toggle.isChecked() if checked is None else bool(checked)
+        self.cfg_box.setVisible(show)
+        self.settings_toggle.setText("⚙ 设置 ▾" if show else "⚙ 设置 ▸")
 
     # ---------- 对外接口 ----------
     def set_running(self, running):
@@ -542,12 +631,25 @@ class AssistantPage(QWidget):
 
     def add_message(self, msg):
         mid = msg.get("msgid") or ""
+        # 插入新消息会打乱行号，先记住当前选中的 msgid，插入后按 msgid 恢复选中
+        prev = self.selected_msgid()
         self.msgs[mid] = dict(msg, status="待处理", result="")
         txt = f"[{msg.get('time','')}] {msg.get('conv') or msg.get('sender') or '钉钉'}：{_trim(msg.get('text'), 70)}"
         it = QListWidgetItem(txt)
         it.setData(Qt.ItemDataRole.UserRole, mid)
         self.list.insertItem(0, it)
+        self._select_msgid(prev)
         return mid
+
+    def _select_msgid(self, mid):
+        """按 msgid 选中对应行（刷新 / 插入后恢复选中项，不靠行号）。"""
+        if not mid:
+            return
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == mid:
+                self.list.setCurrentItem(it)
+                return
 
     def update_status(self, msgid, status, result=None):
         m = self.msgs.get(msgid)
@@ -1389,7 +1491,7 @@ class SettingsPage(QWidget):
         for d in self._devices:
             self.mic_cb.addItem(f"{d['name']}（{d['channels']} 声道）", d["index"])
         f.addRow("麦克风：", self.mic_cb)
-        self.silence_spin = QDoubleSpinBoxCompat(0.5, 30.0, 0.5, 3.0)
+        self.silence_spin = QDoubleSpinBoxCompat(0.5, 30.0, 0.5, 10.0)
         f.addRow("静音多久算说完：", self.silence_spin)
         self.max_rec_spin = QSpinBox()
         self.max_rec_spin.setRange(30, 1800)
@@ -1500,7 +1602,7 @@ class SettingsPage(QWidget):
         self.theme_cb.setCurrentIndex(max(0, i))
         self.font_spin.setValue(int(s.get("font_scale", 100) or 100))
         self.agent_cb.setChecked(bool(s.get("agent_mode", True)))
-        self.search_cb.setChecked(bool(s.get("enable_search", False)))
+        self.search_cb.setChecked(bool(s.get("enable_search", True)))
         j = self.policy_cb.findData(s.get("model_policy", "strict"))
         self.policy_cb.setCurrentIndex(max(0, j))
 
@@ -1508,7 +1610,7 @@ class SettingsPage(QWidget):
         self.asr_cb.setCurrentIndex(max(0, k))
         m = self.mic_cb.findData(int(s.get("mic_device", -1) or -1))
         self.mic_cb.setCurrentIndex(max(0, m))
-        self.silence_spin.setValue(float(s.get("voice_silence", 3.0) or 3.0))
+        self.silence_spin.setValue(float(s.get("voice_silence", 10.0) or 10.0))
         self.max_rec_spin.setValue(int(s.get("voice_max_seconds", 300) or 300))
         self.auto_send_cb.setChecked(bool(s.get("voice_auto_send")))
         self.tts_on.setChecked(bool(s.get("tts_enabled")))
@@ -1560,7 +1662,7 @@ class QDoubleSpinBoxCompat(QDoubleSpinBox):
     """浮点秒数输入框（录音静音的等待时间等）。"""
 
     def __init__(self, minimum=0.5, maximum=30.0, step=0.5,
-                 value=3.0, parent=None):
+                 value=10.0, parent=None):
         super().__init__(parent)
         self.setDecimals(1)
         self.setRange(float(minimum), float(maximum))

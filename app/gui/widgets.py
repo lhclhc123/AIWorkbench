@@ -11,7 +11,8 @@ import re
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
-    QTextBrowser, QTextEdit, QFileDialog, QMessageBox,
+    QTextBrowser, QTextEdit, QPlainTextEdit, QFileDialog, QMessageBox,
+    QApplication,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QIcon, QFont as QGFont, QGuiApplication
@@ -23,7 +24,11 @@ CODE_LINE_H = 22          # 代码块每行像素高（与 CSS line-height 保�
 RADIUS_BUBBLE = 16
 RADIUS_CARD = 12
 
-_ROLE_LABEL = {"user": "你", "assistant": "AI 助手", "tool": "工具"}
+# 角色 -> 标题栏文案。"thinking" 是 v9.8 新增的「深度思考」中间过程块。
+_ROLE_LABEL = {"user": "你", "assistant": "AI 助手", "tool": "工具",
+               "thinking": "深度思考"}
+# 可折叠卡片类型（工具调用、文件写入、深度思考）—— 默认收起，只留一行标题
+_COLLAPSIBLE_ROLES = ("tool", "thinking")
 
 
 def make_icon():
@@ -90,6 +95,86 @@ def strip_tool_markup(text):
     s = re.sub(r"<tool_call>.*", "", s, flags=re.DOTALL)
     s = re.sub(r"<tool_?c?a?l?l?$", "", s)
     return s.strip()
+
+
+# 从文件写入工具的结果里解析行数徽标（+N / -N）。
+# 首选：工具返回的**真实行数**（agent.write_file / create_document 的新格式）：
+#   write_file      -> `[成功] 已写入 {chars} 字符，共 {lines} 行 → 完整路径：…`
+#   create_document -> `[成功] 已生成{label}：{path}（{size}，共 {lines} 行，已确认落盘）`
+# 兜底：老格式只有字符数，按每行约 40 字估算。
+# 删除行数任何情况下都拿不到，恒为 0。
+_WRITE_LINES_RE = re.compile(r"共\s*(\d+)\s*行")
+_WRITE_CHARS_PER_LINE = 40
+_WRITE_CHARS_RE = re.compile(r"已写入\s+(\d+)\s+字符")
+
+
+def file_write_stats(content):
+    """解析工具结果，返回 (新增行数, 删除行数) 或 None（非写入卡片）。
+
+    ① 命中「共 N 行」→ 用真实行数（注意正则带"行"字，`共 12 项` 不会误命中）；
+    ② 否则退回「已写入 N 字符」按每行约 40 字估算（兼容老格式）；
+    ③ 都不中 → None（不是写入卡片）。
+    """
+    s = content or ""
+    m = _WRITE_LINES_RE.search(s)
+    if m:
+        try:
+            return (int(m.group(1)), 0)
+        except Exception:
+            pass
+    m = _WRITE_CHARS_RE.search(s)
+    if not m:
+        return None
+    try:
+        chars = int(m.group(1))
+    except Exception:
+        return None
+    add = max(1, (chars + _WRITE_CHARS_PER_LINE - 1) // _WRITE_CHARS_PER_LINE)
+    return add, 0
+
+
+class ChatInput(QPlainTextEdit):
+    """聊天输入框：Enter 发送，Shift+Enter 换行。
+
+    ⚠️ 中文输入法正在组字（拼音还没上屏）时，Enter 应该交给输入法选词，
+    绝不能当成"发送"。这里用两重判断：Qt 的 `QInputMethod.isComposing()`
+    加上自己维护的 `inputMethodEvent` 组字状态，避免误发半句话。
+    """
+
+    submitted = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._composing = False
+
+    def _ime_composing(self):
+        try:
+            im = QApplication.inputMethod()
+            if im is not None and bool(im.isComposing()):
+                return True
+        except Exception:
+            pass
+        return self._composing
+
+    def inputMethodEvent(self, event):        # noqa: N802 (Qt 命名)
+        super().inputMethodEvent(event)
+        try:
+            self._composing = bool(event.preeditString())
+        except Exception:
+            pass
+
+    def keyPressEvent(self, event):           # noqa: N802 (Qt 命名)
+        key = event.key()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not shift:
+            if self._ime_composing():
+                super().keyPressEvent(event)
+                return
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
 
 
 def fit_prose(browser, width, extra=18, minimum=30):
@@ -268,17 +353,26 @@ class CodeBlockWidget(QFrame):
 class MessageCard(QWidget):
     """单条消息卡片。
 
+    v9.8 变化：
+    - 新增 `thinking` 角色（「深度思考」中间过程块）：字号更小、颜色更灰、
+      默认收起，只占一行标题；
+    - 工具 / 文件写入 / 深度思考三类卡片统一为「一行标题 + 右侧箭头」；
+    - 文件写入卡片收起时在箭头左侧显示绿色 `+N` / 红色 `-N`（行数）。
+
     信号：
-      copy_requested / speak_requested(text) / regenerate_requested / delete_requested
+      copy_requested / speak_requested(text) / regenerate_requested /
+      delete_requested / edit_requested / collapse_changed(bool)
     """
     copy_requested = pyqtSignal()
     speak_requested = pyqtSignal(str)
     regenerate_requested = pyqtSignal()
     delete_requested = pyqtSignal()
     edit_requested = pyqtSignal()
+    collapse_changed = pyqtSignal(bool)
 
     def __init__(self, role, prose_html="", blocks=None, raw_text="", parent=None,
-                 footer_text="", label=None, timestamp="", index=-1, actions=True):
+                 footer_text="", label=None, timestamp="", index=-1, actions=True,
+                 stats=None, collapsed=None):
         super().__init__(parent)
         t = themes.tokens()
         self.role = role
@@ -286,8 +380,11 @@ class MessageCard(QWidget):
         self._raw = raw_text or ""
         self._prose = prose_html or ""
         self._blocks = blocks or []
+        self._stats = stats                    # (新增行数, 删除行数) 或 None
         self._label = label if label else _ROLE_LABEL.get(role, role)
-        self._collapsed = (role == "tool")
+        self._collapsible = role in _COLLAPSIBLE_ROLES
+        # 折叠初值：工具 / 深度思考默认收起；也可由外部显式指定（用于跨重建恢复）
+        self._collapsed = (self._collapsible if collapsed is None else bool(collapsed))
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -300,8 +397,8 @@ class MessageCard(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(6)
-        label = QLabel(("◍ " if role == "assistant" else ("▸ " if role == "tool" else ""))
-                       + self._label)
+        prefix = "◍ " if role == "assistant" else ""
+        label = QLabel(prefix + self._label)
         header.addWidget(label)
         if timestamp:
             ts = QLabel(timestamp)
@@ -330,10 +427,30 @@ class MessageCard(QWidget):
                 _mk("编辑", "改一下这条消息，然后从这儿重新开始", self.edit_requested.emit, 44)
             if role in ("assistant", "user"):
                 _mk("删除", "删除这条消息", self.delete_requested.emit, 44)
-        if role == "tool":
-            self.toggle_btn = QPushButton("展开")
+
+        # 文件写入卡片的 +N / -N（收起时显示，展开时隐藏）
+        self._add_lb = QLabel("")
+        self._del_lb = QLabel("")
+        if self._stats:
+            add, dele = self._stats
+            self._add_lb.setText(f"+{add}")
+            self._add_lb.setStyleSheet(
+                f"color:{t['success']};font-size:12px;font-weight:bold;")
+            self._del_lb.setText(f"-{dele}")
+            self._del_lb.setStyleSheet(
+                f"color:{t['danger']};font-size:12px;font-weight:bold;")
+            header.addWidget(self._add_lb)
+            header.addWidget(self._del_lb)
+        self._add_lb.setVisible(False)
+        self._del_lb.setVisible(False)
+
+        # 折叠箭头（工具 / 深度思考卡片才有）
+        self.toggle_btn = None
+        if self._collapsible:
+            self.toggle_btn = QPushButton("▸" if self._collapsed else "▾")
             self.toggle_btn.setObjectName("cardBtn")
-            self.toggle_btn.setFixedSize(52, 22)
+            self.toggle_btn.setFixedSize(26, 22)
+            self.toggle_btn.setToolTip("展开 / 收起这一步")
             self.toggle_btn.clicked.connect(self._toggle)
             header.addWidget(self.toggle_btn)
 
@@ -344,7 +461,7 @@ class MessageCard(QWidget):
         body.setOpenExternalLinks(False)
         body.setFrameShape(QFrame.Shape.NoFrame)
         body.setFixedWidth(BODY_WIDTH)
-        if role == "tool":
+        if role in ("tool", "thinking"):
             body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         else:
@@ -374,6 +491,19 @@ class MessageCard(QWidget):
             outer.addStretch(1)
             outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
             outer.addStretch(0)
+        elif role == "thinking":
+            # 中间过程块：更灰、更小，与最终结论明显区分
+            bubble.setStyleSheet(
+                f"background:{t['chip_bg']};border:1px solid {t['border']};"
+                f"border-radius:{RADIUS_CARD}px;")
+            label.setStyleSheet(
+                f"color:{t['text_muted']};font-size:12px;font-weight:bold;")
+            body.setStyleSheet("background:transparent;border:none;color:"
+                               + t["text_muted"] + ";"
+                               f"padding:0px;font-size:{themes.fs(13)};line-height:1.7;")
+            outer.addStretch(0)
+            outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
+            outer.addStretch(1)
         else:
             bg = t["ai_bg"] if role == "assistant" else t["tool_bg"]
             fg = t["ai_text"] if role == "assistant" else t["tool_text"]
@@ -393,12 +523,12 @@ class MessageCard(QWidget):
     # ---------- 构造入口 ----------
     @classmethod
     def from_text(cls, role, text, parent=None, footer_text="", label=None,
-                  timestamp="", index=-1, actions=True):
+                  timestamp="", index=-1, actions=True, stats=None, collapsed=None):
         from .. import markdown_render
         prose, blocks = markdown_render.render_with_blocks(text)
         return cls(role, prose, blocks, raw_text=text or "", parent=parent,
                    footer_text=footer_text, label=label, timestamp=timestamp,
-                   index=index, actions=actions)
+                   index=index, actions=actions, stats=stats, collapsed=collapsed)
 
     def set_footer(self, text):
         t = themes.tokens()
@@ -406,6 +536,14 @@ class MessageCard(QWidget):
         self.footer.setVisible(bool(text))
         self.footer.setStyleSheet(
             f"color:{t['text_muted']};font-size:11px;background:transparent;")
+
+    def is_collapsed(self):
+        return bool(self._collapsed)
+
+    def set_collapsed(self, collapsed):
+        """外部设置折叠状态（用于 _render_full 重建后恢复用户的展开/收起）。"""
+        self._collapsed = bool(collapsed)
+        self._apply_height_policy()
 
     def _rebuild(self):
         self.body.setHtml(self._prose)
@@ -420,20 +558,31 @@ class MessageCard(QWidget):
         self._apply_height_policy()
 
     def _apply_height_policy(self):
-        if self.role == "tool" and self._collapsed:
-            self.body.setMaximumHeight(220)
-            self.body.setFixedHeight(220)
+        # 收起态：正文 / 代码块 / 脚注全部隐藏，只留一行标题栏
+        if self._collapsible and self._collapsed:
+            self.body.setVisible(False)
             for i in range(self.code_host.count()):
                 it = self.code_host.itemAt(i)
                 if it and it.widget():
                     it.widget().setVisible(False)
+            self.footer.setVisible(False)
+            if self.toggle_btn is not None:
+                self.toggle_btn.setText("▸")
         else:
+            self.body.setVisible(True)
             self.body.setMaximumHeight(16777215)
             fit_prose(self.body, BODY_WIDTH)
             for i in range(self.code_host.count()):
                 it = self.code_host.itemAt(i)
                 if it and it.widget():
                     it.widget().setVisible(True)
+            self.footer.setVisible(bool(self.footer.text()))
+            if self.toggle_btn is not None:
+                self.toggle_btn.setText("▾")
+        # 行数统计只在收起时展示（展开时正文可见，无需重复）
+        show_stats = bool(self._stats) and self._collapsible and self._collapsed
+        self._add_lb.setVisible(show_stats)
+        self._del_lb.setVisible(show_stats)
 
     def set_content(self, prose_html="", blocks=None):
         self._prose = prose_html or ""
@@ -442,12 +591,12 @@ class MessageCard(QWidget):
         self._rebuild()
 
     def refit(self):
-        if self.role == "tool" and self._collapsed:
+        if self._collapsible and self._collapsed:
             return
         w = self.body.viewport().width()
         fit_prose(self.body, w if w > 80 else BODY_WIDTH)
 
     def _toggle(self):
         self._collapsed = not self._collapsed
-        self.toggle_btn.setText("展开" if self._collapsed else "收起")
         self._apply_height_policy()
+        self.collapse_changed.emit(self._collapsed)

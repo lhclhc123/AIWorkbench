@@ -80,7 +80,7 @@ class VoiceInput(QWidget):
         self.mic.setObjectName("MicBtn")
         self.mic.setCheckable(True)
         self.mic.setFixedSize(40, 40)
-        self.mic.setToolTip("点一下开始说话，再点一下结束（也可以说完停顿自动结束，默认最长 5 分钟）")
+        self.mic.setToolTip("点一下开始说话，再点一下结束（也可以说完停顿约 10 秒自动结束，默认最长 5 分钟）")
         self.mic.clicked.connect(self.toggle)
         row.addWidget(self.mic)
 
@@ -115,8 +115,9 @@ class VoiceInput(QWidget):
         try:
             self.recorder = asr_mod.Recorder(
                 device=None if int(dev) < 0 else int(dev),
-                # 静音判定默认 3 秒（以前 1.6 秒，想词时经常被提前掐断）
-                silence_seconds=float(s.get("voice_silence", 3.0) or 3.0),
+                # 静音判定默认 10 秒（用户 2026-09-30 要求：说话中间停顿
+                # 10 秒左右才停；旧值 3 秒/1.6 秒会在换气、想词时被提前掐断）
+                silence_seconds=float(s.get("voice_silence", 10.0) or 10.0),
                 # 最长录音默认 5 分钟（以前 120 秒，长句子/口述需求根本不够）
                 max_seconds=float(s.get("voice_max_seconds", 300) or 300))
             self.recorder.start()
@@ -131,7 +132,7 @@ class VoiceInput(QWidget):
         self.mic.setText("■")
         self.hint.setText("正在录音 0.0s")
         self._timer.start()
-        self.status.emit("正在录音…说完了停顿一下会自动结束，也可以再点一下麦克风手动结束")
+        self.status.emit("正在录音…中间停顿约 10 秒才会自动结束，说完了也可以直接再点一下麦克风")
 
     def finish(self):
         rec = self.recorder

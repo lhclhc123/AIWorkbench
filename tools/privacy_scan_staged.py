@@ -20,7 +20,13 @@ _WIN_USER = (os.environ.get("PRIVACY_WIN_USER")
              or os.environ.get("USERNAME") or "").strip()
 
 PATTERNS = [
-    ("钉钉凭据", re.compile(r"AppSecret|app_secret|access_token\s*[=:]|accessToken")),
+    # ⚠️ 这里只报「真的赋值了一长串」的 —— 光出现字段名（`"client_secret": ""`）、
+    #    URL 模板（`?access_token={tok}`）、报错文案（`"缺少 AppKey/AppSecret"`）都不算。
+    #    老写法 `AppSecret|app_secret|access_token\s*[=:]` 太松，app/dingtalk.py 里
+    #    一次命中 33 处全是误报，导致每次推送都被自己的扫描挡住。
+    ("钉钉凭据（真值）", re.compile(
+        r"(?i)(app_?secret|access_?token|client_?secret)[\"']?\s*[=:]\s*[\"']?"
+        r"[A-Za-z0-9_\-]{16,}")),
     ("OpenAI 风格密钥", re.compile(r"\bsk-[A-Za-z0-9]{16,}")),
     ("通用 API Key", re.compile(r"(?i)\b(api[_-]?key|apikey)\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{16,}")),
     ("手机号", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),

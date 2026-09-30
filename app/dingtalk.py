@@ -1000,7 +1000,8 @@ class DingTalkClient:
                 "npm i -g dingtalk-workspace-cli")
         cmd = ([node, dws] if node else [dws]) + list(args)
         kw = dict(capture_output=True, text=True, encoding="utf-8",
-                  errors="ignore", timeout=timeout)
+                  errors="ignore", timeout=timeout,
+                  stdin=subprocess.DEVNULL)   # 见下方说明：绝不让子进程死等 stdin
         if cwd:
             kw["cwd"] = cwd
         try:
@@ -1119,7 +1120,7 @@ class DingTalkClient:
         _throttle()
         return self._run_dws(
             ["chat", "+messages-send", "--as", "user", "--chat-id", cid,
-             "--text", text, "--format", "json"])
+             "--text", text, "--format", "json", "--yes"])
 
     def dws_at_me(self, n=10):
         """查最近「@我」的消息（群聊里点名叫我的）。解析失败时返回 []。"""
@@ -1141,7 +1142,8 @@ class DingTalkClient:
             raise DingTalkError("消息内容为空")
         _throttle()
         data = self._run_dws(
-            ["chat", "+dm", "--to", name, "--content", content, "--format", "json"])
+            ["chat", "+dm", "--to", name, "--content", content,
+             "--format", "json", "--yes"])
         return data
 
     def dws_send_group(self, name_or_cid, content):
@@ -1152,7 +1154,7 @@ class DingTalkClient:
         _throttle()
         data = self._run_dws(
             ["chat", "+send-to-group", "--group", name_or_cid,
-             "--content", content, "--format", "json"])
+             "--content", content, "--format", "json", "--yes"])
         return data
 
     def dws_conversation_list_full(self, n=10):
@@ -1178,7 +1180,7 @@ class DingTalkClient:
         d = os.path.dirname(path)
         fname = os.path.basename(path)
         base = ["chat", "+messages-send", "--as", "user",
-                "--msg-type", "file", "--file", fname]
+                "--msg-type", "file", "--file", fname, "--yes"]
         if target.startswith("cid"):
             attempts = [["--group", target]]
         else:

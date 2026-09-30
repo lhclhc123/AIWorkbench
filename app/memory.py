@@ -41,7 +41,16 @@ class MemoryStore:
 
     # ---------- 结构化 ----------
     def parse(self):
-        """解析成 {分类: [条目, ...]}，保持顺序。"""
+        """解析成 {分类: [条目, ...]}，保持顺序。
+
+        ⚠️ 必须跳过「文件前言」：dump() 写出的开头是
+        `# 长期记忆` + `> 由 AI 工作台自动维护，最后更新：<时间>`。
+        这两行既不是 `## 分类` 标题、也不是空行，旧代码会把它们当成
+        「用户与身份」的普通条目；下一次 dump() 又把它们写回成 `- ...`，
+        而那句更新时间每写一次就变一次、去重抓不住 —— 于是每保存一轮就多
+        两条垃圾，累积成几十条（真实发生过）。现在：进入任何 `## 分类`
+        之前的内容一律忽略；任何 `#`/`>` 行也一律忽略。
+        """
         text = self.load_text()
         data = {}
         cur = None
@@ -52,13 +61,16 @@ class MemoryStore:
                 data.setdefault(cur, [])
                 continue
             s = line.strip()
-            if not s:
-                continue
+            if not s or s.startswith(("#", ">")):
+                continue          # 前言/标题/引用一律不是条目
+            if cur is None:
+                continue          # 还没进入任何 ## 分类，忽略正文
             if s.startswith(("- ", "* ", "• ")):
                 s = s[2:].strip()
-            if cur is None:
-                cur = DEFAULT_CATEGORIES[0]
-                data.setdefault(cur, [])
+            # 去掉 bullet 标记后仍是标题/引用的（存量脏数据 `- # 长期记忆`
+            # `- > 由 AI…`）也丢掉，这样重新 dump 一次即可自动清干净
+            if not s or s.startswith(("#", ">")):
+                continue
             data[cur].append(s)
         return data
 

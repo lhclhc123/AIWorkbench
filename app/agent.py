@@ -343,14 +343,99 @@ def _degraded_call(text):
     return None
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek 新一代推理模型（DeepSeek-V4.x 等）除标准 <tool_call> 外，还会吐它
+# 自家的「DSML」语法。分隔符是**全角竖线 U+FF5C**，且空格可有可无：
+#
+#   <｜DSML｜ calls>
+#   <｜DSML｜ invoke name="run_command">
+#   <｜DSML｜ parameter name="command" string="true">powershell -Command "..."</｜DSML｜ parameter>
+#   <｜DSML｜ parameter name="timeout" string="false">120</｜DSML｜ parameter>
+#   </｜DSML｜ invoke>
+#   </｜DSML｜ calls>
+#
+# 三个实测要点（2026-09-30 用真机样本确认，样本存 tests/dsml_sample.txt）：
+#   1) 参数名**直接就是工具的参数名**，不像标准写法那样包一层 arguments；
+#   2) string="true" 是原文文本，string="false" 是 JSON 值（如数字 120）；
+#   3) 有的调用**一个参数都没有**（如 system_info）。
+# 不加这层兜底，模型「想调 run_python 却调不动」，收尾时就会假装已执行 ——
+# 正是用户最反感的「看着干完了、其实没验」。
+# ---------------------------------------------------------------------------
+_DSML_BAR = "[｜|]"
+_DSML_INVOKE_RE = re.compile(
+    r"<\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR +
+    # ⚠️ 工具名首字符必须允许 Unicode：TOOL_ALIAS 里有中文别名（"打包"/"打包exe"/
+    # "编译exe"/"工作总结"），早先写成 [A-Za-z_] 会把它们全挡在门外（实测漏检）。
+    r"\s*invoke\s+name\s*=\s*[\"']?([\w][\w\-]*)[\"']?\s*>"
+    r"(.*?)"
+    r"(?:</\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*invoke\s*>|\Z)",
+    re.DOTALL | re.IGNORECASE)
+_DSML_PARAM_RE = re.compile(
+    r"<\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR +
+    r"\s*parameter\s+name\s*=\s*[\"']?([A-Za-z_][\w\-]*)[\"']?"
+    r"(?:\s+string\s*=\s*[\"']?(true|false)[\"']?)?\s*>"
+    r"(.*?)"
+    r"(?:</\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*parameter\s*>|\Z)",
+    re.DOTALL | re.IGNORECASE)
+# 单参数正文长度上限，防止模型把超长文本塞进来导致正则/内存失控
+_DSML_MAX_ARG = 200000
+
+
+def _dsml_name(raw):
+    """DSML 里给的工具名归一成真正会执行的那个（别把别名丢了）。"""
+    name = (raw or "").strip()
+    if name in KNOWN_TOOLS:
+        return name
+    low = name.lower().replace("-", "_")
+    if low in KNOWN_TOOLS:
+        return low
+    return TOOL_ALIAS.get(low) or TOOL_ALIAS.get(name) or name
+
+
+def _dsml_calls(text):
+    """解析 DSML 工具调用，返回 [{name, arguments}, ...]；解析不出就返回 []。"""
+    # ⚠️ 这里的守卫必须大小写不敏感：下面的正则是 IGNORECASE，
+    # 早先写成 "DSML" not in text，会把全小写 <｜dsml｜…> 拦在门外，
+    # 让 IGNORECASE 变成死代码（实测漏检，复验时被打出来）。
+    if not text or "dsml" not in text.lower():
+        return []
+    out = []
+    for m in _DSML_INVOKE_RE.finditer(text):
+        name = _dsml_name(m.group(1))
+        if name not in KNOWN_TOOLS:
+            continue          # 不是已知工具就别认，免得把普通文本误当调用
+        args = {}
+        for pm in _DSML_PARAM_RE.finditer(m.group(2) or ""):
+            key = pm.group(1).strip()
+            is_text = (pm.group(2) or "true").lower() != "false"
+            val = pm.group(3) or ""
+            if len(val) > _DSML_MAX_ARG:
+                val = val[:_DSML_MAX_ARG]
+            if is_text:
+                # 只去掉首尾换行：保留代码/命令里的缩进与空格
+                val = val.strip("\r\n")
+            else:
+                try:
+                    val = json.loads(val.strip())
+                except Exception:
+                    pass          # 不是合法 JSON 就按原文收下
+            args[key] = val
+        # 有的模型仍套一层 {"arguments": {...}} 壳 —— 拆开合并
+        if len(args) == 1 and isinstance(args.get("arguments"), dict):
+            args = args["arguments"]
+        out.append({"name": name, "arguments": args})
+    return out
+
+
 def parse_tool_call(text):
     """从助手文本里尽力提取工具调用，返回 {name, arguments} 或 None。
 
     依次尝试：
       1) 标准 <tool_call>{...}</tool_call>
-      2) ``` 围栏 / 裸文本里的 JSON（带 name 字段）
-      3) 没有 name 字段的裸 JSON：用附近提到的工具名补齐
-      4) "工具名\n{参数}" 或 "[工具 read_file {...}]" 这类退化写法
+      2) DeepSeek 的 <｜DSML｜invoke ...> 语法
+      3) ``` 围栏 / 裸文本里的 JSON（带 name 字段）
+      4) 没有 name 字段的裸 JSON：用附近提到的工具名补齐
+      5) "工具名\n{参数}" 或 "[工具 read_file {...}]" 这类退化写法
     拿到之后，会用消息里的 ```代码块``` 修补被写坏的长文本参数。
     """
     call = _parse_tool_call_once(text)
@@ -370,6 +455,11 @@ def _parse_tool_call_once(text):
         call = _coerce(obj) if obj is not None else None
         if call:
             return call
+
+    # 1.2) DeepSeek 的 DSML 语法（整段没有 <tool_call>，直接 <｜DSML｜invoke …>）
+    _dsml = _dsml_calls(text)
+    if _dsml:
+        return _dsml[0]
 
     stripped = re.sub(r"```(?:\w+)?", "", text)
 
@@ -560,6 +650,12 @@ def parse_tool_calls(text, limit=4):
     if calls:
         calls = _dedupe(calls)[:limit]
         return _salvage_from_fence(calls, text)
+    # DeepSeek DSML：一条回复里可能连着发多个 invoke，要全部取出来。
+    # 这里**不做** _salvage_from_fence —— 它的参数是原文文本，
+    # code/content 里本来就可能有 ``` 代码块，别当成"写坏的 JSON"再改一遍。
+    _dsml = _dsml_calls(text)
+    if _dsml:
+        return _dedupe(_dsml)[:limit]
     single = parse_tool_call(text)
     return [single] if single else []
 
@@ -662,6 +758,50 @@ def dumped_to_cloud(text):
     """答复是不是把交付甩给了第三方网盘/云盘服务。"""
     t = (text or "").lower()
     return any(p in t for p in _CLOUD_DUMP)
+
+
+# ---- 联网门控（v9.12）------------------------------------------------------
+# 用户 2026-09-30 反馈「联网功能用的非常混乱」。查应用自产日志坐实：
+#   做本机 dws 钉钉诊断那一轮，端点**每轮请求都被强制联网**，塞回一堆
+#   「Python 基础教程 / WPS 求解 / Microsoft Planner」完全无关的结果，
+#   模型连续十几轮都在写「网络搜索结果与本次体检无关，忽略」——纯浪费轮次。
+# 结论：**联网应该是"需要时才发生"的明确动作，不是每轮的背景噪音。**
+# 这里给端点侧自动联网加一道门：像本机/本地任务的，就不自动搜
+# （模型仍可自己显式调 web_search 工具，能力不减）。
+_WEB_EXPLICIT = ("搜一下", "搜索一下", "查一下网上", "网上查", "上网查",
+                 "百度", "谷歌", "google", "联网", "帮我在网上")
+_WEB_WANT = (
+    "最新", "实时", "今天的", "现在的", "目前", "当前", "行情", "股价", "汇率",
+    "天气", "新闻", "价格", "报价", "多少钱", "政策", "法规", "规定", "官网",
+    "版本号", "什么时候发布", "发布了", "现任", "是谁", "怎么样才能",
+)
+_LOCAL_TASK = (
+    "本机", "这台电脑", "我的电脑", "本地", "工作区", "日志", "进程",
+    "报错", "崩溃", "闪退", "打不开", "我自己写的", "这个程序", "这个软件",
+    "c:\\", "d:\\", "e:\\", "f:\\", "c盘", "d盘", "e盘", "f盘",
+    "排查", "诊断", "调试", "闪窗",
+)
+
+
+def needs_web_search(user_text):
+    """这一轮该不该让端点自动联网。
+
+    规则（按优先级）：
+      1. 用户明确要搜（搜一下 / 百度 / 联网…）-> 开；
+      2. 命中"实时外部信息"关键词（最新 / 股价 / 天气 / 政策…）-> 开；
+      3. 命中"本机/本地任务"关键词且没命中 2 -> 关；
+      4. 其余 -> 关（不主动搜；模型想搜可以自己调 web_search 工具）。
+    """
+    t = (user_text or "").lower()
+    if not t:
+        return False
+    if any(w in t for w in _WEB_EXPLICIT):
+        return True
+    wants = any(w in t for w in _WEB_WANT)
+    local = any(w in t for w in _LOCAL_TASK)
+    if local and not wants:
+        return False
+    return wants
 
 
 def honest_ok(user_text, tools_used, files, answer, tool_outputs=()):
@@ -826,7 +966,8 @@ PROJECT_STEP_HINTS = {
         "\"import sys\\nprint(sys.version)\\n\"}}</tool_call>\n"
         "  （确认 Python 版本与可用库；run_python 不会弹确认框，"
         "run_command 会弹确认框、能不用就不用）\n"
-        "不要在没看清环境的情况下假设本机装了什么。"
+        "不要在没看清环境的情况下假设本机装了什么。\n"
+        "之后每一步做完，都要用 Python 脚本跑出真实输出作为证据，不要只口头说“已完成”。"
     ),
     "plan": (
         "用户要的是「独立开发出一个成品」，但你还没有把**任务清单**列出来。\n"
@@ -836,11 +977,18 @@ PROJECT_STEP_HINTS = {
         "列完再继续执行，每完成一步都要回来更新状态。"
     ),
     "verify": (
-        "你已经把代码写出来了，但**还没有真正验证过它能不能跑**。"
-        "没跑通的程序不算交付。\n"
-        "请立刻用 run_python **真的执行一次**（编译 / 语法检查 / 跑个例子都算），"
-        "看到报错就改，改到通过为止，然后把真实的运行输出写进最终答复。\n"
-        "（run_python 不弹确认框；只有确实需要 shell 命令时才用 run_command。）"
+        "你已经把代码写出来了，但系统**没有看到你真的运行过它**"
+        "（只跑 print(sys.version) 这种环境检查不算）。没跑通的程序不算交付。\n"
+        "请立刻写一段**冒烟测试**并真的跑起来，要求：\n"
+        "1) 明确 **import 或运行你刚写的那个文件**（在代码里引用它的文件名 / 用 "
+        "`subprocess.run([sys.executable, \"你的文件.py\"], capture_output=True)`）；\n"
+        "2) 至少写 3 个**具体断言**（例如 assert is_prime(2) == True、"
+        "assert is_prime(17) == True、assert is_prime(9) == False），\n"
+        "   用 try/except 包起来，每项打印 PASS / FAIL，最后打印汇总；\n"
+        "3) 用 run_python 执行它（run_python 不弹确认框；只有必须用 shell 时再用 run_command）；\n"
+        "4) 报错就改，改到全 PASS 为止（同一处最多 3 轮），"
+        "然后把**真实的运行输出**（PASS/FAIL、退出码、关键几行）贴进最终答复。\n"
+        "绝不允许没跑就说「已验证」——那是谎报。"
     ),
 }
 
@@ -2037,7 +2185,7 @@ class AgentRunner:
 
     def _resolve(self, raw):
         """路径解析：绝对路径直接用，相对路径相对工作区 files/。"""
-        raw = (raw or "").strip()
+        raw = _folders.normalize_drive((raw or "").strip())
         if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
             return os.path.normpath(raw)
         return os.path.normpath(os.path.join(self.files_dir, _normalize_rel(raw)))
@@ -2248,7 +2396,10 @@ class AgentRunner:
                     return f"[错误] 写入后没找到文件：{path}（可能被安全软件拦截）"
                 size = os.path.getsize(path)
                 self._note_written(path, size)
-                return (f"[成功] 已写入 {len(content)} 字符 → 完整路径：{path}"
+                # 真实行数（界面拿它显示「+N 行」徽标，比按字符/40 估算准）。
+                # 界面侧解析「共 N 行」；老格式（没有该字段）仍用估算兜底。
+                lines = content.count("\n") + 1
+                return (f"[成功] 已写入 {len(content)} 字符，共 {lines} 行 → 完整路径：{path}"
                         f"（{size} 字节，已确认落盘）")
 
             elif name == "read_worklog":
@@ -2516,7 +2667,9 @@ class AgentRunner:
                 if not os.path.exists(path):
                     return f"[错误] 生成后未找到文件，可能写入失败：{path}"
                 self._note_written(path, size)
-                return (f"[成功] 已生成{label}：{path}（{_human_size(size)}，"
+                # 同样给出真实行数，让 Word/Excel/PPT/PDF 卡片也能显示 +N 行
+                lines = str(content).count("\n") + 1
+                return (f"[成功] 已生成{label}：{path}（{_human_size(size)}，共 {lines} 行，"
                         f"已确认落盘）\n内容格式：Markdown（# 标题 / ## 二级 / - 列表 / "
                         f"| 表格 | / ```代码块```）")
 

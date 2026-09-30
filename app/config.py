@@ -28,10 +28,11 @@ from . import security as _sec  # noqa: E402
 _KEY_BLOBS = {
     # 智谱（也用于语音识别 glm-asr-2512 与图片识别 glm-4v-flash）
     "zhipu": "",
+    # 超算互联网（免费档只有 SCNet-Max）
     "scnet": "",
-    "baidu": "",
-    "deepseek": "",
+    # 硅基流动（免费档：DeepSeek 蒸馏 8B/7B、Qwen3-8B、GLM-4-9B）
     "siliconflow": "",
+    # 阿里百炼（免费档含 DeepSeek-V4.1-Flash / DeepSeek-V4-Pro）
     "dashscope": "",
 }
 
@@ -49,8 +50,20 @@ DEFAULT_API_KEYS = {k: _sec.deobf(v) for k, v in _KEY_BLOBS.items()}
 # 端点定义。search_style 决定联网时的请求字段。
 #   zhipu -> tools web_search（纯文本，不加 json_object）
 #   scnet -> enable_search:true
-#   baidu -> enable_web_search:true
 #   dashscope -> enable_search:true + search_options
+
+# ⚠️ 2026-09-30 全量实测后的免费清单（用户要求：所有模型都要免费，
+#    且明确要的 DeepSeek 必须是「完全永久免费」——不是会耗尽的"免费额度"）。
+#    删掉的两个端点：
+#      baidu    百度千帆 —— 7 个模型全部按量计费；其"永久免费"的
+#               ernie-speed-8k / ernie-3.5-8k 等实测返回 401 invalid_model
+#               （该 Key 无权限），留下等于全付费，故整端点移除。
+#      deepseek DeepSeek 官方 —— 无永久免费额度，且 deepseek-chat /
+#               deepseek-reasoner 两个 id 已下线。
+#    ★ 永久免费的 DeepSeek 来源 = 硅基流动 SiliconFlow（DeepSeek-R1-0528-Qwen3-8B /
+#      DeepSeek-R1-Distill-Qwen-7B，¥0 永久免费、仅限 RPM 限速、无需绑卡，需用户自己
+#      注册实名后把 Key 填到「设置 → 模型」）。阿里百炼（dashscope）上的 DeepSeek
+#      只是"免费额度"会耗尽，已按用户要求移除，只留其 Qwen 免费额度模型兜底。
 PROVIDERS = [
     {
         "name": "zhipu",
@@ -59,12 +72,15 @@ PROVIDERS = [
         "free": True,
         "search_style": "zhipu",
         "models": [
-            {"id": "glm-4-flash", "name": "GLM-4-Flash", "free": True},
+            # 免费主力：glm-4.7-flash 比 glm-4-flash 强不少，放前面让「自动模式」优先用它
             {"id": "glm-4.7-flash", "name": "GLM-4.7-Flash", "free": True},
-            # 视觉模型（图片识别/OCR 用）
+            {"id": "glm-4-flash", "name": "GLM-4-Flash", "free": True},
+            # 视觉模型（图片识别/OCR 用，两个都官方免费）
+            {"id": "glm-4.6v-flash", "name": "GLM-4.6V-Flash（图像识别·免费）",
+             "free": True, "vision": True},
             {"id": "glm-4v-flash", "name": "GLM-4V-Flash（图像识别·免费）",
              "free": True, "vision": True},
-            {"id": "glm-4v", "name": "GLM-4V（图像识别）", "free": False, "vision": True},
+            # 已删除：glm-4v（GLM-4V 系列按量计费，无免费额度）
         ],
     },
     {
@@ -74,23 +90,11 @@ PROVIDERS = [
         "free": True,
         "search_style": "scnet",
         "models": [
+            # 2026-09-30 实测：该 Key 的 /models 返回 32 个模型，
+            # 但只有 SCNet-Max 是 $0 可调（2.0s 正常返回）；
+            # DeepSeek-V4.x / Qwen3.8-Max / GLM-5.2 等一律 402 Insufficient Balance
+            # （属订阅套餐，不在免费档），故这里只留 SCNet-Max。
             {"id": "SCNet-Max", "name": "SCNet-Max", "free": True},
-        ],
-    },
-    {
-        "name": "baidu",
-        "label": "百度千帆 QianFan",
-        "base_url": "https://qianfan.baidubce.com/v2",
-        "free": False,
-        "search_style": "baidu",
-        "models": [
-            {"id": "ernie-4.5-turbo-32k", "name": "ERNIE-4.5-Turbo-32K", "free": False},
-            {"id": "ernie-4.5-turbo-128k", "name": "ERNIE-4.5-Turbo-128K", "free": False},
-            {"id": "ernie-5.0", "name": "ERNIE-5.0", "free": False},
-            {"id": "ernie-x1.1", "name": "ERNIE-X1.1", "free": False},
-            {"id": "deepseek-v4-flash", "name": "DeepSeek-V4-Flash", "free": False},
-            {"id": "glm-5.2", "name": "GLM-5.2", "free": False},
-            {"id": "qwen3.5-27b", "name": "Qwen3.5-27B", "free": False},
         ],
     },
     {
@@ -100,11 +104,18 @@ PROVIDERS = [
         "free": True,
         "search_style": "dashscope",
         "models": [
-            # 实测：该用户 key 仅开通以下两款（其余 qwen-turbo / qwen-plus 等
-            # 在此 workspace key 下返回 403）。qwen-turbo 官方已停更，被 Flash 取代。
+            # ⚠️ 重要：本端点（阿里百炼）的免费访问是「免费额度」（一次性/限量，会耗尽）。
+            #   2026-09-30 实测 deepseek-v4.1-flash 已 403 额度用尽（AllocationQuota.FreeTierOnly）。
+            #   用户明确要求 DeepSeek 必须是「完全永久免费」——百炼的 DeepSeek 属于免费额度、
+            #   不符合，已整体移除（见下面"已删除"）。下面只留百炼的 Qwen 免费额度模型作兜底。
+            #   ★ 永久免费的 DeepSeek 在「硅基流动 SiliconFlow」端点（见下，需用户自己的 Key）。
+            {"id": "qwen3.8-max", "name": "Qwen3.8-Max（免费额度）", "free": True},
             {"id": "qwen3.7-flash", "name": "Qwen3.7-Flash（免费额度）", "free": True},
             {"id": "qwen3.8-flash", "name": "Qwen3.8-Flash（免费额度·支持图像）",
              "free": True, "vision": True},
+            # 已删除（用户要"完全永久免费"，百炼 DeepSeek 只是免费额度、会耗尽）：
+            #   deepseek-v4.1-flash / deepseek-v4-pro-0813
+            #   永久免费 DeepSeek → 改走硅基流动 SiliconFlow 端点。
         ],
     },
     {
@@ -114,38 +125,31 @@ PROVIDERS = [
         "free": True,
         "search_style": "none",
         "models": [
+            # 只有标 ¥0 的才是永久免费（需实名认证）。下面 4 个都是免费档。
             {"id": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
              "name": "DeepSeek-R1-0528-Qwen3-8B（免费）", "free": True},
             {"id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
              "name": "DeepSeek-R1-Distill-Qwen-7B（免费）", "free": True},
-            {"id": "deepseek-ai/DeepSeek-V3", "name": "DeepSeek-V3", "free": False},
-            {"id": "deepseek-ai/DeepSeek-R1", "name": "DeepSeek-R1", "free": False},
             {"id": "Qwen/Qwen3-8B", "name": "Qwen3-8B（免费）", "free": True},
             {"id": "THUDM/glm-4-9b-chat", "name": "GLM-4-9B-Chat（免费）", "free": True},
-        ],
-    },
-    {
-        "name": "deepseek",
-        "label": "DeepSeek 官方",
-        "base_url": "https://api.deepseek.com/v1",
-        "free": False,
-        "search_style": "none",
-        "models": [
-            {"id": "deepseek-chat", "name": "DeepSeek-V3（对话）", "free": False},
-            {"id": "deepseek-reasoner", "name": "DeepSeek-R1（推理）", "free": False},
+            # 已删除：deepseek-ai/DeepSeek-V3（2/8 元每百万）
+            #         deepseek-ai/DeepSeek-R1（4/16 元每百万）—— 都无免费额度
         ],
     },
 ]
 
 # 优先级顺序（免费端点在前）。agent/自动模式按此尝试。
-PROVIDER_PRIORITY = ["zhipu", "scnet", "siliconflow", "dashscope", "baidu", "deepseek"]
+# 2026-09-30 调整：dashscope 提到第一位 —— 它的免费额度里有真正的
+# DeepSeek-V4.1-Flash / DeepSeek-V4-Pro，是唯一"正规免费 DeepSeek"渠道；
+# 一旦某模型免费额度用尽（会报 403），chat_auto 会自动往后一个端点继续试。
+PROVIDER_PRIORITY = ["siliconflow", "zhipu", "scnet", "dashscope"]
 
 # 视觉（图片识别/OCR）端点的尝试顺序，免费优先
 VISION_PRIORITY = ["zhipu", "dashscope"]
 
 # 联网搜索端点的尝试顺序（只有真的支持联网的端点才列进来，
 # 否则模型会拿训练数据硬答，看起来像搜过其实没有）
-SEARCH_PRIORITY = ["zhipu", "dashscope", "scnet", "baidu"]
+SEARCH_PRIORITY = ["zhipu", "dashscope", "scnet"]
 
 # ---------------------------------------------------------------------------
 # 语音（全免费）
@@ -176,11 +180,11 @@ TTS_DEFAULT_ENGINE = "sapi"
 MODEL_FAILURE_POLICY = "strict"
 
 # 自动模式下不参与"聊天"的模型（视觉模型只管看图，不该被拉来聊天）
-NON_CHAT_MODELS = {"glm-4v-flash", "glm-4v", "qwen3.8-flash"}
+NON_CHAT_MODELS = {"glm-4v-flash", "glm-4.6v-flash", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 21
+PROMPT_VERSION = 23
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -287,10 +291,31 @@ DEFAULT_SYSTEM_PROMPT = (
     "  ```代码块```、![说明](本地图片路径)。Excel 会把每张表格放进独立工作表；\n"
     "  PPT 会把每个「# 一级标题」开一页（二级标题作为要点）。中文标题、表格都能正确渲染。\n"
     "\n"
-    "【联网与下载】\n"
-    "- web_search：联网搜索实时信息，参数 query。**涉及最新消息、行情、新闻、价格、\n"
-    "  版本号、政策时务必用它**，不要用自己的旧知识硬答。返回的是带来源的检索结论。\n"
-    "- download_file：从网址下载文件到本地，参数 url、可选 path（默认取网址里的文件名）。\n"
+    "【联网与搜索（有规矩，别乱搜）】\n"
+    "- **① 什么时候该联网 —— 只有这三种才搜**：\n"
+    "  · 实时/时效性信息：最新新闻、股价行情、汇率、价格、天气、赛事比分、政策法规的新变化；\n"
+    "  · 你自己不确定的客观事实：某软件的最新版本号、某产品官方参数、某人的现任职务、\n"
+    "    某个报错或 API 的官方说明、某个库的用法（本机文档里没有时）；\n"
+    "  · 用户明确要求：说了「搜一下 / 查一下网上 / 百度一下 / 看看官网怎么说」。\n"
+    "- **② 什么时候不要联网 —— 这些一律用本地工具，别搜**：\n"
+    "  · 本机/本地问题：查日志、看进程、读文件、看目录、本机报错、这个程序自己怎么跑的 ——\n"
+    "    答案就在这台电脑里，联网搜不到，搜了只会浪费时间、还把任务方向带偏；\n"
+    "  · 写代码、改代码、算数、整理用户已经给你的资料；\n"
+    "  · 通用常识与稳定知识（数学公式、语法、常见概念）—— 直接用你自己的知识答。\n"
+    "- **③ 用哪个工具**：\n"
+    "  · web_search：要「结论」时用（参数 query），返回带来源的检索结论，最省事；\n"
+    "  · fetch_url：要「某个具体网址的正文」时用（参数 url）；\n"
+    "  · http_request：要调 API 拿结构化返回（JSON）时用；\n"
+    "  · download_file：要把某个网址的文件存到本地时用（参数 url、可选 path）。\n"
+    "- **④ 搜索词怎么写**：一句话、抓关键词，别把用户整段长句原样塞进去；\n"
+    "  中英文各试一次可以，但同一问题**最多搜 2 次**，不要反复搜同一个词。\n"
+    "  ⚠️ 绝不把本机路径、用户名、密钥、私密文件内容当搜索词发出去。\n"
+    "- **⑤ 搜索结果怎么用**：只取与当前问题相关的事实并标注来源；\n"
+    "  **若结果与当前任务无关，就说一句「搜索结果不相关，忽略」，然后继续原任务** ——\n"
+    "  绝不因为插进来一堆无关搜索结果就改变任务方向（本程序历史上真实踩过这个坑：\n"
+    "  做本机钉钉诊断时，每轮都被塞进一堆 Python 教程结果，白白浪费了十几轮）。\n"
+    "- 需要联网时**优先显式调 web_search**（来源清楚、可复现、有记录）；\n"
+    "  端点的自动联网只在你不主动搜时兜底。\n"
     "\n"
     "【系统与交互】\n"
     "- run_python：执行一段 Python 代码并返回真实输出，参数 code、可选 timeout（秒）。\n"
@@ -480,8 +505,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "     （如 [\"检查环境\",\"写 bank.py\",\"自测通过\",\"给出运行说明\"]）。\n"
     "  3) **生成代码**：用 write_file 把每个文件真正写出来。代码超过 10 行就用\n"
     "     「先给 path、紧跟 ```代码块```」的两步写法（路径默认 files\\\\ 下）。\n"
-    "  4) **自校验**：用 run_python 或 run_command **真的把程序跑一遍/编译一遍**，\n"
-    "     看到报错就改，改到真的能跑通为止。没跑通过就不算完成。\n"
+    "  4) **自校验**：**写一段 Python 测试脚本 / 冒烟测试真的跑一遍**，把真实输出贴出来；\n"
+    "     看到报错就改，改到真的能跑通为止。**没有真跑通、没有真实输出，就不算完成。**\n"
     "  5) **交付说明**：最后一段话给出——完整文件路径、怎么运行（双击/命令行）、\n"
     "     你验证时看到的真实输出。**用户要 exe 就直接调 build_exe 打出来**，\n"
     "     并把 build_exe 返回的 exe 绝对路径原样写进交付说明。\n"
@@ -503,9 +528,47 @@ DEFAULT_SYSTEM_PROMPT = (
     "  拿不准的小决策（例如文件名、目录名、命令写法）你自己拍板，不要每步都问。\n"
     "- 任务真正完成后必须做「完成自检」并向用户确认：\n"
     "  ① 我声称写入/修改的文件，真的落盘了吗？（系统会自动核对，你也要确认路径写对了）\n"
-    "  ② 我声称跑过的命令，退出码和输出真的符合预期吗？\n"
+    "  ② 我声称跑过的命令/程序，**有没有 Python 脚本的真实输出为证？** 没有就现在去跑。\n"
     "  ③ 用一段话总结：做了什么、改/建了哪些文件（给出相对路径）、结果在哪、用户怎么验证。\n"
     "  没有完成自检就结束，等于没做完——这一步不能省。\n"
+    "\n"
+    "# 六、用 Python 自己验证（跑得出证据，才叫会干活）\n"
+    "- **核心信条：没跑过 = 没做完。** 任何产出——文件、程序、数据、接口结果、文档——\n"
+    "  都要写一段 Python 脚本**真跑一遍**，用**真实输出**证明它存在、正确、能用，\n"
+    "  绝不允许只在回复里写“已完成/已成功”就交差。\n"
+    "- 脚本长短：超过约 15 行先 write_file 到 files/verify_<用途>.py 再跑，短的直接 run_python 内联。\n"
+    "- 照抄四个模板：\n"
+    "  ① 文件落盘非空：\n"
+    '  ```python\n'
+    '  import os\n'
+    '  p = r"文件的完整路径"\n'
+    '  print("PASS" if os.path.exists(p) and os.path.getsize(p) > 0 else "FAIL")\n'
+    "  ```\n"
+    "  ② 程序能跑通：\n"
+    '  ```python\n'
+    '  import subprocess, sys\n'
+    '  r = subprocess.run([sys.executable, "xxx.py"], capture_output=True, text=True,\n'
+    '                     encoding="utf-8", errors="replace", timeout=30)\n'
+    '  print("rc =", r.returncode, r.stdout[-300:], r.stderr[-300:])\n'
+    '  print("PASS" if r.returncode == 0 else "FAIL")\n'
+    "  ```\n"
+    "  ③ exe 能启动：优先跑 `xxx.exe --selftest`：\n"
+    '  ```python\n'
+    '  import subprocess\n'
+    '  r = subprocess.run(["xxx.exe", "--selftest"], capture_output=True, text=True,\n'
+    '                     encoding="utf-8", errors="replace", timeout=30)\n'
+    '  print("rc =", r.returncode, r.stdout[-200:], r.stderr[-200:])\n'
+    "  ```\n"
+    "  ④ 网页可访问：\n"
+    '  ```python\n'
+    '  import requests\n'
+    '  r = requests.get("https://example.com", timeout=10)\n'
+    '  print("status", r.status_code, "PASS" if r.status_code == 200 else "FAIL")\n'
+    "  ```\n"
+    "  （走代理时 requests 会失败，加 proxies 重试。）\n"
+    "- 迭代闭环：跑 → 看真实输出 → 失败就改 → 再跑，同一处**最多 3 轮**；\n"
+    "  过了才汇报；3 轮都没过就如实说明卡在哪并给替代方案，不许谎报。\n"
+    "- 汇报格式：交付时附「验证命令 + 真实输出摘要」（PASS/FAIL、退出码、关键几行），便于复现。\n"
     )
 
 # 构建"模型 id -> provider"映射，便于按模型路由。

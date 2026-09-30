@@ -16,8 +16,8 @@ import time
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton,
-    QPlainTextEdit, QScrollArea, QFrame, QLabel, QMessageBox, QApplication,
-    QStackedWidget, QFileDialog, QTextEdit, QComboBox, QCheckBox, QDialog,
+    QScrollArea, QFrame, QLabel, QMessageBox, QApplication,
+    QStackedWidget, QFileDialog, QTextEdit, QComboBox, QDialog,
     QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -34,7 +34,7 @@ from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
 from .panels import PlanPanel
 from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
-                      strip_tool_markup, BODY_WIDTH)
+                      strip_tool_markup, BODY_WIDTH, ChatInput, file_write_stats)
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
@@ -139,6 +139,10 @@ class MainWindow(QMainWindow):
         self._live_card = None
         self._last_model_label = ""
         self._pending_update = None
+        # 折叠卡片的用户手动展开/收起，用消息对象身份 (id(msg), 角色) 记住，重建时恢复
+        self._card_collapsed = {}
+        # 重建后要恢复的滚动位置：(是否贴底, 旧值)
+        self._pending_scroll = (True, 0)
         # 助理：钉钉消息 -> AI 处理 -> 结果发回钉钉
         self.assistant = assistant_mod.AssistantService(
             self.ding, os.path.join(self.workspace.path, "assistant.json"))
@@ -328,9 +332,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_all(self):
         t = themes.tokens()
-        self.theme_btn.setText("☾ 深色" if t is themes.LIGHT else "☀ 浅色")
         self.chat_scroll.setStyleSheet(
             f"background:{t['chat_bg']};border-radius:{RADIUS_CARD}px;")
+        self._style_input_area()
         self._refresh_chips()
         if hasattr(self, "plan_panel"):
             self.plan_panel.refresh_theme()
@@ -431,36 +435,18 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(12, 12, 12, 6)
         v.setSpacing(9)
 
-        # ---------- 顶栏 ----------
+        # ---------- 顶栏：只留极简会话标题 + 会话列表开关 ----------
+        # （模型下拉 / 联网 / Agent / 主题 / 状态 chip 全部从这里移除，
+        #   模型选择器下移到输入框右下角；联网与 Agent 改由「设置」页配置。）
         top = QFrame()
         top.setObjectName("TopBar")
-        tv = QVBoxLayout(top)
-        tv.setContentsMargins(12, 8, 12, 8)
-        tv.setSpacing(6)
-
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
+        tb = QHBoxLayout(top)
+        tb.setContentsMargins(12, 6, 12, 6)
+        tb.setSpacing(8)
         self.page_title = QLabel("💬 对话")
         self.page_title.setObjectName("PageTitle")
-        bar.addWidget(self.page_title)
-        bar.addSpacing(8)
-
-        mlabel = QLabel("模型：")
-        mlabel.setObjectName("PageSub")
-        bar.addWidget(mlabel)
-        self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(280)
-        self.model_combo.currentIndexChanged.connect(self._on_model_change)
-        bar.addWidget(self.model_combo)
-
-        self.search_cb = QCheckBox("联网搜索")
-        self.search_cb.stateChanged.connect(self._on_search_change)
-        bar.addWidget(self.search_cb)
-        self.agent_cb = QCheckBox("Agent 模式")
-        self.agent_cb.stateChanged.connect(self._on_agent_change)
-        bar.addWidget(self.agent_cb)
-        bar.addStretch(1)
-
+        tb.addWidget(self.page_title)
+        tb.addStretch(1)
         self.list_btn = QPushButton("☰ 列表")
         self.list_btn.setObjectName("cardBtn")
         self.list_btn.setFixedHeight(28)
@@ -468,39 +454,22 @@ class MainWindow(QMainWindow):
         self.list_btn.setChecked(True)
         self.list_btn.setToolTip("显示 / 隐藏左侧对话列表")
         self.list_btn.clicked.connect(self._toggle_conv_list)
-        bar.addWidget(self.list_btn)
+        tb.addWidget(self.list_btn)
+        v.addWidget(top)
 
-        self.stop_speak_btn = QPushButton("🔇")
-        self.stop_speak_btn.setObjectName("cardBtn")
-        self.stop_speak_btn.setFixedSize(34, 28)
-        self.stop_speak_btn.setToolTip("停止朗读（Ctrl+Shift+S）")
-        self.stop_speak_btn.clicked.connect(self._stop_speaking)
-        bar.addWidget(self.stop_speak_btn)
-
-        self.theme_btn = QPushButton("☾ 深色" if t is themes.LIGHT else "☀ 浅色")
-        self.theme_btn.setObjectName("cardBtn")
-        self.theme_btn.setFixedHeight(28)
-        self.theme_btn.setToolTip("切换浅色 / 深色")
-        self.theme_btn.clicked.connect(self._toggle_theme)
-        bar.addWidget(self.theme_btn)
-        tv.addLayout(bar)
-
-        chips = QHBoxLayout()
-        chips.setSpacing(6)
+        # 内部状态标签（实际模型 / 联网·Agent 状态 / 上下文占用）：
+        # 顶部不再展示这些 chip，但 _refresh_chips() 与回归测试仍读其文本，
+        # 因此保留为「不可见」的内部状态标签，不占用任何界面空间。
         self.chip_model = QLabel("")
         self.chip_model.setObjectName("Chip")
-        self.chip_model.setToolTip("本次回复真实使用的模型（与你选的模型应当一致）")
-        chips.addWidget(self.chip_model)
+        self.chip_model.setToolTip("本次回复真实使用的模型")
         self.chip_flags = QLabel("")
         self.chip_flags.setObjectName("Chip")
-        chips.addWidget(self.chip_flags)
         self.chip_ctx = QLabel("")
         self.chip_ctx.setObjectName("Chip")
-        self.chip_ctx.setToolTip("当前对话的上下文占用估算（中文约 1 字 ≈ 1 token）")
-        chips.addWidget(self.chip_ctx)
-        chips.addStretch(1)
-        tv.addLayout(chips)
-        v.addWidget(top)
+        for _c in (self.chip_model, self.chip_flags, self.chip_ctx):
+            _c.setParent(page)
+            _c.setVisible(False)
 
         # ---------- 主体：左列表 + 右聊天 ----------
         body = QHBoxLayout()
@@ -546,7 +515,8 @@ class MainWindow(QMainWindow):
         self.plan_panel = PlanPanel()
         right.addWidget(self.plan_panel)
 
-        # 语音输入条
+        # 语音输入条：录音逻辑仍由 VoiceInput 承载（波形/静音判定/识别都在里面），
+        # 但界面入口改成输入卡片右下角那个紧凑的麦克风按钮，这里整体隐藏。
         self.voice = VoiceInput(
             keys_provider=lambda: self.settings.get("api_keys", {}),
             settings_provider=lambda: self.settings)
@@ -554,50 +524,121 @@ class MainWindow(QMainWindow):
         self.voice.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.voice.failed.connect(self._on_voice_error)
         right.addWidget(self.voice)
+        self.voice.setVisible(False)
 
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
+        # ---------- 输入区：圆角卡片（上=输入框，下=＋ / 模型 / 麦克风 / 发送）----------
+        self.input_card = QFrame()
+        self.input_card.setObjectName("InputCard")
 
-        # ---------- 附件条（拖进来的文件显示成小卡片，不往输入框里灌正文）----------
+        # 附件条（拖进来的文件显示成小卡片，不往输入框里灌正文）
         self.attach_bar = QWidget()
         self.attach_bar.setObjectName("AttachBar")
         self.attach_bar_layout = QHBoxLayout(self.attach_bar)
-        self.attach_bar_layout.setContentsMargins(2, 0, 2, 0)
+        self.attach_bar_layout.setContentsMargins(4, 2, 4, 0)
         self.attach_bar_layout.setSpacing(6)
         self.attach_bar.setVisible(False)
-        right.addWidget(self.attach_bar)
 
-        self.input = QPlainTextEdit()
+        # 输入框：Enter 发送 / Shift+Enter 换行（中文输入法组字时不会误发）
+        self.input = ChatInput()
         self.input.setPlaceholderText(
             "输入消息，Enter 发送，Shift+Enter 换行　·　"
-            "🎙 点左边的麦克风可以直接说话　·　文件/图片拖进窗口即可交给 AI")
-        self.input.setMinimumHeight(84)
-        self.input.setMaximumHeight(170)
+            "点右下角麦克风可以直接说话　·　文件/图片拖进窗口即可交给 AI")
+        self.input.setMinimumHeight(68)
+        self.input.setMaximumHeight(180)
         self.input.textChanged.connect(self._on_input_changed)
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(6)
-        self.attach_btn = QPushButton("📎 添加文件")
-        self.attach_btn.setFixedSize(96, 40)
-        self.attach_btn.setToolTip("选择 Word / PDF / Excel / PPT / 图片 / 文本")
+        self.input.submitted.connect(self._send)
+
+        # 左下角：添加文件（复用现有附件逻辑 _pick_file / _attach_file）
+        self.attach_btn = QPushButton("＋")
+        self.attach_btn.setObjectName("InputIcon")
+        self.attach_btn.setFixedSize(32, 32)
+        self.attach_btn.setToolTip("添加文件（Word / PDF / Excel / PPT / 图片 / 文本）")
         self.attach_btn.clicked.connect(self._pick_file)
-        self.send_btn = QPushButton("发送")
-        self.send_btn.setFixedSize(96, 40)
+
+        # 右下角：模型选择器（紧凑）+ 麦克风 + 发送箭头
+        self.model_combo = QComboBox()
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.model_combo.setMaximumWidth(240)
+        self.model_combo.setToolTip("选择本次对话使用的模型")
+        self.model_combo.currentIndexChanged.connect(self._on_model_change)
+
+        self.mic_btn = QPushButton("🎙")
+        self.mic_btn.setObjectName("InputIcon")
+        self.mic_btn.setCheckable(True)
+        self.mic_btn.setFixedSize(32, 32)
+        self.mic_btn.setToolTip("语音输入：点一下开始说话，再点一下结束")
+        self.mic_btn.clicked.connect(self._toggle_recording)
+        try:
+            # 两个麦克风按钮状态保持同步（自动静音结束时也能正确复位）
+            self.voice.mic.toggled.connect(self.mic_btn.setChecked)
+        except Exception:
+            pass
+
+        self.send_btn = QPushButton("➤")
+        self.send_btn.setObjectName("InputIconPrimary")
+        self.send_btn.setFixedSize(36, 32)
+        self.send_btn.setToolTip("发送（Enter）")
         self.send_btn.clicked.connect(self._send)
-        btn_col.addWidget(self.attach_btn)
-        btn_col.addWidget(self.send_btn)
-        btn_col.addStretch(1)
-        input_row.addWidget(self.input, 1)
-        input_row.addLayout(btn_col)
-        right.addLayout(input_row)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(6)
+        bottom.addWidget(self.attach_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(self.model_combo)
+        bottom.addWidget(self.mic_btn)
+        bottom.addWidget(self.send_btn)
+
+        card_v = QVBoxLayout(self.input_card)
+        card_v.setContentsMargins(8, 8, 8, 8)
+        card_v.setSpacing(6)
+        card_v.addWidget(self.attach_bar)
+        card_v.addWidget(self.input)
+        card_v.addLayout(bottom)
+
+        right.addWidget(self.input_card)
 
         body.addLayout(right, 1)
         v.addLayout(body, 1)
 
         self.send_btn.setEnabled(False)
+        self._style_input_area()
         self._render_timer = QTimer()
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._update_live)
         return page
+
+    def _style_input_area(self):
+        """按当前主题给输入卡片与图标按钮上色（跟随浅色 / 深色切换）。"""
+        t = themes.tokens()
+        try:
+            self.input_card.setStyleSheet(
+                f"QFrame#InputCard{{background:{t['input_bg']};"
+                f"border:1px solid {t['input_border']};border-radius:{RADIUS_CARD}px;}}")
+            self.input.setStyleSheet(
+                "background:transparent;border:none;padding:2px 6px;color:"
+                f"{t['text']};font-size:{themes.fs(15)};")
+            self.model_combo.setStyleSheet(
+                f"QComboBox{{background:{t['btn_bg']};color:{t['btn_text']};"
+                f"border:1px solid {t['btn_border']};border-radius:8px;"
+                "padding:3px 8px;font-size:12px;min-width:0;}}"
+                f"QComboBox:hover{{border:1px solid {t['accent']};}}")
+            for b in (self.attach_btn, self.mic_btn):
+                b.setStyleSheet(
+                    f"QPushButton{{background:{t['btn_bg']};color:{t['btn_text']};"
+                    f"border:1px solid {t['btn_border']};border-radius:16px;"
+                    "font-size:15px;padding:0px;}"
+                    f"QPushButton:hover{{background:{t['btn_hover_bg']};"
+                    f"border:1px solid {t['accent']};}}"
+                    f"QPushButton:checked{{background:{t['danger']};color:#ffffff;"
+                    f"border:1px solid {t['danger']};}}")
+            self.send_btn.setStyleSheet(
+                f"QPushButton{{background:{t['accent']};color:#ffffff;border:none;"
+                "border-radius:16px;font-size:16px;padding:0px;}"
+                f"QPushButton:hover{{background:{t['accent_hover']};}}"
+                f"QPushButton:disabled{{background:{t['chip_bg']};"
+                f"color:{t['text_muted']};}}")
+        except Exception:
+            pass
 
     def _wire_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+N"), self, self._new_conversation)
@@ -618,6 +659,17 @@ class MainWindow(QMainWindow):
     def _toggle_conv_list(self):
         show = self.list_btn.isChecked()
         self.left_panel.setVisible(show)
+
+    def _update_page_title(self):
+        """顶栏只显示当前会话标题（极简）。"""
+        title = (self.conv or {}).get("title") or ""
+        title = str(title).strip() or "新对话"
+        if len(title) > 24:
+            title = title[:24] + "…"
+        try:
+            self.page_title.setText("💬 " + title)
+        except Exception:
+            pass
 
     # ================= 页面切换 =================
     def _open_page(self, key):
@@ -1030,6 +1082,31 @@ class MainWindow(QMainWindow):
     def _open_workspace(self, path, first=False):
         self.workspace = ws_mod.Workspace(path).ensure()
         self.settings = self.workspace.load_settings()
+        # 聊天页不再放「联网 / Agent」开关，改由设置页配置且默认开启。
+        # 老工作区里存的是旧默认（enable_search=False），这里做一次性迁移打开；
+        # 之后一律以用户在设置页的选择为准（用 _chat_defaults_v2 标记只迁一次）。
+        if not self.settings.get("_chat_defaults_v2"):
+            self.settings["enable_search"] = True
+            self.settings["agent_mode"] = True
+            self.settings["_chat_defaults_v2"] = True
+            try:
+                self.workspace.save_settings(self.settings)
+            except Exception:
+                pass
+        # 语音静音阈值一次性迁移（用户 2026-09-30 反馈"一停顿就停了"）。
+        # 老工作区里存的还是更早的旧默认（实测用户工作区是 1.6 秒），
+        # 只要小于 5 秒就抬到 10 秒；之后用户自己在设置页改的值不再覆盖。
+        if not self.settings.get("_voice_silence_v2"):
+            try:
+                if float(self.settings.get("voice_silence", 10.0) or 10.0) < 5.0:
+                    self.settings["voice_silence"] = 10.0
+            except Exception:
+                self.settings["voice_silence"] = 10.0
+            self.settings["_voice_silence_v2"] = True
+            try:
+                self.workspace.save_settings(self.settings)
+            except Exception:
+                pass
         themes.set_theme(self.settings.get("theme", "light"))
         themes.set_font_scale(self.settings.get("font_scale", 100))
         self.client.set_keys(self.settings.get("api_keys", {}))
@@ -1088,7 +1165,9 @@ class MainWindow(QMainWindow):
         self.conv = self.workspace.new_conversation()
         self.live_text = ""
         self.pending_tool = []
+        self._card_collapsed = {}      # 换会话：折叠记录随之清空
         self._render()
+        self._update_page_title()
         if not silent:
             self._load_conversations()
         self.input.setFocus()
@@ -1101,7 +1180,9 @@ class MainWindow(QMainWindow):
             self.conv = conv
             self.live_text = ""
             self.pending_tool = []
+            self._card_collapsed = {}  # 换会话：折叠记录随之清空
             self._render()
+            self._update_page_title()
 
     def _delete_conversation(self):
         if not self.conv:
@@ -1140,27 +1221,16 @@ class MainWindow(QMainWindow):
         self.model_combo.blockSignals(False)
 
     def _sync_toolbar(self):
+        """把设置里的模型选择同步到输入区下拉框。
+
+        「联网搜索 / Agent 模式」已从聊天页移除，改由设置页统一配置，
+        这里不再同步 QCheckBox（它们已不存在）。
+        """
         idx = self.model_combo.findData(self.settings.get("selected_model", "auto"))
         if idx >= 0:
             self.model_combo.blockSignals(True)
             self.model_combo.setCurrentIndex(idx)
             self.model_combo.blockSignals(False)
-        self.search_cb.blockSignals(True)
-        self.search_cb.setChecked(bool(self.settings.get("enable_search", False)))
-        self.search_cb.blockSignals(False)
-        self.agent_cb.blockSignals(True)
-        self.agent_cb.setChecked(bool(self.settings.get("agent_mode", True)))
-        self.agent_cb.blockSignals(False)
-        self._refresh_chips()
-
-    def _on_search_change(self, state):
-        self.settings["enable_search"] = (state == Qt.CheckState.Checked.value)
-        self.workspace.save_settings(self.settings)
-        self._refresh_chips()
-
-    def _on_agent_change(self, state):
-        self.settings["agent_mode"] = (state == Qt.CheckState.Checked.value)
-        self.workspace.save_settings(self.settings)
         self._refresh_chips()
 
     def _model_label_short(self):
@@ -1176,7 +1246,7 @@ class MainWindow(QMainWindow):
         else:
             self.chip_model.setText(self._model_label_short())
         bits = []
-        bits.append("联网✓" if self.settings.get("enable_search") else "联网—")
+        bits.append("联网✓" if self.settings.get("enable_search", True) else "联网—")
         bits.append("Agent✓" if self.settings.get("agent_mode") else "Agent—")
         try:
             data = self.memory.parse()
@@ -1927,7 +1997,9 @@ class MainWindow(QMainWindow):
         self._asst_worker = ChatWorker(
             self.bg_client, self.runner, api_msgs, True,
             model_sel=self.settings.get("selected_model") or "auto",
-            enable_search=bool(self.settings.get("enable_search")),
+            enable_search=(bool(self.settings.get("enable_search"))
+                           and agent_mod.needs_web_search(
+                               str(msg.get("text") or prompt))),
             max_iter=12)
         self._asst_worker.finished.connect(lambda out, m=msg: self._asst_finish(m, out))
         self._asst_worker.error.connect(lambda e, m=msg: self._asst_error(m, e))
@@ -2505,7 +2577,7 @@ class MainWindow(QMainWindow):
                 f"# 六、当前环境\n现在的时间是 {n.strftime('%Y-%m-%d %H:%M:%S')}（星期{wd}）。"
                 f"工作区目录：{self.workspace.path}；文件沙箱：{self.workspace.files_dir}。"
                 f"\n当前选择模型：{self._model_label_short().replace('模型：', '')}；"
-                f"联网搜索：{'开' if self.settings.get('enable_search') else '关'}；"
+                f"联网搜索：{'开' if self.settings.get('enable_search', True) else '关'}；"
                 f"钉钉推送：{'可用' if self.ding.configured() else '未配置'}；"
                 f"语音识别：{'可用' if _asr_ok(self.settings) else '不可用'}。")
         except Exception:
@@ -2541,8 +2613,6 @@ class MainWindow(QMainWindow):
     def _send(self):
         if self.running:
             return
-        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-            return
         text = self.input.toPlainText().strip()
         att_text = self._pending_attachment_text()
         note = self._attachment_note()
@@ -2572,7 +2642,11 @@ class MainWindow(QMainWindow):
             self.client, self.runner, api_messages,
             agent_mode=bool(self.settings.get("agent_mode", True)),
             model_sel=self.settings.get("selected_model", "auto"),
-            enable_search=bool(self.settings.get("enable_search")),
+            # 联网门控：设置里允许联网 + 这一轮看起来真的需要外部实时信息，
+            # 才让端点自动搜。本机/本地任务不再被塞进无关搜索结果
+            # （模型需要时仍可自己显式调 web_search 工具）。
+            enable_search=(bool(self.settings.get("enable_search", True))
+                           and agent_mod.needs_web_search(text)),
             max_iter=24,
             plan=self.conv.get("plan"),
         )
@@ -2587,9 +2661,10 @@ class MainWindow(QMainWindow):
         self.worker.wrapup.connect(self._on_wrapup)
         self.running = True
         self.send_btn.setEnabled(False)
-        self.send_btn.setText("生成中…")
+        self.send_btn.setText("…")
         self._open_page("chat")
-        self._render()
+        # 发新消息必须强制贴底
+        self._render(stick=True)
         self.worker.start()
 
     def _on_notice(self, text):
@@ -2601,23 +2676,36 @@ class MainWindow(QMainWindow):
             self._render_timer.start(80)
 
     def _update_live(self):
+        # ⚠️ 流式刷新时**不能强制贴底**：否则用户往上翻看历史时，会被
+        #    每 80ms 一次的强制滚动拽回底部（用户 2026-09-30 反馈
+        #    「AI 生成的时候我没办法往上翻」）。
+        #    改成"只在自己本来就贴着底时才跟随" —— 用户主动上滑后就不再打扰，
+        #    等他滚回底部，_scroll_to_bottom 的贴底判断会自动恢复跟随。
         if self._live_card is None:
             self._render_full()
         else:
             shown = strip_tool_markup(self.live_text)
             prose, blocks = markdown_render.render_with_blocks(shown)
             self._live_card.set_content(prose, blocks)
-            self._scroll_to_bottom(False)
+            # 卡片高度刚变，滚动条最大值要等布局刷新后再取 -> 延后一帧再跟随
+            QTimer.singleShot(0, lambda: self._scroll_to_bottom(False))
 
     def _on_tool_start(self, desc):
         self.statusBar().showMessage("正在执行工具：" + desc[:130])
 
     def _on_tool_result(self, result):
+        # 工具前的「中间话」不再丢弃：先作为折叠的「深度思考」块留在本轮记录里
+        # （整轮结束后 chat_worker 也会把它作为 role="thinking" 交回来，pending 只是
+        #   本轮的即时展示，_on_finished 会清空 pending，不会重复落进对话记录。）
+        _think = strip_tool_markup(self.live_text).strip() if self.live_text else ""
+        if _think:
+            self.pending_tool.append({"role": "thinking", "content": _think})
         self.live_text = ""
         self._live_card = None
         self.pending_tool.append({"role": "tool", "content": result})
         self.statusBar().clearMessage()
         self._refresh_chips()
+        # 工具结果到达也不强制贴底：用户可能正往上翻（同上）。
         self._render()
 
     def _on_finished(self, new_messages):
@@ -2652,10 +2740,11 @@ class MainWindow(QMainWindow):
         self.running = False
         self.send_btn.setEnabled(bool(self.input.toPlainText().strip())
                                  or bool(self.attachments))
-        self.send_btn.setText("发送")
+        self.send_btn.setText("➤")
         self.statusBar().clearMessage()
         self._refresh_chips()
         self._load_conversations()
+        # 收尾渲染同样不强制贴底：用户若正在上翻看历史，不该被拽走。
         self._render()
 
     def _on_confirm(self, cmd):
@@ -2749,6 +2838,10 @@ class MainWindow(QMainWindow):
             return
         msgs = self.conv.get("messages", [])
         if 0 <= index < len(msgs):
+            m = msgs[index]
+            # 清掉这条消息的折叠记录，避免其 dict 被回收后 id 复用、误套到新卡片上
+            for _r in ("tool", "thinking"):
+                self._card_collapsed.pop(self._card_key(m, index, _r), None)
             del msgs[index]
             self.workspace.save_conversation(self.conv)
             self._render()
@@ -2779,10 +2872,11 @@ class MainWindow(QMainWindow):
         self.conv["title"] = title
         self.workspace.save_conversation(self.conv)
         self._load_conversations()
+        self._update_page_title()
 
     # ================= 渲染 =================
-    def _render(self):
-        self._render_full()
+    def _render(self, stick=None):
+        self._render_full(stick=stick)
 
     def _clear_chat(self):
         while self.chat_layout.count():
@@ -2798,7 +2892,24 @@ class MainWindow(QMainWindow):
         if force or sb.value() >= sb.maximum() - 40:
             sb.setValue(sb.maximum())
 
-    def _render_full(self):
+    def _card_key(self, msg, index, role):
+        """折叠状态键：与会变动的下标解耦。
+
+        优先用消息 dict 的稳定身份 —— 同一次会话内 `id(m)` 稳定，
+        删掉别的消息不会改变它（所以删中间一条不会让展开态"跑"到别的卡上）；
+        非 dict 的临时项退回下标兜底。
+        """
+        if isinstance(msg, dict):
+            return ("obj", id(msg), str(role))
+        return ("idx", int(index), str(role))
+
+    def _render_full(self, stick=None):
+        # 重建前先记住滚动状态：stick=True 强制贴底；否则沿用"当前是否贴底"。
+        # 这就是「一发新消息就跳到最上面」的根因修复 —— 重建后延后一帧再恢复。
+        sb = self.chat_scroll.verticalScrollBar()
+        at_bottom = True if stick is True else (sb.value() >= sb.maximum() - 40)
+        old_value = sb.value()
+
         self._clear_chat()
         self._cards = []
         self._live_card = None
@@ -2816,23 +2927,33 @@ class MainWindow(QMainWindow):
             return
 
         for i, m in enumerate(display):
+            role = m.get("role")
+            content = m.get("content", "") or ""
             footer = ""
-            if m.get("role") == "assistant" and m.get("_model"):
+            if role == "assistant" and m.get("_model"):
                 footer = "实际使用模型：" + m["_model"]
-            label = tool_label(m.get("content", "")) if m.get("role") == "tool" else None
-            card = MessageCard.from_text(m["role"], m["content"], footer_text=footer,
-                                        label=label, index=i)
-            if m.get("role") in ("assistant", "user", "tool"):
-                card.copy_requested.connect(
-                    lambda _=False, c=m: self._copy_msg(c))
+            label = tool_label(content) if role == "tool" else None
+            # 文件写入卡片：从工具结果文本解析 +N / -N
+            stats = file_write_stats(content) if role == "tool" else None
+            # 折叠状态跨重建保持：优先用用户手动设置过的值
+            saved = self._card_collapsed.get(self._card_key(m, i, role))
+            card = MessageCard.from_text(role, content, footer_text=footer,
+                                        label=label, index=i,
+                                        stats=stats, collapsed=saved)
+            if role in ("assistant", "user", "tool"):
+                card.copy_requested.connect(lambda _=False, c=m: self._copy_msg(c))
                 card.delete_requested.connect(
                     lambda _=False, k=i: self._delete_message(k))
                 card.speak_requested.connect(self._speak_message)
-            if m.get("role") == "assistant":
+            if role == "assistant":
                 card.regenerate_requested.connect(self._regenerate)
-            if m.get("role") == "user":
+            if role == "user":
                 card.edit_requested.connect(
                     lambda _=False, k=i: self._edit_message(k))
+            if role in ("tool", "thinking"):
+                card.collapse_changed.connect(
+                    lambda collapsed, k=self._card_key(m, i, role):
+                        self._card_collapsed.__setitem__(k, collapsed))
             self.chat_layout.addWidget(card)
             self._cards.append(card)
 
@@ -2849,18 +2970,37 @@ class MainWindow(QMainWindow):
             self._live_card = card
 
         self.chat_layout.addStretch(1)
-        self._scroll_to_bottom(self.running)
-        QTimer.singleShot(0, self._refit_cards)
+        # 此刻布局还没最终确定，直接读滚动条最大值不准 —— 延后一帧再恢复位置
+        self._pending_scroll = (at_bottom, old_value)
+        QTimer.singleShot(0, self._after_render)
 
     def _copy_msg(self, m):
         QGuiApplication.clipboard().setText(m.get("content") or "")
         self.statusBar().showMessage("已复制到剪贴板", 2500)
 
-    def _refit_cards(self):
+    def _after_render(self):
+        """布局落定后撑开卡片并按需要恢复滚动位置。
+
+        修的是用户反馈的「一弹出来 / 一发新消息就自动跳到最顶端」：
+        重建卡片后先让布局重新计算高度，再贴底或还原旧位置。
+        """
+        try:
+            self.chat_layout.activate()
+            self.chat_container.adjustSize()
+        except Exception:
+            pass
         for c in self._cards:
             if hasattr(c, "refit"):
                 c.refit()
-        self._scroll_to_bottom(self.running)
+        self._restore_scroll()
+
+    def _restore_scroll(self):
+        sb = self.chat_scroll.verticalScrollBar()
+        at_bottom, old = getattr(self, "_pending_scroll", (True, 0))
+        if at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(min(old, max(sb.maximum(), 0)))
 
     def _stack_welcome(self):
         self._clear_chat()

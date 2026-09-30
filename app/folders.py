@@ -10,6 +10,7 @@ r"""已知文件夹（桌面 / 文档 / 下载 / 图片…）别名解析。
 """
 import ctypes
 import os
+import re
 import sys
 
 # SHGetKnownFolderPath 的 KNOWNFOLDERID
@@ -150,6 +151,27 @@ def split_alias(raw):
     return base, rest
 
 
+_DRIVE_PAN_RE = re.compile(r"^([A-Za-z])\s*盘\s*(?:根目录|根)?$")
+_DRIVE_COLON_RE = re.compile(r"^([A-Za-z])\s*[:：]\s*[\\/]*$")
+
+
+def normalize_drive(raw):
+    """把"只有盘符"的写法归一成 `X:\\`。
+
+    背景（真实 bug）：Windows 上 `"D:"` 不是"D 盘根目录"，而是
+    **"D 盘上的当前目录"**（进程 CWD，常等于程序自己所在目录）。
+    于是 list_dir("D:") 会列出**程序自己的目录**而不是 D 盘根，用户看到
+    的内容完全不对。这里统一把手写的 "D:" / "D盘" / "D盘根目录" 变成 "D:\\"。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return raw
+    m = _DRIVE_COLON_RE.match(s) or _DRIVE_PAN_RE.match(s)
+    if m:
+        return m.group(1).upper() + ":\\"
+    return raw
+
+
 def resolve(raw):
     """把带别名的路径换成绝对路径；不是别名则原样返回。
 
@@ -158,7 +180,9 @@ def resolve(raw):
       desktop/a.txt            -> C:\\Users\\xxx\\Desktop\\a.txt
       下载\\x.zip\\            -> C:\\Users\\xxx\\Downloads\\x.zip
       out\\a.txt               -> out\\a.txt（原样，交给工作区处理）
+      D: / D盘 / D盘根目录      -> D:\\（盘符归一化，见 normalize_drive）
     """
+    raw = normalize_drive(raw)
     base, rest = split_alias(raw)
     if not base:
         return raw
