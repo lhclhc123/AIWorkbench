@@ -175,6 +175,7 @@ class StatusLine(QWidget):
         "search": ("🔍", "正在联网搜索"),
         "verify": ("🧪", "正在运行验证"),
         "write":  ("📝", "正在写文件"),
+        "web":    ("🌐", "正在等待 DeepSeek 网页输出"),
         "stop":   ("⏹", "已停止"),
     }
 

@@ -1,0 +1,105 @@
+classDiagram
+    class WebErrorKind {
+        <<enumeration>>
+        NOT_INSTALLED
+        NOT_STARTED
+        NOT_LOGGED_IN
+        READY
+        GENERATING
+        TIMEOUT
+        PAGE_CHANGED
+        DUPLICATE
+        BUSY
+        OTHER
+    }
+    class errors_py {
+        <<module>>
+        +humanize(kind, detail) str
+        +WEB_ERROR_TEXT dict
+    }
+
+    class CDPClient {
+        -_ws
+        -_id: int
+        -_lock: Lock
+        +from_page(port, url_match, timeout) CDPClient
+        +call(method, params, timeout) dict
+        +send(method, params) int
+        +evaluate(expression, await_promise, timeout) Any
+        +navigate(url, timeout) None
+        +close() None
+    }
+
+    class WebDriver {
+        -cdp: CDPClient
+        +probe_state() tuple
+        +submit(prompt, on_progress, ack_timeout, answer_timeout, dedupe_key) str
+        +new_conversation() None
+        +open_page(url) None
+        +stop_generation() None
+        -_inject_composer() None
+        -_wait_answer() str
+    }
+
+    class prompt_py {
+        <<module>>
+        +ROLE_TAG dict
+        +estimate_chars(messages) int
+        +flatten(messages) str
+        +diff_tail(prev, cur) str
+        +trim_recent(messages, keep_turns) list
+    }
+
+    class LocalServer {
+        -_httpd
+        -_port: int
+        -_task_lock: Lock
+        -_inflight: dict
+        -_notices: deque
+        +start(preferred_port) int
+        +stop() None
+        +status() dict
+        +selftest() list
+        +take_notices() list
+        +push_notice(text) None
+    }
+
+    class WebTask {
+        +fp: str
+        +submitted_at: float
+        +state: str
+        +answer: str
+        +error: str
+        +done: Event
+    }
+
+    class DeepSeekWebService {
+        -_server: LocalServer
+        -_driver: WebDriver
+        -_chrome_proc: Popen
+        +instance() DeepSeekWebService
+        +ensure_started() int
+        +launch() dict
+        +status() dict
+        +selftest() list
+        +reset() None
+        +auto_ready() bool
+        +shutdown() None
+    }
+
+    class LLMClient {
+        +set_web_gate(fn) None
+        +_stream_once()
+        +chat_auto()
+        +probe_provider()
+    }
+
+    DeepSeekWebService --> LocalServer : owns
+    DeepSeekWebService --> WebDriver : owns(lazy)
+    LocalServer --> WebDriver : submit()
+    WebDriver --> CDPClient : uses
+    LocalServer --> prompt_py : flatten/diff_tail
+    LocalServer --> WebTask : manages
+    LocalServer --> errors_py : humanize
+    DeepSeekWebService --> errors_py : humanize
+    LLMClient ..> LocalServer : HTTP(SSE)

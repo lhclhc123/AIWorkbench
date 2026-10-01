@@ -1,0 +1,48 @@
+%% 主链路：用户发一条消息 → Agent 循环 → LLMClient → 本机服务 → CDP → 网页 → 回来
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant MW as MainWindow
+    participant CW as ChatWorker
+    participant LC as LLMClient
+    participant LS as LocalServer(第三层)
+    participant WD as WebDriver(第二层)
+    participant CD as CDPClient(第一层)
+    participant CH as Chrome/DeepSeek网页
+
+    U->>MW: 选「DeepSeek 网页版」→ 输入并发送
+    MW->>MW: 选中网页版 → state_line=("web","正在等待网页输出")
+    MW->>CW: start(ChatWorker)
+    CW->>LC: chat(api_messages, model_sel="deepseek-web@deepseek_web", on_token, on_reasoning)
+    LC->>LC: resolve_model_choice → provider(deepseek_web)
+    LC->>LS: POST /chat/completions (Bearer local, stream=true)
+    LS->>LS: fp=sha1(model+messages)；查幂等表（新任务）
+    LS->>LS: prompt.diff_tail(prev, cur) → tail 文本
+    LS-->>LC: 200 + 立即开流（先发一帧心跳）
+    LS->>WD: submit(tail, dedupe_key=fp, on_progress=转SSE)
+    WD->>CD: evaluate(填 contenteditable 输入框)
+    CD->>CH: Runtime.evaluate
+    WD->>CD: evaluate(点发送)
+    CD->>CH: 点击发送按钮
+    loop 等待网页出字（每 2s 心跳保活）
+        LS-->>LC: data:{delta.content/reasoning_content} 或 ": ping"
+        LC-->>CW: on_token / on_reasoning
+    end
+    WD->>CD: evaluate(轮询答复文本 + 停止按钮)
+    CD->>CH: 读取 DOM
+    CH-->>CD: 答复原文
+    WD-->>LS: answer 原文
+    LS->>LS: 幂等表置 done、缓存 answer
+    LS-->>LC: data: [DONE]
+    LC-->>CW: 返回完整文本
+    CW->>CW: parse_tool_calls(text)
+    alt 有工具调用（Agent 多轮）
+        CW->>CW: 执行工具（零改动）
+        CW->>LC: 下一轮 chat(api_messages + assistant + user反馈)
+        Note over LC,LS: diff_tail 命中前缀 → 只发"新增尾段"，复用网页上下文
+        LC->>LS: POST /chat/completions (仅新增尾段)
+        LS->>WD: submit(tail) ... 同上 ...
+    else 无工具调用（最终答复）
+        CW-->>MW: finished(out_messages)
+        MW->>MW: state_line=("idle")
+    end

@@ -1349,6 +1349,10 @@ class SettingsPage(QWidget):
     saved = pyqtSignal(dict)
     probe_requested = pyqtSignal()
     voice_test = pyqtSignal(str)        # tts 试听
+    # v9.14.0：DeepSeek 网页版区块的三个动作（由主窗口接线）
+    web_launch = pyqtSignal()
+    web_selftest = pyqtSignal()
+    web_retry = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1449,9 +1453,115 @@ class SettingsPage(QWidget):
         row.addWidget(btn)
         row.addStretch(1)
         v.addLayout(row)
+
+        # ---------------- DeepSeek 网页版（v9.14.0 新增区块） ----------------
+        # 规范对齐 PRD 第 4 节：状态行 + 三个按钮 + 灰色提示 + 风险说明。
+        box = QGroupBox("DeepSeek 网页版")
+        bv = QVBoxLayout(box)
+        bv.setSpacing(8)
+
+        srow = QHBoxLayout()
+        self.web_dot = QLabel("●")
+        self.web_dot.setStyleSheet("color:#9e9e9e;font-size:15px;")
+        self.web_state = QLabel("状态：网页未启动")
+        self.web_state.setStyleSheet("font-size:13px;")
+        srow.addWidget(self.web_dot)
+        srow.addWidget(self.web_state)
+        srow.addStretch(1)
+        bv.addLayout(srow)
+
+        brow = QHBoxLayout()
+        brow.setSpacing(8)
+        self.web_btn_launch = QPushButton("启动/打开网页")
+        self.web_btn_launch.setFixedHeight(30)
+        self.web_btn_launch.clicked.connect(self.web_launch.emit)
+        self.web_btn_selftest = QPushButton("连通性自检")
+        self.web_btn_selftest.setFixedHeight(30)
+        self.web_btn_selftest.clicked.connect(self.web_selftest.emit)
+        self.web_btn_retry = QPushButton("重试")
+        self.web_btn_retry.setFixedHeight(30)
+        self.web_btn_retry.clicked.connect(self.web_retry.emit)
+        brow.addWidget(self.web_btn_launch)
+        brow.addWidget(self.web_btn_selftest)
+        brow.addWidget(self.web_btn_retry)
+        brow.addStretch(1)
+        bv.addLayout(brow)
+
+        web_hint = QLabel("首次使用请在弹出的网页里登录一次 DeepSeek（手机号验证码 / 微信扫码"
+                          "都行），登录后回来点「连通性自检」。登录态会记住，之后免登。")
+        web_hint.setWordWrap(True)
+        web_hint.setObjectName("PageSub")
+        bv.addWidget(web_hint)
+
+        self.web_selftest_view = QTextBrowser()
+        self.web_selftest_view.setVisible(False)
+        self.web_selftest_view.setFixedHeight(120)
+        bv.addWidget(self.web_selftest_view)
+
+        self.web_auto_cb = QCheckBox("程序启动时，若网页已在线则自动接入"
+                                     "（不会主动打开浏览器）")
+        bv.addWidget(self.web_auto_cb)
+
+        web_risk = QLabel("ⓘ 本功能通过自动化驱动本机 Chrome 页面工作，非官方 API。"
+                          "DeepSeek 网页若改版可能暂时失效；账号存在被判定为异常使用的潜在风险。")
+        web_risk.setWordWrap(True)
+        web_risk.setObjectName("PageSub")
+        bv.addWidget(web_risk)
+
+        v.addWidget(box)
+
         self.probe_view = QTextBrowser()
         v.addWidget(self.probe_view, 1)
         return page
+
+    def set_web_status(self, kind, detail=""):
+        """更新「DeepSeek 网页版」状态行（圆点颜色 + 文案）。kind 为 WebErrorKind 值或短名。"""
+        try:
+            from ..deepseek_web import errors as _dw_errors
+            wkind = _dw_errors.WebErrorKind(kind) if not isinstance(
+                kind, _dw_errors.WebErrorKind) else kind
+            label = _dw_errors.label_of(wkind)
+        except Exception:
+            label = "未知"
+            wkind = None
+        color = "#2e7d32"   # 绿
+        try:
+            name = wkind.value if wkind is not None else str(kind)
+        except Exception:
+            name = str(kind)
+        if name in ("not_logged_in",):
+            color = "#f9a825"       # 黄
+        elif name in ("not_started", "not_installed"):
+            color = "#9e9e9e"       # 灰
+        elif name in ("timeout", "page_changed", "duplicate", "other"):
+            color = "#c62828"       # 红
+        text = f"状态：{label}"
+        detail = (detail or "").strip()
+        if detail and detail not in text:
+            text += f"（{detail[:40]}）"
+        try:
+            self.web_dot.setStyleSheet(f"color:{color};font-size:15px;")
+            self.web_state.setText(text)
+        except Exception:
+            pass
+
+    def show_web_selftest(self, results):
+        """把自检结果渲染进区块（逐项 ✓ / ✗ + 中文说明）。"""
+        rows = ['<table style="font-size:13px;border-collapse:collapse;">']
+        for item in results or []:
+            ok = item.get("ok")
+            mark = "✅" if ok else "❌"
+            color = "#2e7d32" if ok else "#c62828"
+            rows.append(
+                f'<tr><td style="padding:4px 12px 4px 0;"><b>{_esc(item.get("name",""))}</b></td>'
+                f'<td style="color:{color};padding:4px 8px;">{mark}</td>'
+                f'<td style="padding:4px 0;">{_esc(item.get("detail",""))}</td></tr>')
+        rows.append("</table>")
+        try:
+            self.web_selftest_view.setHtml("".join(rows))
+            self.web_selftest_view.setVisible(True)
+        except Exception:
+            pass
 
     def show_probe(self, results):
         t = themes.tokens()
@@ -1628,6 +1738,7 @@ class SettingsPage(QWidget):
         self.tray_on_close.setChecked(bool(s.get("tray_on_close", True)))
         self.hotkey_show.setText(s.get("hotkey_show", "ctrl+alt+space") or "")
         self.hotkey_voice.setText(s.get("hotkey_voice", "ctrl+alt+v") or "")
+        self.web_auto_cb.setChecked(bool(s.get("deepseek_web_auto", False)))
 
     def _save(self):
         s = dict(self._settings)
@@ -1650,6 +1761,7 @@ class SettingsPage(QWidget):
         s["tray_on_close"] = self.tray_on_close.isChecked()
         s["hotkey_show"] = self.hotkey_show.text().strip()
         s["hotkey_voice"] = self.hotkey_voice.text().strip()
+        s["deepseek_web_auto"] = self.web_auto_cb.isChecked()
         keys = dict(s.get("api_keys") or {})
         for name, e in self.key_edits.items():
             keys[name] = e.text().strip()

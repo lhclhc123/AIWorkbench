@@ -12,6 +12,7 @@
 import json
 import os
 import re
+import threading
 import time
 
 from PyQt6.QtWidgets import (
@@ -30,6 +31,7 @@ from .. import (config, llm_client, workspace as ws_mod, agent as agent_mod,
                 skills as skills_mod, scheduler as _sched_mod,
                 hotkey as _hotkey_mod, worklog as _worklog_mod,
                 assistant as assistant_mod)
+from ..deepseek_web import service as _dsw_service
 from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
 from .panels import PlanPanel
@@ -98,6 +100,9 @@ class MainWindow(QMainWindow):
     _update_progress = pyqtSignal(int, int)
     _update_done = pyqtSignal(str)
     _update_fail = pyqtSignal(str)
+    # DeepSeek 网页版（v9.14.0）：后台线程 -> 界面
+    _dsw_launch_ready = pyqtSignal(dict)
+    _dsw_selftest_ready = pyqtSignal(list)
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
@@ -112,6 +117,21 @@ class MainWindow(QMainWindow):
         self.bg_client = llm_client.LLMClient()
         self.bg_client.policy = self.client.policy
         self.bg_client.set_keys(self.settings.get("api_keys", {}))
+
+        # ---- DeepSeek 网页版（v9.14.0）----
+        # 单例协调器。遵循红线：**不主动拉起浏览器**，也**不在未使用时启动后台服务**
+        # （HTTP 服务只在选中网页版 / 打开设置页 / 点区块按钮时按需启动）。
+        self.dsw = _dsw_service.instance()
+        try:
+            self.client.set_web_gate(self.dsw.auto_ready)
+            self.bg_client.set_web_gate(self.dsw.auto_ready)
+        except Exception:
+            pass
+        self._dsw_timer = QTimer(self)
+        self._dsw_timer.setInterval(3000)
+        self._dsw_timer.timeout.connect(self._poll_deepseek_web)
+        self._dsw_launch_ready.connect(self._dsw_on_launch)
+        self._dsw_selftest_ready.connect(self._dsw_on_selftest)
         self.memory = memory_mod.MemoryStore(self.workspace.path)
         self.trace = trace_mod.TraceLog(self.workspace.path)
         self.mcp = mcp_client.MCPManager(self.workspace.path)
@@ -139,6 +159,7 @@ class MainWindow(QMainWindow):
         self._cards = []
         self._live_card = None
         self._last_model_label = ""
+        self._dsw_selected = False      # 本轮是否使用「DeepSeek 网页版」（状态行用）
         self._pending_update = None
         # 折叠卡片的用户手动展开/收起，用消息对象身份 (id(msg), 角色) 记住，重建时恢复
         self._card_collapsed = {}
@@ -180,6 +201,111 @@ class MainWindow(QMainWindow):
 
         self._setup_tray()
         QTimer.singleShot(600, self._setup_hotkey)
+
+        # 仅在"已选中网页版"或用户开了"启动时自动接入"时才按需启动本机服务；
+        # 且只尝试接入**已在线**的网页（绝不主动拉起浏览器）。
+        _sel = self.settings.get("selected_model", "auto")
+        if (isinstance(_sel, str) and "deepseek" in _sel and "web" in _sel) or \
+                self.settings.get("deepseek_web_auto"):
+            QTimer.singleShot(0, self._dsw_boot)
+
+    # ================= DeepSeek 网页版（v9.14.0） =================
+    def _dsw_boot(self):
+        """按需启动本机服务并尝试接入已在线网页（不拉起浏览器）。"""
+        self._dsw_ensure()
+        try:
+            self.dsw.connect_if_online()
+        except Exception:
+            pass
+        self._poll_deepseek_web()
+
+    def _dsw_ensure(self):
+        """确保本机 HTTP 服务在跑 + 状态轮询定时器在跑（幂等、无浏览器副作用）。"""
+        try:
+            if not self.dsw.is_started():
+                self.dsw.ensure_started()
+            if not self._dsw_timer.isActive():
+                self._dsw_timer.start()
+        except Exception:
+            pass
+
+    def _poll_deepseek_web(self):
+        """状态轮询：刷新设置页状态行 + 取走网页层推来的提示。"""
+        try:
+            st = self.dsw.status()
+        except Exception:
+            return
+        try:
+            self.page_settings.set_web_status(st.get("state") or "not_started",
+                                              st.get("detail") or "")
+        except Exception:
+            pass
+        try:
+            for note in self.dsw.take_notices():
+                self.statusBar().showMessage(str(note)[:160], 12000)
+        except Exception:
+            pass
+
+    def _dsw_do_launch(self):
+        """「启动/打开网页」：拉起（或复用）Chrome。这是**唯一**会主动开浏览器的入口。"""
+        self._dsw_ensure()
+        self.page_settings.set_web_status("not_started", "正在启动网页…")
+
+        def work():
+            try:
+                res = self.dsw.launch()
+            except Exception as exc:
+                res = {"ok": False, "detail": f"{exc}"}
+            self._dsw_launch_ready.emit(res)
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-launch").start()
+
+    def _dsw_on_launch(self, res):
+        detail = (res or {}).get("detail") or ""
+        if (res or {}).get("ok"):
+            self.statusBar().showMessage("DeepSeek 网页：" + detail[:150], 12000)
+        else:
+            self._info(detail or "启动网页失败", "DeepSeek 网页版")
+        self._poll_deepseek_web()
+
+    def _dsw_do_selftest(self):
+        """「连通性自检」：后台跑三项自检，结果回到设置页。"""
+        self._dsw_ensure()
+        self.page_settings.set_web_status("not_started", "正在自检…")
+
+        def work():
+            try:
+                results = self.dsw.selftest()
+            except Exception as exc:
+                results = [{"name": "自检", "ok": False, "detail": f"{exc}"}]
+            self._dsw_selftest_ready.emit(results)
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-selftest").start()
+
+    def _dsw_on_selftest(self, results):
+        try:
+            self.page_settings.show_web_selftest(results)
+        except Exception:
+            pass
+        self._poll_deepseek_web()
+
+    def _dsw_do_retry(self):
+        """「重试」：重连 CDP / 重载网页（**不重发**历史提问）。"""
+        self._dsw_ensure()
+        self.page_settings.set_web_status("not_started", "正在重试…")
+
+        def work():
+            try:
+                self.dsw.reset()
+            except Exception:
+                pass
+            try:
+                res = self.dsw.launch()
+            except Exception as exc:
+                res = {"ok": False, "detail": f"{exc}"}
+            self._dsw_launch_ready.emit(res)
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-retry").start()
 
     # ================= 托盘 + 全局热键 =================
     def _setup_tray(self):
@@ -315,6 +441,15 @@ class MainWindow(QMainWindow):
                 self.tray.hide()
         except Exception:
             pass
+        # 真正退出：收拾 DeepSeek 网页通道（停本机服务 / 断开 CDP / 关掉我们拉起的浏览器）
+        try:
+            self._dsw_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.dsw.shutdown()
+        except Exception:
+            pass
         event.accept()
 
     # ================= 主题 =================
@@ -421,6 +556,10 @@ class MainWindow(QMainWindow):
         self.page_settings.saved.connect(self._on_settings_saved)
         self.page_settings.probe_requested.connect(self._probe_providers)
         self.page_settings.voice_test.connect(self._tts_test)
+        # DeepSeek 网页版区块（v9.14.0）
+        self.page_settings.web_launch.connect(self._dsw_do_launch)
+        self.page_settings.web_selftest.connect(self._dsw_do_selftest)
+        self.page_settings.web_retry.connect(self._dsw_do_retry)
 
         self.page_about = AboutPage()
         self.stack.addWidget(self.page_about)
@@ -700,6 +839,8 @@ class MainWindow(QMainWindow):
             self.page_integrations.bind_mcp(self.mcp, self.workspace.path)
         elif key == "settings":
             self.page_settings.load(self.settings)
+            self._dsw_ensure()          # 打开设置页才按需启动本机服务（无浏览器副作用）
+            self._poll_deepseek_web()
         elif key == "chat":
             self.input.setFocus()
             self._scroll_to_bottom(True)
@@ -2348,6 +2489,14 @@ class MainWindow(QMainWindow):
         self.speaker.rate = int(self.settings.get("tts_rate", 0) or 0)
         self.mcp.reload()
         self.bg_client.set_keys(self.settings.get("api_keys", {}))
+        # DeepSeek 网页版：开了"启动时自动接入"就立刻尝试接入已在线网页（绝不拉起浏览器）
+        if self.settings.get("deepseek_web_auto"):
+            self._dsw_ensure()
+            try:
+                self.dsw.connect_if_online()
+            except Exception:
+                pass
+            self._poll_deepseek_web()
         # 托盘 / 热键设置变更后立刻重建（先把旧的注册释放掉，再按新配置注册）
         for hk in getattr(self, "hotkeys", []) or []:
             try:
@@ -2374,6 +2523,7 @@ class MainWindow(QMainWindow):
     def _probe_providers(self):
         self.page_settings.probe_view.setHtml("正在逐个端点体检，请稍候…")
         QApplication.processEvents()
+        self._dsw_ensure()      # 让网页版端点的 /models 可被体检到（用户主动操作）
         results = self.client.probe_all(timeout=8)
         self.page_settings.show_probe(results)
 
@@ -2632,6 +2782,12 @@ class MainWindow(QMainWindow):
         self.client.policy = self.settings.get("model_policy", "strict")
         self.client.reset_used()
         self._last_model_label = ""
+        # 本轮若用「DeepSeek 网页版」：按需启动本机服务（不拉起浏览器）
+        _sel = self.settings.get("selected_model", "auto")
+        self._dsw_selected = bool(isinstance(_sel, str)
+                                  and "deepseek" in _sel and "web" in _sel)
+        if self._dsw_selected:
+            self._dsw_ensure()
         msg = {"role": "user", "content": (note + "\n" + text) if note else text}
         if att_text:
             msg["attached"] = att_text
@@ -2670,7 +2826,8 @@ class MainWindow(QMainWindow):
         self.running = True
         # 生成中：右下角按钮变成红色方形「停止」，点一下就能打断模型
         self._set_stop_mode(True)
-        self.state_line.set_phase("model", "")
+        # 选中网页版时，状态行显示"正在等待 DeepSeek 网页输出"；否则沿用旧的"调用模型"
+        self.state_line.set_phase("web" if self._dsw_selected else "model", "")
         self._open_page("chat")
         # 发新消息必须强制贴底
         self._render(stick=True)

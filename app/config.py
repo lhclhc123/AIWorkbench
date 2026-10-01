@@ -144,6 +144,50 @@ PROVIDERS = [
 # 一旦某模型免费额度用尽（会报 403），chat_auto 会自动往后一个端点继续试。
 PROVIDER_PRIORITY = ["siliconflow", "zhipu", "scnet", "dashscope"]
 
+# ---------------------------------------------------------------------------
+# 【v9.14.0 新增】DeepSeek 网页版（本机 OpenAI 兼容中转，免 API Key）
+# ---------------------------------------------------------------------------
+# 原理：本程序用 CDP 驱动本机已登录的 Chrome 打开 chat.deepseek.com，
+# 在本地起一个 OpenAI 兼容服务把"messages -> 网页 -> 原文"串起来。
+# 详见 docs/deepseek-web/00-context.md 与 02-arch.md。
+#
+# ⚠️ base_url 的端口在运行时由 app/deepseek_web/service.py 回写为真实端口
+#    （首选 18921，被占用则回退系统随机端口）。
+WEB_PROVIDER_NAME = "deepseek_web"      # provider 名
+WEB_MODEL_ID = "deepseek-web"           # 模型 id（下拉 choice = deepseek-web@deepseek_web）
+WEB_DEFAULT_PORT = 18921                # 本机 HTTP 服务首选端口
+WEB_CHROME_PORT = 9222                  # 驱动 Chrome 的远程调试端口
+WEB_MAX_PROMPT_CHARS = 60000            # 摊平提示词超过该字符数 -> 新建网页对话 + 携带最近若干轮
+WEB_ACK_TIMEOUT = 12.0                  # 提交后等待"网页确认收到"的上限（秒）
+WEB_ANSWER_TIMEOUT = 300.0              # 单轮网页生成上限（秒）
+WEB_DEDUPE_GRACE = 90.0                 # 幂等结果回放宽限窗（秒）
+WEB_HEARTBEAT = 2.0                     # SSE 心跳间隔（秒），远小于 llm_client 的 25s 读超时
+# 占位 key（双保险）：即使设置页把 Key 存成空串，no_key 白名单也让 llm_client 照常工作。
+# 取值形如 sk-… 只是为了通过 main.py 自检里"内置密钥格式"检查；它不是真密钥，
+# 本机服务对 Authorization 只要求"非空"，并不校验内容。
+# ★ 全项目**唯一**的占位串定义处：llm_client 在 key 为空且 no_key=True 时也回落到它，
+#   绝不在别处硬编码第二份。
+WEB_PLACEHOLDER_KEY = "sk-local-deepseek-web"
+
+PROVIDERS.append({
+    "name": WEB_PROVIDER_NAME,
+    "label": "DeepSeek 网页版",
+    "base_url": f"http://127.0.0.1:{WEB_DEFAULT_PORT}",
+    "free": True,
+    "search_style": "none",   # 命中 llm_client.py 的跳过分支：不追加任何联网字段
+    "no_key": True,           # ★ 免密钥白名单（满足 00-context 3.4 硬约束 1）
+    "web": True,              # ★ 网页通道标记：auto 模式要据此查就绪态
+    "models": [
+        {"id": WEB_MODEL_ID, "name": "DeepSeek 网页版（免费·深度思考）", "free": True},
+    ],
+})
+# 占位 key（双保险）：即使设置页把 Key 存成空串，no_key 白名单也让 llm_client 照常工作。
+# （常量定义见上方 WEB_PLACEHOLDER_KEY，此处只引用，避免出现第二份硬编码串。）
+DEFAULT_API_KEYS.setdefault(WEB_PROVIDER_NAME, WEB_PLACEHOLDER_KEY)
+# 放最后：不抢免费 API 的位，仅作自动模式下的兜底候选（且只在"已连接"时才被选）。
+PROVIDER_PRIORITY.append(WEB_PROVIDER_NAME)
+
+
 # 视觉（图片识别/OCR）端点的尝试顺序，免费优先
 VISION_PRIORITY = ["zhipu", "dashscope"]
 

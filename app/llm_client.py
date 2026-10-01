@@ -28,6 +28,39 @@ def _is_hard_err(e):
             or "AllocationQuota" in msg or "额度" in msg)
 
 
+def _default_web_gate():
+    """网页通道的默认闸门（只读就绪态，**绝不主动拉起浏览器**）。
+
+    v9.14.0：任何未显式注入 web_gate 的 LLMClient，在 auto 模式下也用它来判定
+    "网页版是否已连接"；服务不可用一律视为未就绪，从而静默跳过网页 provider，
+    避免去撞一个没启动的本机服务。
+    """
+    def _gate():
+        try:
+            from .deepseek_web import service as _svc
+            return bool(_svc.instance().auto_ready())
+        except Exception:
+            return False
+    return _gate
+
+
+def _effective_key(provider, key):
+    """挑出发请求实际要用的 key。
+
+    `no_key` 白名单端点（DeepSeek 网页版本机服务）：即使调用方把 key 传成**空串**
+    （例如用户在设置页清空了 Key 输入框并保存），也回落到 `config.WEB_PLACEHOLDER_KEY`，
+    **绝不发出空 Bearer** —— 本机服务要求 Bearer 非空，否则会 401。
+
+    注意：这是**客户端**兜底；服务端的"回环绑定 + Host 校验 + 要求 Bearer"强度保持不变。
+    占位串全项目只在 `config.WEB_PLACEHOLDER_KEY` 定义一处。
+    """
+    if key:
+        return key
+    if provider.get("no_key"):
+        return config.WEB_PLACEHOLDER_KEY
+    return key
+
+
 class LLMClient:
     def __init__(self):
         self.keys = dict(config.DEFAULT_API_KEYS)  # provider -> key
@@ -44,6 +77,14 @@ class LLMClient:
         # 本会话内已知「硬报错」的 (端点名, 模型id)：认证/额度用尽/已下线。
         # auto 模式会跳过它们，避免每次都白撞一次失败请求（如某模型免费额度耗尽 403）。
         self._bad = set()
+        # 网页通道闸门（v9.14.0）：由界面注入 callable -> bool。
+        # None = 不启用闸门；返回 False 表示"网页版未就绪"，auto 模式静默跳过它
+        # （绝不因为 auto 模式就主动拉起浏览器）。
+        self.web_gate = None
+
+    def set_web_gate(self, fn):
+        """注入"网页通道是否就绪"的判断函数（供 chat_auto 使用）。"""
+        self.web_gate = fn
 
     def set_keys(self, keys: dict):
         if keys:
@@ -126,8 +167,12 @@ class LLMClient:
         这里把思维链单独回调出去，界面可以渲染成"深度思考"块。
         """
         key = self.keys.get(provider["name"], "")
-        if not key:
+        # 满足 00-context 3.4 硬约束 1：带 no_key 标记的端点（DeepSeek 网页版本机服务）
+        # 不需要真密钥，即使 Key 被清空也照常工作。
+        if not key and not provider.get("no_key"):
             raise LLMError(f"[{provider['label']}] 缺少 API Key")
+        # no_key 端点若 key 为空，回落到统一占位串，避免发出空 Bearer 触发 401（见 04-qa §6.1）
+        key = _effective_key(provider, key)
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         payload = self._build_payload(provider, model, messages, enable_search, stream=True)
         headers = {
@@ -240,8 +285,17 @@ class LLMClient:
             p = config.provider_by_name(pname)
             if not p:
                 continue
-            if not self.keys.get(p["name"]):
+            if not self.keys.get(p["name"]) and not p.get("no_key"):
                 continue          # 没配 Key 的端点直接跳过，不要浪费一次"缺少 Key"的错误
+            # v9.14.0：网页通道未就绪则静默跳过 —— 绝不因为 auto 模式就去拉起浏览器。
+            # web_gate 未显式注入时用默认闸门（查单例 service 的就绪态；不可用即未就绪）。
+            if p.get("web"):
+                gate = self.web_gate or _default_web_gate()
+                try:
+                    if not gate():
+                        continue
+                except Exception:
+                    continue
             for m in config.chat_models_for_provider(p):
                 if (p["name"], m["id"]) in self._bad:
                     continue      # 本会话已知坏模型，跳过
@@ -324,8 +378,10 @@ class LLMClient:
         if not p:
             return False, f"未知端点 {provider_name}", []
         key = self.keys.get(p["name"], "")
-        if not key:
+        if not key and not p.get("no_key"):
             return False, "没有配置 API Key", []
+        # no_key 端点 key 为空时回落到统一占位串（见 04-qa §6.1，避免空 Bearer -> 401）
+        key = _effective_key(p, key)
         url = p["base_url"].rstrip("/") + "/models"
         try:
             r = self.session.get(url, headers={"Authorization": "Bearer " + key},
@@ -347,7 +403,7 @@ class LLMClient:
         """逐个端点体检，返回 [(provider_label, ok, message)]。"""
         out = []
         for p in config.PROVIDERS:
-            if not self.keys.get(p["name"]):
+            if not self.keys.get(p["name"]) and not p.get("no_key"):
                 out.append((p["label"], None, "未配置 Key"))
                 continue
             ok, msg, _ = self.probe_provider(p["name"], timeout)
