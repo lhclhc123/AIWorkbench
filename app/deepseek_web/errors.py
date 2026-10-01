@@ -15,6 +15,7 @@ class WebErrorKind(Enum):
     NOT_INSTALLED = "not_installed"      # 没装 Chrome
     NOT_STARTED = "not_started"          # 网页没启动（调试端口不可用）
     NOT_LOGGED_IN = "not_logged_in"      # 网页打开了但没登录
+    WINDOW_HIDDEN = "window_hidden"      # 窗口被最小化/藏起来（会导致发送失效）
     READY = "ready"                      # 已连接，可以对话
     GENERATING = "generating"            # 网页正在生成
     TIMEOUT = "timeout"                  # 等待网页返回超时（不重发）
@@ -38,6 +39,10 @@ WEB_ERROR_TEXT = {
         "（手机号验证码 / 微信扫码都行），登录完成后回来点「连通性自检」。",
     WebErrorKind.READY:
         "已连接，可以对话。",
+    WebErrorKind.WINDOW_HIDDEN:
+        "DeepSeek 网页窗口当前**不可见**（被最小化、或被移到了屏幕外）。"
+        "这种状态下网页收不到按键和点击，提问会填进输入框却发不出去。"
+        "请把浏览器窗口恢复出来（点设置页的「显示网页窗口」），再重试。",
     WebErrorKind.GENERATING:
         "网页正在生成回复，请稍候…",
     WebErrorKind.TIMEOUT:
@@ -64,6 +69,7 @@ WEB_STATE_LABEL = {
     WebErrorKind.NOT_INSTALLED: "未检测到 Chrome",
     WebErrorKind.NOT_STARTED: "网页未启动",
     WebErrorKind.NOT_LOGGED_IN: "网页已打开，未登录",
+    WebErrorKind.WINDOW_HIDDEN: "网页窗口不可见（会发不出去）",
     WebErrorKind.READY: "已连接，可以对话",
     WebErrorKind.GENERATING: "网页正在生成…",
     WebErrorKind.TIMEOUT: "等待超时",

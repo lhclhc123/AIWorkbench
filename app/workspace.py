@@ -39,6 +39,12 @@ DEFAULT_SETTINGS = {
     "tts_engine": config.TTS_DEFAULT_ENGINE,
     "tts_voice": "",                               # edge 音色
     "tts_rate": 0,
+    # —— DeepSeek 网页版（v9.14.2：免手动）——
+    "deepseek_web_auto": True,      # 启动/切到该模型时，自动拉起浏览器（免手动开 .bat）
+    # True = 后台无头（桌面零窗口，但实测 visibilityState 仍是 visible，发送正常）；
+    # False = 显示窗口。⚠️ 绝不改回"挪到屏幕外"：那种窗口 visibilityState='hidden'，
+    # 浏览器会丢弃发送动作 -> 字填进输入框却发不出去。
+    "deepseek_web_silent": True,
     # —— 钉钉 ——
     "dingtalk": dict(_dt.DEFAULT_CONFIG) if _dt else {},
     # —— 更新 ——

@@ -162,6 +162,15 @@ WEB_ACK_TIMEOUT = 12.0                  # 提交后等待"网页确认收到"的
 WEB_ANSWER_TIMEOUT = 300.0              # 单轮网页生成上限（秒）
 WEB_DEDUPE_GRACE = 90.0                 # 幂等结果回放宽限窗（秒）
 WEB_HEARTBEAT = 2.0                     # SSE 心跳间隔（秒），远小于 llm_client 的 25s 读超时
+# v9.14.2：后台运行模式。
+#   True  = **无头后台**（Chrome `--headless=new`）：桌面完全不留浏览器窗口，
+#           但实测 `document.visibilityState` 仍是 'visible'，发送/收答复完全正常，
+#           且能复用专用 profile 的登录态。这是"免手动"的完整体验。
+#   False = 显示正常窗口（要看页面 / 首次扫码登录时更直观）。
+#   ★ 绝不要改回"用 --window-position 把窗口挪到屏幕外"那种土办法：
+#     实测那种窗口 visibilityState='hidden'，浏览器会**丢弃**点击与真实按键 ——
+#     表现就是"字填进了输入框却发不出去，然后白等超时"（用户报的那个 bug）。
+WEB_SILENT_WINDOW = True
 # 占位 key（双保险）：即使设置页把 Key 存成空串，no_key 白名单也让 llm_client 照常工作。
 # 取值形如 sk-… 只是为了通过 main.py 自检里"内置密钥格式"检查；它不是真密钥，
 # 本机服务对 Authorization 只要求"非空"，并不校验内容。

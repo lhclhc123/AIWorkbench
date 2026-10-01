@@ -33,11 +33,14 @@ class WebDriverError(Exception):
 # ---------------------------------------------------------------------------
 # 注入脚本版本：页面会常驻旧的 __AWB__，改过选择器后必须靠版本号强制重注入，
 # 否则新代码不生效（真机踩过：只判断 'typeof __AWB__ === object' 会拿到旧脚本）。
-AGENT_VERSION = 5
+AGENT_VERSION = 8
 
-JS_AGENT = r"""
+# ★ 版本号只写在这一处（AGENT_VERSION）。脚本里的 `__v` 由 agent_script() 注入，
+#   绝不在 JS 里再写一份字面量 —— 否则 `_ensure_agent()` 的版本校验会永远失败
+#   （页面常驻旧脚本，校验失效就会一直拿到改选择器之前的旧代码；v9.14.2 踩过一次）。
+JS_AGENT_TEMPLATE = r"""
 (function () {
-  const AWB = { __v: 5 };
+  const AWB = { __v: __AWB_AGENT_VERSION__ };
 
   const visible = (el) => {
     if (!el) { return false; }
@@ -57,9 +60,24 @@ JS_AGENT = r"""
       return !!svg.querySelector('rect') && !svg.querySelector('path');
     } catch (e) { return false; }
   };
+  // 禁用态判定（真机核对 2026-10-01）：
+  //   输入框为空时，发送键 class 里确实带 `ds-button--disabled`，同时 opacity=0.4，
+  //   而 aria-disabled 为 null、pointer-events 仍是 auto。
+  //   只认 class 太脆（改版换个说法就失效），所以四条一起看：
+  //     class / aria-disabled / DOM disabled / pointer-events / opacity。
   const hasDisabled = (el) => {
-    try { return (el.className || '').toString().indexOf('ds-button--disabled') >= 0; }
-    catch (e) { return false; }
+    try {
+      if (!el) { return true; }
+      const cls = (el.className || '').toString();
+      if (cls.indexOf('disabled') >= 0) { return true; }
+      if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') { return true; }
+      if (el.disabled === true) { return true; }
+      const st = window.getComputedStyle(el);
+      if (st && st.pointerEvents === 'none') { return true; }
+      const op = parseFloat(st ? st.opacity : '1');
+      if (!isNaN(op) && op < 0.6) { return true; }
+      return false;
+    } catch (e) { return false; }
   };
 
   // ↓↓↓ 输入框选择器候选（contenteditable 优先）
@@ -157,28 +175,48 @@ JS_AGENT = r"""
       '[class*="send_btn"]',
     ];
     for (const s of sels) {
-      const list = queryAll(s).filter(visible);
+      const list = queryAll(s).filter(visible).filter((el) => !hasDisabled(el));
       if (list.length) { return list[list.length - 1]; }
     }
-    if (circles.length) { return circles[circles.length - 1]; }   // 兜底：即使 disabled 也点一下
+    // ★ 绝不兜底返回"禁用态"按钮。
+    //   v9.14.1 及以前这里是 `return circles[circles.length - 1];  // 即使 disabled 也点一下`，
+    //   结果是：`.click()` 打在禁用按钮上 = 空点击，但 clickSend() 照样报成功
+    //   -> 日志写「已提交提示词」-> 网页其实没发 -> 12 秒后报超时。
+    //   （用户现象：字留在网页输入框里，一直没发出去。）返回 null 让调用方去等就绪 / 换真键盘。
     return null;
   };
 
-  AWB.clickSend = () => {
+  // 发送键当前是否可用（React 是异步渲染：setComposer 之后按钮的 disabled
+  // 不会立刻消失，必须等它变回可用再点，否则就是上面说的空点击）。
+  AWB.sendState = () => {
+    if (!AWB.findComposer()) { return 'no-composer'; }
     const btn = AWB.findSend();
-    if (btn) {
-      try { btn.click(); return 'button'; } catch (e) {}
+    if (btn) { return 'ready'; }
+    const circles = queryAll('div.ds-button--circle, div[class*="ds-button--circle"]')
+      .filter(visible);
+    return circles.length ? 'disabled' : 'missing';
+  };
+
+  AWB.clickSend = () => {
+    if (!AWB.findComposer()) { return 'no-composer'; }
+    const btn = AWB.findSend();
+    if (!btn) { return 'disabled'; }
+    if (hasDisabled(btn)) { return 'disabled'; }
+    try {
+      btn.click();
+      return 'button';
+    } catch (e) {
+      return 'click-error';
     }
-    // 兜底：在输入框上按 Enter（DeepSeek 网页约定 Enter=发送）
+  };
+
+  // 给输入框抢焦点（Python 侧用 CDP 发"真键盘 Enter"之前必须先聚焦）
+  AWB.focusComposer = () => {
     const el = AWB.findComposer();
-    if (!el) { return 'none'; }
+    if (!el) { return false; }
     try { el.focus(); } catch (e) {}
-    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
-                   bubbles: true, cancelable: true };
-    el.dispatchEvent(new KeyboardEvent('keydown', opts));
-    el.dispatchEvent(new KeyboardEvent('keypress', opts));
-    el.dispatchEvent(new KeyboardEvent('keyup', opts));
-    return 'enter';
+    try { el.click(); } catch (e) {}
+    try { return document.activeElement === el; } catch (e) { return false; }
   };
 
   // ↓↓↓ 停止按钮选择器候选（用于判断"正在生成"）
@@ -225,7 +263,31 @@ JS_AGENT = r"""
   //   ⚠️ 页面底部的「智能搜索」是 ds-toggle-button（**不是**答复）；
   //   旧的结构兜底会把它当答复返回（"极短提示"那轮实测拿到 '智能搜索'），
   //   故这里：① 优先精确类名；② 结构兜底显式排除控件与 UI 文案。 ↓↓↓
-  const UI_NOISE = /^(智能搜索|深度思考|联网搜索|开启新对话|新对话|收起|展开|复制|重新生成|停止生成|内容由 AI 生成|发送消息)$/;
+  // DeepSeek 页面底部的免责声明。真机实测：整页 innerText 里确实有这句
+  //   （tests/probe_answer_purity.py -> pageHasDisclaimer=True）。
+  //   一旦它被卷进"答复正文"，模型会把这句声明当成回答，所以统一剥掉。
+  const DISCLAIMER = '内容由 AI 生成，请仔细甄别';
+  const stripDisclaimer = (t) => {
+    let s = String(t || '');
+    if (s.trim() === DISCLAIMER) { return ''; }        // 整段就是声明 -> 当成空
+    const i = s.lastIndexOf(DISCLAIMER);
+    if (i >= 0 && (s.length - (i + DISCLAIMER.length)) <= 12) {
+      s = s.slice(0, i);                               // 结尾挂着声明 -> 去掉
+    }
+    return s.trim();
+  };
+  // 单行 UI 文案（侧栏/开关/按钮）。注意必须**逐行**判断：
+  //   真机实测，兜底路径取到的是 `'深度思考\n智能搜索'`（多行拼接），
+  //   老的 `^(…)$` 整段匹配对多行不生效，于是把开关文案当成了答复正文。
+  const UI_NOISE_LINE = /^(智能搜索|深度思考|联网搜索|开启新对话|新对话|收起|展开|复制|重新生成|停止生成|发送消息|按 ?Enter 发送|Shift ?\+ ?Enter)$/;
+  // 整段**每一行**都是 UI 文案（或免责声明）才算噪声。
+  const isUiNoise = (t) => {
+    const lines = String(t || '').split('\n').map((x) => x.trim()).filter((x) => x);
+    if (!lines.length) { return true; }
+    return lines.every((ln) => UI_NOISE_LINE.test(ln) || ln === DISCLAIMER);
+  };
+  const UI_NOISE = { test: isUiNoise };     // 兼容旧引用
+
   AWB.answerText = () => {
     const sels = [
       '.ds-assistant-message-main-content',
@@ -233,12 +295,16 @@ JS_AGENT = r"""
       '[class*="ds-assistant-message-main-content"]',
       '[class*="message-content"]',
     ];
+    const good = (el) => {
+      const t = stripDisclaimer(el.innerText || '');
+      return t.length > 0 && !isUiNoise(t);
+    };
     for (const s of sels) {
       const list = queryAll(s).filter(visible)
         .filter((el) => String(el.className || '').indexOf('-paragraph') < 0)
-        .filter((el) => (el.innerText || '').trim().length > 0);
+        .filter(good);
       if (list.length) {
-        return (list[list.length - 1].innerText || '').trim();
+        return stripDisclaimer(list[list.length - 1].innerText || '');
       }
     }
     // 结构兜底：找主对话滚动容器（排除左侧会话栏），取它最后一块"像答复"的文本块；
@@ -251,12 +317,14 @@ JS_AGENT = r"""
       const main = scrollers[0];
       if (main) {
         const blocks = [...main.querySelectorAll('div,p,article,li')]
-          .filter((el) => (el.innerText || '').trim().length > 0)
           .filter((el) => !el.closest('button, a, [role="button"], [class*="toggle"]'))
-          .filter((el) => !UI_NOISE.test((el.innerText || '').trim()));
+          .filter((el) => {
+            const t = stripDisclaimer(el.innerText || '');
+            return t.length > 0 && !isUiNoise(t);
+          });
         if (blocks.length) {
           const last = blocks[blocks.length - 1];
-          return (last.innerText || '').trim();
+          return stripDisclaimer(last.innerText || '');
         }
       }
     } catch (e) {}
@@ -266,14 +334,27 @@ JS_AGENT = r"""
   // 助手答复"块数量"：用于判断"是否真的新增了一条答复"。
   // 比文本比较更可靠 —— 可覆盖"同一问题两次得到同样文字"（文本相等但确实新增了答复）。
   AWB.answerCount = () => {
-    let list = queryAll('.ds-assistant-message-main-content').filter(visible)
-      .filter((el) => String(el.className || '').indexOf('-paragraph') < 0);
+    const good = (el) => {
+      if (String(el.className || '').indexOf('-paragraph') >= 0) { return false; }
+      const t = stripDisclaimer(el.innerText || '');
+      return t.length > 0 && !isUiNoise(t);
+    };
+    let list = queryAll('.ds-assistant-message-main-content').filter(visible).filter(good);
     if (!list.length) {
-      list = queryAll('div.ds-markdown').filter(visible)
-        .filter((el) => String(el.className || '').indexOf('-paragraph') < 0);
+      list = queryAll('div.ds-markdown').filter(visible).filter(good);
     }
     return list.length;
   };
+
+  // 输入框**是否存在**（注意：不能拿"composerText() 为空串"当判据 ——
+  //  输入框不存在时它同样返回空串，会被误当成"发送后输入框被清空"= 已发送）。
+  AWB.hasComposer = () => !!AWB.findComposer();
+  // 当前地址（新建对话会让它变成新的 /a/chat/s/<id>，可作为"确实发出去了"的旁证之一）
+  AWB.pageHref = () => String(location.href || '');
+  // 页面可见性。真机实测(2026-10-01)：窗口被最小化/藏到屏幕外时这里是 'hidden'，
+  // 此时输入框照样能写进字，但**点发送键和真键盘 Enter 都不生效**
+  // —— 正是用户报的"字在输入框里、没发送、最后报超时"。
+  AWB.visibility = () => String(document.visibilityState || 'unknown');
 
   // ---- 网页自身错误态识别（用于"快速失败"，见 04-qa §6.2）----
   // 真机实测(2026-10-01， QA 04-qa §4.1)：「服务器暂时不可用」「已停止」曾出现在 DeepSeek 自身横幅里。
@@ -390,6 +471,15 @@ JS_AGENT = r"""
 })()
 """
 
+
+def agent_script():
+    """把 AGENT_VERSION 注入页面脚本（单一来源；改版本号只改上面那一行）。"""
+    return JS_AGENT_TEMPLATE.replace("__AWB_AGENT_VERSION__", str(int(AGENT_VERSION)))
+
+
+# 兼容别名：老代码/测试里直接引用 JS_AGENT 的地方继续可用。
+JS_AGENT = agent_script()
+
 JS_STATE = "JSON.stringify(window.__AWB__ ? window.__AWB__.pageState() : {missing:true})"
 
 # 结束判定：答复文本看起来是一段"完整的 JSON 对象"（对齐 2.3-3 的规则 b）
@@ -420,6 +510,14 @@ class WebDriver:
     # 零增量兜底：连续这么久"页面没有任何活动"（答复文本 / 答复块数 / 页面正文长度都不变）
     # 就提前失败，不再空等到 answer_timeout（见 04-qa §6.2）。
     NO_OUTPUT_SECONDS = 60.0
+
+    # 点了发送之后，留给"发送键由禁用变可用"的时间上限（秒）。
+    # React 状态更新是异步的，实测 setComposer 之后按钮会先保持禁用一小会儿。
+    SEND_READY_SECONDS = 3.0
+
+    # 触发发送后，验证"网页真的接受了"的时间上限（秒）。
+    # 超时未确认 -> 判定这次触发没生效 -> 才允许用真键盘 Enter 补一次（最多补一次）。
+    SEND_CONFIRM_SECONDS = 5.0
 
     # 页面级防重发标记的"过期时间"（毫秒）。超过则视为陈旧标记，允许重新发送，
     # 避免页面被刷新/异常中断后永远卡在"重复请求"。
@@ -459,7 +557,7 @@ class WebDriver:
             except Exception:
                 self._agent_ready = False
         try:
-            self.cdp.evaluate(JS_AGENT, await_promise=False)
+            self.cdp.evaluate(agent_script(), await_promise=False)
         except CDPError as exc:
             self._logf("warn", f"注入脚本失败：{exc}")
             return False
@@ -520,6 +618,13 @@ class WebDriver:
         if st.get("composer"):
             if st.get("generating"):
                 return errors.WebErrorKind.GENERATING, "网页正在生成回复"
+            # 窗口不可见时"看起来就绪"，实际发不出去 —— 单独报出来（v9.14.2）
+            try:
+                if str(self._js("window.__AWB__.visibility()")) != "visible":
+                    return (errors.WebErrorKind.WINDOW_HIDDEN,
+                            errors.WEB_ERROR_TEXT[errors.WebErrorKind.WINDOW_HIDDEN])
+            except WebDriverError:
+                pass
             return errors.WebErrorKind.READY, "已连接，可以对话"
         return (errors.WebErrorKind.PAGE_CHANGED,
                 "找不到网页输入框（网页结构可能已变）。")
@@ -575,6 +680,149 @@ class WebDriver:
         except Exception:
             pass
 
+    # ---------- 发送链路的"真确认"工具（v9.14.2）----------
+    def ensure_interactive(self, wait=3.0):
+        """确保网页**可见/可交互**（不可见时发送 100% 失效）。
+
+        真机实测(2026-10-01)：窗口被最小化或藏到屏幕外时
+        `document.visibilityState === 'hidden'`，此时：
+          - 输入框照样能写进字（composerText 正常）；
+          - 输入框照样"有焦点"（activeElement = TEXTAREA）；
+          - 但 **点发送键、发真键盘 Enter 都不生效** —— 字一直留在框里。
+        => 这正是用户报的「字放到输入框里、并没有发送、然后报超时」。
+
+        这里先尝试自救（Page.bringToFront + 恢复窗口到屏幕内），
+        仍不可见就返回 False，由调用方**提前报错**（而不是白等 60 秒）。
+
+        Returns: True 表示当前可见（可交互）。
+        """
+        if self.cdp is None:
+            return False
+        # ① 让标签页到前台
+        try:
+            self.cdp.call("Page.bringToFront", {}, timeout=6)
+        except Exception:
+            pass
+        # ② 把窗口从"最小化/离屏"恢复成普通窗口并摆到屏幕内
+        try:
+            res = self.cdp.call("Browser.getWindowForTarget", {}, timeout=6)
+            wid = (res.get("result") or {}).get("windowId")
+            if wid:
+                self.cdp.call("Browser.setWindowBounds", {
+                    "windowId": wid, "bounds": {"windowState": "normal"}}, timeout=6)
+                self.cdp.call("Browser.setWindowBounds", {
+                    "windowId": wid,
+                    "bounds": {"left": 60, "top": 50, "width": 1180, "height": 840}},
+                    timeout=6)
+        except Exception:
+            pass
+        # ③ 轮询可见性
+        deadline = time.time() + float(wait)
+        while time.time() < deadline:
+            try:
+                if str(self._js("window.__AWB__.visibility()")) == "visible":
+                    return True
+            except WebDriverError:
+                pass
+            time.sleep(0.25)
+        try:
+            self._logf("warn", "网页窗口不可见（visibilityState="
+                               f"{self._js('window.__AWB__.visibility()')}），"
+                               "发送会被浏览器丢弃")
+        except Exception:
+            pass
+        return False
+
+    def _confirm_sent(self, seconds, *, baseline_count=0, baseline_text="", baseline_href=""):
+        """网页是否**真的**接受了这次提问（秒级轮询）。
+
+        任一成立即确认：
+          ① 出现"停止生成"按钮（正在生成）；
+          ② 答复块数量 > 提交前基线；
+          ③ 答复文本 ≠ 提交前基线；
+          ④ 输入框**存在且**被清空（提交后网页会清空输入框）；
+          ⑤ 地址变成了另一个 /a/chat/s/<id>（新建对话 = 这一问确实发出去了）。
+
+        ★ ④ 必须同时要求"输入框存在"：
+          输入框**不存在**时 composerText() 也返回空串，若只看空串就会把
+          "页面正在导航/结构变化"误判成"已发送"——那就又变成假成功了。
+
+        全不成立 = 这次触发**没生效**。此时才允许补发，绝不会造成重复提问。
+        """
+        base_cnt = int(baseline_count or 0)
+        base_txt = str(baseline_text or "")
+        base_href = str(baseline_href or "")
+        t0 = time.time()
+        while time.time() - t0 < float(seconds):
+            try:
+                st = self._read_state()
+                if st.get("generating"):
+                    return True
+                try:
+                    cnt = int(self._js("window.__AWB__.answerCount()") or 0)
+                except WebDriverError:
+                    cnt = base_cnt
+                if cnt > base_cnt:
+                    return True
+                try:
+                    txt = str(self._js("window.__AWB__.answerText()") or "")
+                except WebDriverError:
+                    txt = base_txt
+                if txt != base_txt:
+                    return True
+                try:
+                    has_composer = bool(self._js("window.__AWB__.hasComposer()"))
+                except WebDriverError:
+                    has_composer = False
+                if has_composer:
+                    left = self._js("window.__AWB__.composerText()") or ""
+                    if not str(left).strip():
+                        return True
+                if base_href:
+                    try:
+                        href = str(self._js("window.__AWB__.pageHref()") or "")
+                    except WebDriverError:
+                        href = base_href
+                    if href and href != base_href and "/a/chat/s/" in href:
+                        return True
+            except WebDriverError:
+                pass
+            time.sleep(0.3)
+        return False
+
+    def _press_enter_real(self):
+        """用 CDP 的 Input 域发**真实** Enter 键（isTrusted=True）。
+
+        为什么不能只在 JS 里 `dispatchEvent(new KeyboardEvent('keydown'))`：
+        合成事件的 `isTrusted === false`，DeepSeek 的 React onKeyDown 完全可以忽略它
+        （旧版就吃了这个亏，日志里那唯一一次 `发送方式=enter` 很可能就是空炮）。
+        CDP 的 Input.dispatchKeyEvent 走浏览器真实输入管线，等价于人手按键。
+
+        安全性：本方法只在"确认上一次触发完全没生效"之后才被调用（见 `submit`）。
+        """
+        if self.cdp is None:
+            return False
+        try:
+            focused = self._js("window.__AWB__.focusComposer()")
+            self._logf("info", f"真键盘 Enter 前置：输入框已聚焦={bool(focused)}")
+        except WebDriverError:
+            pass
+        common = {"windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+                  "key": "Enter", "code": "Enter"}
+        try:
+            # keyDown 带 text="\r"：DeepSeek 收到后即按"Enter=发送"处理
+            self.cdp.call("Input.dispatchKeyEvent",
+                          dict(common, type="keyDown", text="\r",
+                               unmodifiedText="\r", autoRepeat=False,
+                               isKeypad=False, isSystemKey=False), timeout=8)
+            self.cdp.call("Input.dispatchKeyEvent",
+                          dict(common, type="keyUp", autoRepeat=False,
+                               isKeypad=False, isSystemKey=False), timeout=8)
+            return True
+        except CDPError as exc:
+            self._logf("warn", f"真键盘 Enter 发送失败：{exc}")
+            return False
+
     # ---------- 主流程：提交一轮 ----------
     def submit(self, prompt_text, *, on_progress=None,
                ack_timeout=12.0, answer_timeout=300.0, dedupe_key=None):
@@ -597,6 +845,11 @@ class WebDriver:
             raise WebDriverError(errors.WebErrorKind.NOT_STARTED)
         if not self._ensure_agent():
             raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED, "无法注入网页脚本")
+
+        # ⓪ 可见性闸门：窗口被最小化/藏到屏幕外时，发出去的字会被浏览器直接丢掉。
+        #    提前判死并给出可操作的中文提示，而不是填完字白等 60 秒。
+        if not self.ensure_interactive():
+            raise WebDriverError(errors.WebErrorKind.WINDOW_HIDDEN)
 
         # ① 防重发：同一指纹若已在页面标记里（且标记未过期）-> 直接报错，绝不重发（2.3-4）
         if dedupe_key:
@@ -624,6 +877,10 @@ class WebDriver:
             baseline_count = int(self._js("window.__AWB__.answerCount()") or 0)
         except Exception:
             baseline_count = 0
+        try:
+            baseline_href = str(self._js("window.__AWB__.pageHref()") or "")
+        except Exception:
+            baseline_href = ""
 
         # ② 填输入框（contenteditable / textarea 双兼容）
         ok = self._js("window.__AWB__.setComposer(%s)" % json.dumps(str(prompt_text)))
@@ -635,14 +892,53 @@ class WebDriver:
             raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED,
                                   "提示词未能写入网页输入框（网页结构可能已变）")
 
-        # ③ 点发送
-        mode = self._js("window.__AWB__.clickSend()")
-        if mode == "none":
-            raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED, "找不到网页发送按钮")
-        self._logf("info", f"已提交提示词（发送方式={mode}，{len(str(prompt_text))} 字）")
+        # ③ 等发送键"真正可用"再点。
+        #    React 是异步渲染：刚 setComposer 完，发送键的 disabled 还没消失
+        #    （实测：空输入框时按钮 opacity=0.4 + class 带 ds-button--disabled）。
+        #    这时候点它 = 空点击。旧版（v9.14.1）没等这一步，于是出现
+        #    「字在输入框里、网页没发出去、12 秒后报超时」。
+        base_cnt = int(baseline_count or 0)
+        send_state = "missing"
+        deadline = time.time() + float(self.SEND_READY_SECONDS)
+        while time.time() < deadline:
+            try:
+                send_state = str(self._js("window.__AWB__.sendState()") or "missing")
+            except WebDriverError:
+                send_state = "missing"
+            if send_state == "ready":
+                break
+            time.sleep(0.2)
+        if send_state == "no-composer":
+            raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED, "找不到网页输入框")
 
-        # ④ ack：ack_timeout 内须出现"输入框被清空 或 停止按钮"；否则 TIMEOUT（不重发）
-        # TODO(真机核对)：需真机确认提交后确实会出现"输入框被清空 或 停止按钮"。
+        # ③.1 只在按钮确实可用时才点（clickSend 已改成"禁用就不点"）
+        mode = str(self._js("window.__AWB__.clickSend()") or "none")
+        self._logf("info", f"点击发送键：mode={mode}，发送键状态={send_state}，"
+                           f"{len(str(prompt_text))} 字")
+
+        # ③.2 发送确认：真发出去了一定会出现
+        #      「输入框被清空 / 出现停止键 / 多出答复块 / 答复文本变了」之一。
+        #      全都没出现 -> 上一次触发**确定没生效**（不存在"其实发出去了"的可能），
+        #      这时才用 CDP 真键盘事件补一次 Enter —— 所以不会造成重复提问。
+        confirmed = self._confirm_sent(self.SEND_CONFIRM_SECONDS,
+                                       baseline_count=base_cnt, baseline_text=baseline_text,
+                                       baseline_href=baseline_href)
+        if not confirmed:
+            self._logf("warn", "点击发送未生效（网页没反应），改用真键盘 Enter 补发一次")
+            if self._press_enter_real():
+                confirmed = self._confirm_sent(self.SEND_CONFIRM_SECONDS,
+                                               baseline_count=base_cnt,
+                                               baseline_text=baseline_text,
+                                               baseline_href=baseline_href)
+        if not confirmed:
+            # ★ 绝不假成功：如实上报"字还在输入框里"，并给用户可执行的出路。
+            raise WebDriverError(
+                errors.WebErrorKind.TIMEOUT,
+                "没有发出去：文字已经填进 DeepSeek 网页的输入框，但网页没把它发送。"
+                "可切到网页窗口手动按回车或点发送键，或点「重试」。（不会重复发送）")
+        self._logf("info", "网页已确认收到本次提问")
+
+        # ④ ack 兜底：确认过之后这里通常立刻通过，只作为最后一道保险。
         t0 = time.time()
         acked = False
         while time.time() - t0 < float(ack_timeout):

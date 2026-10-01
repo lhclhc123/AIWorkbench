@@ -203,21 +203,63 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(600, self._setup_hotkey)
 
         # 仅在"已选中网页版"或用户开了"启动时自动接入"时才按需启动本机服务；
-        # 且只尝试接入**已在线**的网页（绝不主动拉起浏览器）。
+        # 开了「自动拉起」且当前是网页版模型时，_dsw_boot 会自己把浏览器拉起来（v9.14.2）。
         _sel = self.settings.get("selected_model", "auto")
         if (isinstance(_sel, str) and "deepseek" in _sel and "web" in _sel) or \
                 self.settings.get("deepseek_web_auto"):
             QTimer.singleShot(0, self._dsw_boot)
 
-    # ================= DeepSeek 网页版（v9.14.0） =================
-    def _dsw_boot(self):
-        """按需启动本机服务并尝试接入已在线网页（不拉起浏览器）。"""
-        self._dsw_ensure()
+    # ================= DeepSeek 网页版（v9.14.0 / v9.14.2 免手动） =================
+    def _dsw_sync_prefs(self):
+        """把设置里的偏好同步给服务层（后台无头 / 是否自动拉起）。"""
         try:
-            self.dsw.connect_if_online()
+            self.dsw.silent = bool(self.settings.get("deepseek_web_silent", True))
         except Exception:
             pass
+
+    def _dsw_auto_on(self):
+        return bool(self.settings.get("deepseek_web_auto", True))
+
+    def _dsw_is_web_model(self):
+        """当前选中的模型是不是 DeepSeek 网页版。"""
+        try:
+            sel = str(self.settings.get("selected_model") or "")
+        except Exception:
+            sel = ""
+        return sel in (config.WEB_MODEL_ID, f"{config.WEB_MODEL_ID}@{config.WEB_PROVIDER_NAME}") \
+            or sel.startswith(config.WEB_PROVIDER_NAME)
+
+    def _dsw_boot(self):
+        """启动时准备通道。
+
+        v9.14.2：开了「自动拉起」且当前就是 DeepSeek 网页版模型时，**程序自己把浏览器拉起来**
+        （用户不必再双击 .bat / 自己开 Chrome）；否则只接入已在线网页，不打扰。
+        """
+        self._dsw_ensure()
+        self._dsw_sync_prefs()
+        if self._dsw_auto_on() and self._dsw_is_web_model():
+            self._dsw_auto_ensure("启动")
+        else:
+            try:
+                self.dsw.connect_if_online()
+            except Exception:
+                pass
         self._poll_deepseek_web()
+
+    def _dsw_auto_ensure(self, reason="需要时"):
+        """后台自动确保网页可用（不在线就拉起浏览器）。绝不阻塞界面。"""
+        self._dsw_ensure()
+        self._dsw_sync_prefs()
+        self.page_settings.set_web_status("not_started", f"正在准备网页（{reason}）…")
+
+        def work():
+            try:
+                res = self.dsw.ensure_page(auto_launch=True)
+            except Exception as exc:
+                res = {"ok": False, "detail": f"{exc}"}
+            self._dsw_launch_ready.emit(res)
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-auto").start()
 
     def _dsw_ensure(self):
         """确保本机 HTTP 服务在跑 + 状态轮询定时器在跑（幂等、无浏览器副作用）。"""
@@ -235,19 +277,66 @@ class MainWindow(QMainWindow):
             st = self.dsw.status()
         except Exception:
             return
+        state = st.get("state") or "not_started"
         try:
-            self.page_settings.set_web_status(st.get("state") or "not_started",
-                                              st.get("detail") or "")
+            self.page_settings.set_web_status(state, st.get("detail") or "")
         except Exception:
             pass
+        # v9.14.2：检测到"已打开但没登录"时，自动把窗口挪回屏幕内（否则用户没法扫码），
+        # 每进入一次该状态只挪一次，避免反复抢焦点。
+        if state == "not_logged_in":
+            if not getattr(self, "_dsw_login_shown", False):
+                self._dsw_login_shown = True
+                if str(st.get("kind") or "") == "not_logged_in":
+                    threading.Thread(target=self.dsw.show_window, daemon=True,
+                                     name="awb-dsw-showwin").start()
+                    self.statusBar().showMessage(
+                        "DeepSeek 网页还没登录：已在屏幕上打开网页窗口，"
+                        "登录一次后长期免登。", 20000)
+        else:
+            self._dsw_login_shown = False
         try:
             for note in self.dsw.take_notices():
                 self.statusBar().showMessage(str(note)[:160], 12000)
         except Exception:
             pass
 
+    def _dsw_do_show(self):
+        """「显示网页窗口」：亮出网页窗口（无头后台模式下会重启成显示窗口模式）。
+
+        切换模式要重启浏览器（登录态在专用 profile 里，不会掉），所以放后台线程做。
+        """
+        self._dsw_ensure()
+
+        def work():
+            ok = False
+            try:
+                ok = self.dsw.show_window()
+            except Exception:
+                ok = False
+            self._dsw_launch_ready.emit(
+                {"ok": True, "detail": "已显示网页窗口" if ok else
+                 "暂时没有可显示的网页窗口（先点「启动/打开网页」）"})
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-show").start()
+
+    def _dsw_do_hide(self):
+        """「收起窗口」：收回后台（切到无头模式，桌面零窗口，发送照常）。"""
+        self._dsw_ensure()
+
+        def work():
+            ok = False
+            try:
+                ok = self.dsw.hide_window()
+            except Exception:
+                ok = False
+            self._dsw_launch_ready.emit(
+                {"ok": True, "detail": "已收起网页窗口" if ok else "暂时没有可收起的网页窗口"})
+
+        threading.Thread(target=work, daemon=True, name="awb-dsw-hide").start()
+
     def _dsw_do_launch(self):
-        """「启动/打开网页」：拉起（或复用）Chrome。这是**唯一**会主动开浏览器的入口。"""
+        """「启动/打开网页」：拉起（或复用）Chrome 并接入网页。"""
         self._dsw_ensure()
         self.page_settings.set_web_status("not_started", "正在启动网页…")
 
@@ -560,6 +649,8 @@ class MainWindow(QMainWindow):
         self.page_settings.web_launch.connect(self._dsw_do_launch)
         self.page_settings.web_selftest.connect(self._dsw_do_selftest)
         self.page_settings.web_retry.connect(self._dsw_do_retry)
+        self.page_settings.web_show.connect(self._dsw_do_show)
+        self.page_settings.web_hide.connect(self._dsw_do_hide)
 
         self.page_about = AboutPage()
         self.stack.addWidget(self.page_about)
@@ -2489,8 +2580,11 @@ class MainWindow(QMainWindow):
         self.speaker.rate = int(self.settings.get("tts_rate", 0) or 0)
         self.mcp.reload()
         self.bg_client.set_keys(self.settings.get("api_keys", {}))
-        # DeepSeek 网页版：开了"启动时自动接入"就立刻尝试接入已在线网页（绝不拉起浏览器）
-        if self.settings.get("deepseek_web_auto"):
+        # DeepSeek 网页版（v9.14.2）：开了"自动拉起"就直接把网页准备好（不在线就自己开浏览器）
+        self._dsw_sync_prefs()
+        if self._dsw_auto_on() and self._dsw_is_web_model():
+            self._dsw_auto_ensure("设置已更新")
+        elif self.settings.get("deepseek_web_auto"):
             self._dsw_ensure()
             try:
                 self.dsw.connect_if_online()
@@ -2766,6 +2860,9 @@ class MainWindow(QMainWindow):
         self.settings["selected_model"] = data
         self.workspace.save_settings(self.settings)
         self._refresh_chips()
+        # v9.14.2：切到 DeepSeek 网页版模型时，自动把网页准备好（免手动开浏览器）
+        if self._dsw_auto_on() and self._dsw_is_web_model():
+            self._dsw_auto_ensure("切换到 DeepSeek 网页版")
 
     def _send(self):
         if self.running:

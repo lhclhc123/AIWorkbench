@@ -90,10 +90,18 @@ class LocalServer:
 
     # ---------- 生命周期 ----------
     def start(self, preferred_port=None):
-        """启动服务；返回实际监听的端口（固定端口被占用则回退随机端口）。"""
+        """启动服务；返回实际监听的端口（固定端口被占用则回退随机端口）。
+
+        ⚠️ 注意 `preferred_port=0` 的语义是"**随机端口**"，不是"用默认端口"。
+        旧写法 `int(preferred_port or config.WEB_DEFAULT_PORT)` 里 `0 or X == X`，
+        会把 0 吞掉 -> 传 0 变成抢 18921。测试探针因此和真机实例撞端口，
+        又因为 Windows 的 SO_REUSEADDR 允许重复绑定，请求会被真机实例截走，
+        表现为"离线测试莫名拿到真实网页的内容"。
+        """
         if self._httpd is not None:
             return self._port
-        preferred = int(preferred_port or config.WEB_DEFAULT_PORT)
+        preferred = (config.WEB_DEFAULT_PORT if preferred_port is None
+                     else int(preferred_port))
         bound = None
         for port in (preferred, 0):
             try:

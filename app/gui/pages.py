@@ -1353,6 +1353,9 @@ class SettingsPage(QWidget):
     web_launch = pyqtSignal()
     web_selftest = pyqtSignal()
     web_retry = pyqtSignal()
+    # v9.14.2：窗口显隐
+    web_show = pyqtSignal()
+    web_hide = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1481,14 +1484,27 @@ class SettingsPage(QWidget):
         self.web_btn_retry = QPushButton("重试")
         self.web_btn_retry.setFixedHeight(30)
         self.web_btn_retry.clicked.connect(self.web_retry.emit)
+        # v9.14.2：窗口显隐（自动拉起后默认离屏，要看的时候挪回来）
+        self.web_btn_show = QPushButton("显示网页窗口")
+        self.web_btn_show.setFixedHeight(30)
+        self.web_btn_show.clicked.connect(self.web_show.emit)
+        self.web_btn_hide = QPushButton("收起窗口")
+        self.web_btn_hide.setFixedHeight(30)
+        self.web_btn_hide.clicked.connect(self.web_hide.emit)
         brow.addWidget(self.web_btn_launch)
         brow.addWidget(self.web_btn_selftest)
         brow.addWidget(self.web_btn_retry)
+        brow.addWidget(self.web_btn_show)
+        brow.addWidget(self.web_btn_hide)
         brow.addStretch(1)
         bv.addLayout(brow)
 
-        web_hint = QLabel("首次使用请在弹出的网页里登录一次 DeepSeek（手机号验证码 / 微信扫码"
-                          "都行），登录后回来点「连通性自检」。登录态会记住，之后免登。")
+        web_hint = QLabel("不用手动开浏览器：程序会自己把 Chrome 拉起来（默认后台无头，"
+                          "桌面上不会多出窗口）。"
+                          "只有**这一次**需要你在网页里登录一下 DeepSeek（手机验证码 / 微信扫码），"
+                          "登录态会保存在专用配置里，以后一直免登。\n"
+                          "要亲眼看页面时点「显示网页窗口」，看完点「收起窗口」收回后台"
+                          "（切换模式会重启浏览器，但不会掉登录）。")
         web_hint.setWordWrap(True)
         web_hint.setObjectName("PageSub")
         bv.addWidget(web_hint)
@@ -1498,9 +1514,12 @@ class SettingsPage(QWidget):
         self.web_selftest_view.setFixedHeight(120)
         bv.addWidget(self.web_selftest_view)
 
-        self.web_auto_cb = QCheckBox("程序启动时，若网页已在线则自动接入"
-                                     "（不会主动打开浏览器）")
+        self.web_auto_cb = QCheckBox("程序启动 / 切到本模型时，自动拉起浏览器并接入"
+                                     "（免手动；关闭后需自己点「启动/打开网页」）")
         bv.addWidget(self.web_auto_cb)
+        self.web_silent_cb = QCheckBox("后台无头运行 —— 桌面不留浏览器窗口"
+                                       "（推荐；发送与收答复完全正常）")
+        bv.addWidget(self.web_silent_cb)
 
         web_risk = QLabel("ⓘ 本功能通过自动化驱动本机 Chrome 页面工作，非官方 API。"
                           "DeepSeek 网页若改版可能暂时失效；账号存在被判定为异常使用的潜在风险。")
@@ -1533,6 +1552,8 @@ class SettingsPage(QWidget):
             color = "#f9a825"       # 黄
         elif name in ("not_started", "not_installed"):
             color = "#9e9e9e"       # 灰
+        elif name in ("window_hidden",):
+            color = "#ef6c00"       # 橙：看着就绪，实际发不出去
         elif name in ("timeout", "page_changed", "duplicate", "other"):
             color = "#c62828"       # 红
         text = f"状态：{label}"
@@ -1738,7 +1759,8 @@ class SettingsPage(QWidget):
         self.tray_on_close.setChecked(bool(s.get("tray_on_close", True)))
         self.hotkey_show.setText(s.get("hotkey_show", "ctrl+alt+space") or "")
         self.hotkey_voice.setText(s.get("hotkey_voice", "ctrl+alt+v") or "")
-        self.web_auto_cb.setChecked(bool(s.get("deepseek_web_auto", False)))
+        self.web_auto_cb.setChecked(bool(s.get("deepseek_web_auto", True)))
+        self.web_silent_cb.setChecked(bool(s.get("deepseek_web_silent", True)))
 
     def _save(self):
         s = dict(self._settings)
@@ -1762,6 +1784,7 @@ class SettingsPage(QWidget):
         s["hotkey_show"] = self.hotkey_show.text().strip()
         s["hotkey_voice"] = self.hotkey_voice.text().strip()
         s["deepseek_web_auto"] = self.web_auto_cb.isChecked()
+        s["deepseek_web_silent"] = self.web_silent_cb.isChecked()
         keys = dict(s.get("api_keys") or {})
         for name, e in self.key_edits.items():
             keys[name] = e.text().strip()

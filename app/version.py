@@ -3,8 +3,8 @@
 
 APP_NAME = "AI 工作台"
 APP_ID = "AIWorkbench"
-VERSION = "9.14.1"
-VERSION_TUPLE = (9, 14, 1)
+VERSION = "9.14.2"
+VERSION_TUPLE = (9, 14, 2)
 BUILD_DATE = "2026-10-01"
 
 # 自动更新检查依赖的 GitHub 仓库（可在设置里改）
