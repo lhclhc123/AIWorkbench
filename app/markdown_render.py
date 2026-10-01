@@ -7,7 +7,26 @@ from pygments.lexers import get_lexer_by_name, TextLexer
 from pygments.formatters import HtmlFormatter
 
 _CODE_RE = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+# 把工具调用块从正文里剔掉再渲染。
+# ⚠️ 两个都要有：模型经常**漏写** </tool_call>（尤其用智谱 XML 参数风
+# `<tool_call>run_python<arg_key>code</arg_key><arg_value>…</arg_value>` 时），
+# 只认闭合标签的话，调用原文会直接显示在气泡里，很难看。
 _TOOL_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+# 漏写 </tool_call> 时的兜底：只吃「调用本体」（名字 + 若干 <arg_key>/<arg_value> 对），
+# ⚠️ 不能用 `<tool_call>.*$` —— 模型把调用夹在中间时（"我先查 <tool_call>… 然后汇总"），
+#    那样会把后半段结论一起吃掉，气泡直接变空。
+_TOOL_XMLARG_RE = re.compile(
+    r"<tool_call>\s*[\w\u4e00-\u9fff][\w\-]*\s*"
+    r"(?:(?:<arg_key>.*?</arg_key>\s*)?<arg_value>.*?</arg_value>\s*)+"
+    r"(?:</tool_call>)?",
+    re.DOTALL)
+
+
+def _strip_tool_call(text: str) -> str:
+    """把工具调用块从正文里剔掉（工具活动由专用 UI 展示）。"""
+    if not text:
+        return text
+    return _TOOL_XMLARG_RE.sub("", _TOOL_RE.sub("", text))
 
 # 预解析 Pygments 默认风格的 类->样式 映射（内联用）
 _FMT = HtmlFormatter(nowrap=True, style="default")
@@ -47,7 +66,7 @@ def render_with_blocks(text: str):
     """
     if not text:
         return "", []
-    text = _TOOL_RE.sub("", text)
+    text = _strip_tool_call(text)
     blocks = []
 
     def grab(m):
@@ -70,7 +89,7 @@ def render_markdown(text: str) -> str:
     if not text:
         return ""
     # 去掉 Agent 工具调用标签（工具活动由专用 UI 展示）
-    text = _TOOL_RE.sub("", text)
+    text = _strip_tool_call(text)
     blocks = []
 
     def grab(m):

@@ -438,15 +438,103 @@ def _dsml_calls(text):
     return out
 
 
+# ---------------------------------------------------------------------------
+# 智谱 GLM 的**原生函数调用序列化**：不是 JSON，是 XML 片段。
+#
+#   <tool_call>run_python<arg_key>code</arg_key><arg_value>print(1)</arg_value></tool_call>
+#   <tool_call>web_form_batch<arg_key>url</arg_key><arg_value>https://…</arg_value>
+#     <arg_key>field</arg_key><arg_value>s_xingming</arg_value></tool_call>
+#
+# 实测（2026-10-01，v9.15.0 的模型 e2e 探针，真实案例）：
+#   glm-4.7-flash 在「读名单 → 嗅探表单 → 该批量查询」这条链上，第 3 轮就吐了这种格式。
+#   老解析器只认 `<tool_call>{…}</tool_call>`，于是整段被当成「模型给的最终答复」→
+#   agent 循环**当场结束**，用户看到的就是「说要干、实际一步没干」（他报的"跑不动"）。
+# 参数值既可能是 JSON（如 {"a":1} / 数字 / true），也可能是一整段代码或命令行原文——
+# 所以先试 JSON，解不开就按原文收下（只去掉首尾换行，保留缩进）。
+# ---------------------------------------------------------------------------
+_XMLARG_CALL_RE = re.compile(
+    r"<tool_call>\s*([\w\u4e00-\u9fff][\w\-]*)\s*"
+    r"((?:<arg_key>.*?</arg_value>\s*)+)"
+    r"(?:</tool_call>|\Z)", re.DOTALL | re.IGNORECASE)
+_XMLARG_PAIR_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL | re.IGNORECASE)
+# 整个参数就是一个 <arg_value>{…}</arg_value>（省略 arg_key）
+_XMLARG_BARE_RE = re.compile(
+    r"<tool_call>\s*([\w\u4e00-\u9fff][\w\-]*)\s*<arg_value>(.*?)</arg_value>\s*"
+    r"(?:</tool_call>|\Z)", re.DOTALL | re.IGNORECASE)
+# 光一个工具名、零参数（如 <tool_call>system_info</tool_call>）
+_XMLARG_NOARG_RE = re.compile(
+    r"<tool_call>\s*([\w\u4e00-\u9fff][\w\-]*)\s*</tool_call>", re.IGNORECASE)
+_XMLARG_MAX_ARG = 200000
+
+
+def _xmlarg_value(raw):
+    """XML 参数值 -> Python 值：能当 JSON 解就解，否则按原文（保留代码缩进）。"""
+    v = raw if raw is not None else ""
+    s = v.strip()
+    if not s:
+        return ""
+    try:
+        return json.loads(s)
+    except Exception:
+        return v.strip("\r\n")
+
+
+def _xmlarg_calls(text):
+    """解析智谱 XML 风格工具调用，返回 [{name, arguments}, ...]；解析不出返回 []。"""
+    # ⚠️ 守卫只能看 <tool_call> —— 别写成 "arg_value" not in text：
+    #    零参数写法（<tool_call>system_info</tool_call>）里根本没有 arg_value，
+    #    那样会被误挡在门外（写完立刻被 parser_cases 打出来）。
+    if not text or "<tool_call>" not in text.lower():
+        return []
+    out = []
+    for m in _XMLARG_CALL_RE.finditer(text):
+        name = _dsml_name(m.group(1))
+        if name not in KNOWN_TOOLS:
+            continue          # 不是已知工具就别认，免得把普通文本误当调用
+        args = {}
+        for pm in _XMLARG_PAIR_RE.finditer(m.group(2) or ""):
+            key = (pm.group(1) or "").strip()
+            if not key:
+                continue
+            val = pm.group(2) or ""
+            if len(val) > _XMLARG_MAX_ARG:
+                val = val[:_XMLARG_MAX_ARG]
+            args[key] = _xmlarg_value(val)
+        # 有的模型仍套一层 {"arguments": {...}} 壳 —— 拆开
+        if len(args) == 1 and isinstance(args.get("arguments"), dict):
+            args = args["arguments"]
+        if args:
+            out.append({"name": name, "arguments": args})
+    if out:
+        return out
+    for m in _XMLARG_BARE_RE.finditer(text):
+        name = _dsml_name(m.group(1))
+        if name not in KNOWN_TOOLS:
+            continue
+        obj = _loads_lenient((m.group(2) or "").strip())
+        if isinstance(obj, dict):
+            out.append({"name": name, "arguments": obj})
+    if out:
+        return out
+    for m in _XMLARG_NOARG_RE.finditer(text):
+        name = _dsml_name(m.group(1))
+        if name in KNOWN_TOOLS:
+            out.append({"name": name, "arguments": {}})
+    return out
+
+
 def parse_tool_call(text):
     """从助手文本里尽力提取工具调用，返回 {name, arguments} 或 None。
 
     依次尝试：
       1) 标准 <tool_call>{...}</tool_call>
-      2) DeepSeek 的 <｜DSML｜invoke ...> 语法
-      3) ``` 围栏 / 裸文本里的 JSON（带 name 字段）
-      4) 没有 name 字段的裸 JSON：用附近提到的工具名补齐
-      5) "工具名\n{参数}" 或 "[工具 read_file {...}]" 这类退化写法
+      2) 智谱 GLM 的 <tool_call>名字<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+      3) DeepSeek 的 <｜DSML｜invoke ...> 语法
+      4) ``` 围栏 / 裸文本里的 JSON（带 name 字段）
+      5) 没有 name 字段的裸 JSON：用附近提到的工具名补齐
+      6) "工具名\n{参数}" 或 "[工具 read_file {...}]" 这类退化写法
     拿到之后，会用消息里的 ```代码块``` 修补被写坏的长文本参数。
     """
     call = _parse_tool_call_once(text)
@@ -466,6 +554,11 @@ def _parse_tool_call_once(text):
         call = _coerce(obj) if obj is not None else None
         if call:
             return call
+
+    # 1.1) 智谱 GLM 的原生 XML 参数写法（<arg_key>/<arg_value>）
+    _xa = _xmlarg_calls(text)
+    if _xa:
+        return _xa[0]
 
     # 1.2) DeepSeek 的 DSML 语法（整段没有 <tool_call>，直接 <｜DSML｜invoke …>）
     _dsml = _dsml_calls(text)
@@ -661,6 +754,11 @@ def parse_tool_calls(text, limit=4):
     if calls:
         calls = _dedupe(calls)[:limit]
         return _salvage_from_fence(calls, text)
+    # 智谱 XML 风格（<arg_key>/<arg_value>）：一条回复里可能连着发多个，全取出来。
+    # 与 DSML 同理，参数值本来就是原文文本，不做 _salvage_from_fence。
+    _xa = _xmlarg_calls(text)
+    if _xa:
+        return _dedupe(_xa)[:limit]
     # DeepSeek DSML：一条回复里可能连着发多个 invoke，要全部取出来。
     # 这里**不做** _salvage_from_fence —— 它的参数是原文文本，
     # code/content 里本来就可能有 ``` 代码块，别当成"写坏的 JSON"再改一遍。

@@ -244,7 +244,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4.6v-flash", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 25
+PROMPT_VERSION = 26
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -411,6 +411,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "    extract=forms 看一眼）；\n"
     "  · values（直接给一串值，字符串或数组）或 values_from（指向 Excel/CSV/txt，\n"
     "    **取第一列**——用户说「用桌面那个名单查」时用这个）；\n"
+    "    **⚠️ 不要把名单「先读出来再用 run_python 抠成列表」——那是白跑一轮，也容易抠错；\n"
+    "    直接把 values_from 指向那个 Excel/CSV 就行，工具自己会取第一列；**\n"
     "  · save_to（**必填，产出文件名**，如 查询结果.xlsx；.xlsx 或 .csv）。\n"
     "    批量查询的价值就是这份表，**不给 save_to 等于没交付**；\n"
     "  · method（默认 POST）、extra（每次都要带的固定字段）、delay（默认 1.5 秒，\n"
