@@ -1356,6 +1356,8 @@ class SettingsPage(QWidget):
     # v9.14.2：窗口显隐
     web_show = pyqtSignal()
     web_hide = pyqtSignal()
+    # v9.15.0：GitHub 检测
+    gh_test = pyqtSignal(str)           # 传 Token（可为空 = 用本机 gh 登录态）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1501,7 +1503,7 @@ class SettingsPage(QWidget):
 
         web_hint = QLabel("不用手动开浏览器：程序会自己把 Chrome 拉起来（默认后台无头，"
                           "桌面上不会多出窗口）。"
-                          "只有**这一次**需要你在网页里登录一下 DeepSeek（手机验证码 / 微信扫码），"
+                          "只有这一次需要你在网页里登录一下 DeepSeek（手机验证码 / 微信扫码），"
                           "登录态会保存在专用配置里，以后一直免登。\n"
                           "要亲眼看页面时点「显示网页窗口」，看完点「收起窗口」收回后台"
                           "（切换模式会重启浏览器，但不会掉登录）。")
@@ -1527,11 +1529,46 @@ class SettingsPage(QWidget):
         web_risk.setObjectName("PageSub")
         bv.addWidget(web_risk)
 
+        # ---------------- v9.15.0：GitHub ----------------
+        gh_box = QGroupBox("GitHub（让 AI 直接读你的仓库 / 搜代码 / 看 issue）")
+        gv = QVBoxLayout(gh_box)
+        gh_hint = QLabel("优先用本机已登录的 gh 命令行（免配置就能读你自己的仓库）。"
+                         "没装 gh、或要读私有仓库 / 用搜索，才需要填下面的 Token。\n"
+                         "Token 只存在本机工作区设置里，不会上传到任何地方。")
+        gh_hint.setWordWrap(True)
+        gh_hint.setObjectName("PageSub")
+        gv.addWidget(gh_hint)
+        gh_row = QHBoxLayout()
+        gh_row.addWidget(QLabel("Token："))
+        self.gh_token_edit = QLineEdit()
+        self.gh_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gh_token_edit.setPlaceholderText("可留空（本机 gh 已登录时不需要）；形如 ghp_xxx")
+        gh_row.addWidget(self.gh_token_edit, 1)
+        self.gh_btn_test = QPushButton("检测连接")
+        self.gh_btn_test.setFixedHeight(30)
+        self.gh_btn_test.clicked.connect(
+            lambda: self.gh_test.emit(self.gh_token_edit.text().strip()))
+        gh_row.addWidget(self.gh_btn_test)
+        gv.addLayout(gh_row)
+        self.gh_status = QLabel("尚未检测。点「检测连接」看能不能读到 GitHub。")
+        self.gh_status.setWordWrap(True)
+        self.gh_status.setObjectName("PageSub")
+        gv.addWidget(self.gh_status)
+        bv.addWidget(gh_box)
+        self.gh_box = gh_box
+
         v.addWidget(box)
 
         self.probe_view = QTextBrowser()
         v.addWidget(self.probe_view, 1)
         return page
+
+    def set_gh_status(self, ok, text):
+        """主窗口回填 GitHub 检测结果（v9.15.0）。"""
+        try:
+            self.gh_status.setText(("✅ " if ok else "⚠️ ") + str(text))
+        except Exception:
+            pass
 
     def set_web_status(self, kind, detail=""):
         """更新「DeepSeek 网页版」状态行（圆点颜色 + 文案）。kind 为 WebErrorKind 值或短名。"""
@@ -1761,6 +1798,10 @@ class SettingsPage(QWidget):
         self.hotkey_voice.setText(s.get("hotkey_voice", "ctrl+alt+v") or "")
         self.web_auto_cb.setChecked(bool(s.get("deepseek_web_auto", True)))
         self.web_silent_cb.setChecked(bool(s.get("deepseek_web_silent", True)))
+        try:
+            self.gh_token_edit.setText(str(s.get("github_token", "") or ""))
+        except Exception:
+            pass
 
     def _save(self):
         s = dict(self._settings)
@@ -1785,6 +1826,7 @@ class SettingsPage(QWidget):
         s["hotkey_voice"] = self.hotkey_voice.text().strip()
         s["deepseek_web_auto"] = self.web_auto_cb.isChecked()
         s["deepseek_web_silent"] = self.web_silent_cb.isChecked()
+        s["github_token"] = self.gh_token_edit.text().strip()
         keys = dict(s.get("api_keys") or {})
         for name, e in self.key_edits.items():
             keys[name] = e.text().strip()

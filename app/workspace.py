@@ -45,6 +45,9 @@ DEFAULT_SETTINGS = {
     # False = 显示窗口。⚠️ 绝不改回"挪到屏幕外"：那种窗口 visibilityState='hidden'，
     # 浏览器会丢弃发送动作 -> 字填进输入框却发不出去。
     "deepseek_web_silent": True,
+    # —— GitHub（v9.15.0）——
+    # 留空即可：优先用本机已登录的 gh CLI。只有没装 gh / 要读私有仓库时才需要填 Token。
+    "github_token": "",
     # —— 钉钉 ——
     "dingtalk": dict(_dt.DEFAULT_CONFIG) if _dt else {},
     # —— 更新 ——

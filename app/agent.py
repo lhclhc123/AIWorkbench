@@ -42,6 +42,8 @@ KNOWN_TOOLS = (
     "clipboard", "screenshot", "notify",
     # 联网
     "web_search", "download_file", "http_request",
+    # 网页采集 / GitHub（v9.15.0）
+    "web_scrape", "web_form_batch", "github",
     # 记忆 / 计划 / 知识库
     "remember", "recall", "update_plan", "build_index", "search_knowledge",
     # 语音
@@ -84,6 +86,15 @@ TOOL_ALIAS = {
     "asr": "transcribe_audio", "stt": "transcribe_audio",
     "search": "web_search", "http": "http_request",
     "fetch": "fetch_url", "python": "run_python",
+    # 网页采集（模型爱用的各种叫法）
+    "scrape": "web_scrape", "crawl": "web_scrape", "crawler": "web_scrape",
+    "spider": "web_scrape", "web_fetch": "web_scrape", "get_url": "web_scrape",
+    "爬虫": "web_scrape", "抓取网页": "web_scrape", "网页抓取": "web_scrape",
+    "batch_query": "web_form_batch", "query_batch": "web_form_batch",
+    "form_query": "web_form_batch", "batch_scrape": "web_form_batch",
+    "batch_form": "web_form_batch", "query_site": "web_form_batch",
+    "批量查询": "web_form_batch", "网站查询": "web_form_batch",
+    "gh": "github", "github_api": "github", "git_hub": "github",
     "bash": "run_command", "shell": "run_command",
     "worklog": "write_worklog", "work_log": "write_worklog",
     "summary": "write_worklog", "diary": "write_worklog",
@@ -3514,6 +3525,91 @@ class AgentRunner:
                     head += f"\n…（共 {len(raw)} 字符，已截断）"
                 tag = "成功" if 200 <= code < 400 else f"HTTP {code}"
                 return f"[{tag}] HTTP {method} {url}{where} → {code}\n{head}"
+
+            # ---------------- 网页采集 / GitHub（v9.15.0）----------------
+            elif name == "web_scrape":
+                from . import webcap
+                return webcap.scrape(
+                    url=args.get("url"),
+                    method=args.get("method") or "GET",
+                    form=args.get("form") or args.get("data"),
+                    json_body=args.get("json") or args.get("json_body"),
+                    headers=args.get("headers"),
+                    cookies=args.get("cookies"),
+                    session=args.get("session"),
+                    extract=args.get("extract") or "auto",
+                    selector=args.get("selector"),
+                    raw=bool(args.get("raw")),
+                    max_chars=int(args.get("max_chars") or 9000),
+                    timeout=int(args.get("timeout") or 30),
+                    referer=args.get("referer"),
+                )
+
+            elif name == "web_form_batch":
+                from . import webcap
+                raw_save = (args.get("save_to") or args.get("save_path")
+                            or args.get("path") or "").strip()
+                save_path, err = (None, None)
+                if raw_save:
+                    save_path, err = self._resolve_write(raw_save)
+                    if err:
+                        return f"[错误] save_to 不合法：{err}"
+                else:
+                    # 批量查询必须有产物：模型忘了给路径时，程序自动补一个。
+                    # 阈值 2：≥2 个值就算批量（用户验收看的就是这份表）；
+                    # 单个值只是随口一问，结果直接看聊天就够，不必生成文件。
+                    n_try = args.get("values") or []
+                    if isinstance(n_try, str):
+                        n_try = [x for x in re.split(r"[\n,，、;；]+", n_try) if x.strip()]
+                    if args.get("values_from") or len(n_try or []) >= 2:
+                        import datetime as _dt
+                        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        save_path, _e = self._resolve_write(
+                            os.path.join("网页查询结果_" + stamp + ".xlsx"))
+                text, saved, size = webcap.form_batch(
+                    url=args.get("url"),
+                    field=args.get("field") or args.get("name_field")
+                    or args.get("key") or "",
+                    values=args.get("values"),
+                    values_from=args.get("values_from") or args.get("from_file"),
+                    extra=args.get("extra") or args.get("form") or args.get("fixed"),
+                    method=args.get("method") or "POST",
+                    session=args.get("session"),
+                    delay=float(args.get("delay") if args.get("delay") is not None else 1.5),
+                    max_items=args.get("max") or args.get("max_items"),
+                    save_path=save_path,
+                    timeout=int(args.get("timeout") or 30),
+                    resume=bool(args.get("resume", True)),
+                    headers=args.get("headers"),
+                    cookies=args.get("cookies"),
+                    label=(args.get("label") or "查询值"),
+                )
+                if saved:
+                    self._note_written(saved, size)
+                return text
+
+            elif name == "github":
+                from . import webcap
+                token = args.get("token") or ""
+                if not token:
+                    try:
+                        from . import config as _cfg
+                        token = getattr(_cfg, "GITHUB_TOKEN", "") or ""
+                    except Exception:
+                        token = ""
+                return webcap.github(
+                    action=args.get("action") or args.get("op") or "read",
+                    repo=args.get("repo") or args.get("repository"),
+                    path=args.get("path") or args.get("file"),
+                    ref=args.get("ref") or args.get("branch"),
+                    query=args.get("query") or args.get("q"),
+                    kind=args.get("kind") or args.get("type") or "repos",
+                    number=args.get("number"),
+                    state=args.get("state") or "open",
+                    limit=args.get("limit") or args.get("max") or 20,
+                    token=token,
+                    timeout=int(args.get("timeout") or 45),
+                )
 
             # ---------------- v9.1：技能 / 定时任务 / 子代理 ----------------
             elif name == "list_skills":

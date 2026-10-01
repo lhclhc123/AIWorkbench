@@ -178,6 +178,13 @@ WEB_SILENT_WINDOW = True
 #   绝不在别处硬编码第二份。
 WEB_PLACEHOLDER_KEY = "sk-local-deepseek-web"
 
+# v9.15.0：GitHub 访问。
+#   优先用本机已登录的 `gh` CLI（**不用配这个**就能读你自己的仓库）；
+#   只有当没装 gh、或要访问私有仓库/搜索接口时，才需要填一个
+#   Personal Access Token（只读权限就够，形如 ghp_xxx）。
+#   优先级：工具参数 token > 这里 > 环境变量 GITHUB_TOKEN。
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
 PROVIDERS.append({
     "name": WEB_PROVIDER_NAME,
     "label": "DeepSeek 网页版",
@@ -237,7 +244,7 @@ NON_CHAT_MODELS = {"glm-4v-flash", "glm-4.6v-flash", "qwen3.8-flash"}
 
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 24
+PROMPT_VERSION = 25
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -371,6 +378,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "  · web_search：要「结论」时用（参数 query），返回带来源的检索结论，最省事；\n"
     "  · fetch_url：要「某个具体网址的正文」时用（参数 url）；\n"
     "  · http_request：要调 API 拿结构化返回（JSON）时用；\n"
+    "  · web_scrape：**要拿原始 HTML（含 script）、要看页面表单字段、要带 Cookie 会话**\n"
+    "    访问时用（参数 url，可选 method/form/raw/extract/selector/session）；\n"
+    "  · web_form_batch：**「输入一个值 -> 返回一条信息」这类查询网站要批量查**时用；\n"
+    "  · github：读 GitHub 仓库文件 / 列目录 / 搜索 / 看 issue 时用；\n"
     "  · download_file：要把某个网址的文件存到本地时用（参数 url、可选 path）。\n"
     "- **④ 搜索词怎么写**：一句话、抓关键词，别把用户整段长句原样塞进去；\n"
     "  中英文各试一次可以，但同一问题**最多搜 2 次**，不要反复搜同一个词。\n"
@@ -381,6 +392,41 @@ DEFAULT_SYSTEM_PROMPT = (
     "  做本机钉钉诊断时，每轮都被塞进一堆 Python 教程结果，白白浪费了十几轮）。\n"
     "- 需要联网时**优先显式调 web_search**（来源清楚、可复现、有记录）；\n"
     "  端点的自动联网只在你不主动搜时兜底。\n"
+    "\n"
+    "【网页采集与批量查询（重点能力，遇到「上某个网站查一批数据」就用它）】\n"
+    "- **web_scrape**：带会话抓网页。参数：\n"
+    "  · url（必填）、method（GET/POST，默认 GET）；\n"
+    "  · form（POST 表单字段，形如 {\"字段名\":\"值\"}）；json（POST JSON）；\n"
+    "  · raw=true 时返回**原始 HTML（含 script）**——排查「这网站怎么提交的」时必须用它，\n"
+    "    fetch_url 会把 script 删掉，看不到接口；\n"
+    "  · extract：auto（默认）/ text（正文）/ html / forms（**列出页面所有表单的字段名、\n"
+    "    隐藏 token、提交地址**）/ fields（字段:值）/ tables（表格转 Markdown）/ json；\n"
+    "  · selector（CSS 选择器，只取匹配到的内容）、session（会话名，见下）、cookies、headers。\n"
+    "- **★ web_form_batch —— 批量表单查询，这是「查询类网站」的专用解法**：\n"
+    "  典型场景：一个网址 + 一个输入框（姓名/学号/准考证号），逐个提交拿回信息\n"
+    "  （宿舍、班级、成绩、录取结果、分班、录取通知书编号……）。**不要自己写爬虫去循环**，\n"
+    "  直接用这个工具，它已经处理好 Cookie、跳转、结果提取和落盘。参数：\n"
+    "  · url（必填，查询页或提交接口地址）；\n"
+    "  · field（必填，表单里那个字段的 **name**，如 s_xingming —— 不知道就先 web_scrape\n"
+    "    extract=forms 看一眼）；\n"
+    "  · values（直接给一串值，字符串或数组）或 values_from（指向 Excel/CSV/txt，\n"
+    "    **取第一列**——用户说「用桌面那个名单查」时用这个）；\n"
+    "  · save_to（**必填，产出文件名**，如 查询结果.xlsx；.xlsx 或 .csv）。\n"
+    "    批量查询的价值就是这份表，**不给 save_to 等于没交付**；\n"
+    "  · method（默认 POST）、extra（每次都要带的固定字段）、delay（默认 1.5 秒，\n"
+    "    **别调太小**，太快会被网站风控）、max（最多查几个）；\n"
+    "  · 它会自动：预热拿 Cookie -> 逐个提交 -> 若返回 JSON 里有 url 就自动跟进结果页 ->\n"
+    "    抠出「字段:值」-> 汇总成表 -> 写成 Excel/CSV；**支持断点续查**（重跑会跳过已查到的）。\n"
+    "  · 遇到验证码/风控会**立刻停下并如实说明**——这时把已完成的结果文件交给用户，\n"
+    "    告诉他还有哪几个没查到，**绝不要假装全都查到了**。\n"
+    "- **github**：GitHub 操作。参数 action：\n"
+    "  · read（读文件，需 repo + path）、list（列目录，需 repo，path 可选）、\n"
+    "    repo（看仓库概况）、search（搜仓库/代码，需 query + kind）、\n"
+    "    issues / pr（需 repo，可选 state、limit）、releases；\n"
+    "  · repo 写 owner/name，如 lhclhc123/AIWorkbench；ref 指定分支/tag。\n"
+    "  · 优先用本机已登录的 gh CLI（能读私有仓库）；没 gh 时会自动回落公开接口。\n"
+    "- **会话（session）**：同一个网站的多步操作（先访问页面、再提交表单）要给**同一个\n"
+    "  session 名**（如 session=\"yichafen\"），这样 Cookie 能串起来；不填就按域名自动分。\n"
     "\n"
     "【系统与交互】\n"
     "- run_python：执行一段 Python 代码并返回真实输出，参数 code、可选 timeout（秒）。\n"
@@ -539,6 +585,14 @@ DEFAULT_SYSTEM_PROMPT = (
     "【HTTP 与自检】\n"
     "- http_request：发一个 HTTP 请求拿返回，参数 url、可选 method（GET/POST）、headers、body。\n"
     "  适合调 API、查接口、验证服务是否可用。\n"
+    "- web_scrape：带 Cookie 会话的抓取，能拿原始 HTML（raw=true）、列页面表单字段\n"
+    "  （extract=forms）、按表格/字段提取（extract=tables/fields）、用 CSS 选择器取内容。\n"
+    "  排查「这网站怎么提交数据」时必须用它（fetch_url 看不到 script）。\n"
+    "- web_form_batch：**批量表单查询**。url + field（表单字段 name）+ values/values_from\n"
+    "  + save_to（产出 Excel/CSV）-> 逐个提交 -> 汇总成表。查询类网站（成绩/分班/宿舍/录取）\n"
+    "  的专用解法，自动处理 Cookie、结果页跳转、断点续查、验证码风控停手。\n"
+    "- github：GitHub 操作，参数 action=read/list/repo/search/issues/pr/releases，\n"
+    "  repo 写 owner/name。读你自己的仓库、搜代码、看 issue 都行；优先走本机已登录的 gh。\n"
     "- check_update：检查 AI 工作台自身有没有新版本（走 GitHub），无参数。\n"
     "  用户问\"有没有更新 / 新版本\"时用它。\n"
     "\n"

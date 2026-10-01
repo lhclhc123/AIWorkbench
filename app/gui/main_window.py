@@ -103,11 +103,18 @@ class MainWindow(QMainWindow):
     # DeepSeek 网页版（v9.14.0）：后台线程 -> 界面
     _dsw_launch_ready = pyqtSignal(dict)
     _dsw_selftest_ready = pyqtSignal(list)
+    # GitHub 检测（v9.15.0）
+    _gh_status_ready = pyqtSignal(bool, str)
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
         self.workspace = workspace
         self.settings = settings
+        # GitHub Token 生效（v9.15.0）
+        try:
+            config.GITHUB_TOKEN = str(settings.get("github_token", "") or "")
+        except Exception:
+            pass
         themes.set_font_scale(self.settings.get("font_scale", 100))
 
         self.client = llm_client.LLMClient()
@@ -131,6 +138,7 @@ class MainWindow(QMainWindow):
         self._dsw_timer.setInterval(3000)
         self._dsw_timer.timeout.connect(self._poll_deepseek_web)
         self._dsw_launch_ready.connect(self._dsw_on_launch)
+        self._gh_status_ready.connect(self._on_gh_status_ready)
         self._dsw_selftest_ready.connect(self._dsw_on_selftest)
         self.memory = memory_mod.MemoryStore(self.workspace.path)
         self.trace = trace_mod.TraceLog(self.workspace.path)
@@ -334,6 +342,56 @@ class MainWindow(QMainWindow):
                 {"ok": True, "detail": "已收起网页窗口" if ok else "暂时没有可收起的网页窗口"})
 
         threading.Thread(target=work, daemon=True, name="awb-dsw-hide").start()
+
+    def _gh_do_test(self, token=""):
+        """「检测连接」：看 GitHub 通不通（优先本机 gh 登录态，其次 Token）。"""
+        token = (token or "").strip()
+        try:
+            self.page_settings.set_gh_status(True, "正在检测…")
+        except Exception:
+            pass
+
+        def work():
+            ok, msg = False, ""
+            try:
+                from .. import webcap
+                detail = []
+                if token:
+                    g = webcap.github(action="repo", repo="octocat/Hello-World",
+                                      token=token)
+                    ok_t = g.startswith("[成功]")
+                    detail.append("Token " + ("可用" if ok_t else "不可用"))
+                    ok = ok or ok_t
+                gh_ok, gh_info = webcap._gh_ready()
+                if gh_ok:
+                    acc = ""
+                    for ln in (gh_info or "").split("\n"):
+                        if "account" in ln.lower():
+                            acc = ln.split(":", 1)[-1].strip()
+                    detail.append("本机 gh 已登录" + (f"（{acc}）" if acc else ""))
+                    ok = True
+                else:
+                    detail.append("本机 gh 不可用")
+                # 真正读一次你自己的仓库
+                g2 = webcap.github(action="repo", repo="lhclhc123/AIWorkbench",
+                                   token=token)
+                if g2.startswith("[成功]"):
+                    ok = True
+                    detail.append("已能读取 lhclhc123/AIWorkbench")
+                else:
+                    detail.append("读仓库失败：" + g2[:80])
+                msg = "；".join(detail)
+            except Exception as exc:
+                ok, msg = False, f"{type(exc).__name__}: {exc}"
+            self._gh_status_ready.emit(ok, msg)
+
+        threading.Thread(target=work, daemon=True, name="awb-gh-test").start()
+
+    def _on_gh_status_ready(self, ok, msg):
+        try:
+            self.page_settings.set_gh_status(ok, msg)
+        except Exception:
+            pass
 
     def _dsw_do_launch(self):
         """「启动/打开网页」：拉起（或复用）Chrome 并接入网页。"""
@@ -651,6 +709,8 @@ class MainWindow(QMainWindow):
         self.page_settings.web_retry.connect(self._dsw_do_retry)
         self.page_settings.web_show.connect(self._dsw_do_show)
         self.page_settings.web_hide.connect(self._dsw_do_hide)
+        # GitHub 区块（v9.15.0）
+        self.page_settings.gh_test.connect(self._gh_do_test)
 
         self.page_about = AboutPage()
         self.stack.addWidget(self.page_about)
@@ -2582,6 +2642,11 @@ class MainWindow(QMainWindow):
         self.bg_client.set_keys(self.settings.get("api_keys", {}))
         # DeepSeek 网页版（v9.14.2）：开了"自动拉起"就直接把网页准备好（不在线就自己开浏览器）
         self._dsw_sync_prefs()
+        # GitHub（v9.15.0）：把设置里的 Token 生效到运行时
+        try:
+            config.GITHUB_TOKEN = str(self.settings.get("github_token", "") or "")
+        except Exception:
+            pass
         if self._dsw_auto_on() and self._dsw_is_web_model():
             self._dsw_auto_ensure("设置已更新")
         elif self.settings.get("deepseek_web_auto"):
