@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """工作区与本地持久化：设置、对话历史、文件沙箱、导出。"""
 import os
+import re
 import json
 import time
 import shutil
@@ -71,15 +72,126 @@ class Workspace:
         self.path = os.path.abspath(path)
         self.settings_file = os.path.join(self.path, "settings.json")
         self.conv_dir = os.path.join(self.path, "conversations")
-        self.files_dir = os.path.join(self.path, "files")
+        # ★ v9.17.0：`files/` 变成"工作区级兜底目录"，真正落产物的位置是
+        #   每个对话自己的文件夹（见下面的 files_dir / set_current）。
+        self.files_root = os.path.join(self.path, "files")
         self.exports_dir = os.path.join(self.path, "exports")
+        # ★ v9.17.0 用户要求：「工作空间内每个对话都新建一个文件夹，
+        #   分别存放产物和记忆，还要有主记忆」。
+        #   chats/<NN_标题>/files     → 这个对话的产物
+        #   chats/<NN_标题>/MEMORY.md → 这个对话的记忆
+        #   工作区根的 MEMORY.md       → 主记忆（跨对话共享，一直保留）
+        self.chats_dir = os.path.join(self.path, "chats")
+        self._index_file = os.path.join(self.chats_dir, "_index.json")
+        self.current_cid = None
+        self._cur_folder = ""
 
     def ensure(self):
-        for d in (self.path, self.conv_dir, self.files_dir, self.exports_dir):
+        for d in (self.path, self.conv_dir, self.files_root,
+                  self.exports_dir, self.chats_dir):
             os.makedirs(d, exist_ok=True)
         if not os.path.exists(self.settings_file):
             self.save_settings(DEFAULT_SETTINGS.copy())
         return self
+
+    # ---------- ★ v9.17.0 每个对话一个文件夹 ----------
+    @property
+    def files_dir(self):
+        """当前对话的产物目录。
+
+        有当前对话 → `<ws>/chats/<NN_标题>/files`；
+        还没选定对话（或老工作区首次启动）→ 退回工作区级 `<ws>/files`（旧行为）。
+        """
+        if self._cur_folder:
+            d = os.path.join(self._cur_folder, "files")
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                return self.files_root
+            return d
+        return self.files_root
+
+    @staticmethod
+    def _safe_name(text, limit=14):
+        s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(text or "")).strip(" ._")
+        return (s[:limit] or "对话")
+
+    def _load_index(self):
+        try:
+            with open(self._index_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_index(self, idx):
+        try:
+            os.makedirs(self.chats_dir, exist_ok=True)
+            with open(self._index_file, "w", encoding="utf-8") as f:
+                json.dump(idx, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _title_of(self, cid):
+        try:
+            conv = self.load_conversation(cid)
+            return (conv or {}).get("title") or ""
+        except Exception:
+            return ""
+
+    def conv_folder(self, cid, title=None, create=True):
+        """这个对话的专属目录（`chats/<NN_标题>`）的绝对路径。
+
+        `chats/_index.json` 记着 对话id -> 目录名 的映射：序号一旦分配就不再变
+        （避免"改了标题就换目录、产物全失联"），标题变了只改后半段。
+        """
+        cid = str(cid or "").strip()
+        if not cid:
+            return ""
+        idx = self._load_index()
+        old = idx.get(cid)
+        if not old and not create:
+            return ""
+        title = title or self._title_of(cid) or "新对话"
+        if not old:
+            name = f"{len(idx) + 1:02d}_{self._safe_name(title)}"
+        else:
+            m = re.match(r"^(\d+)_", old)
+            n = int(m.group(1)) if m else (len(idx) + 1)
+            name = f"{n:02d}_{self._safe_name(title)}"
+        dst = os.path.join(self.chats_dir, name)
+        if create:
+            try:
+                if old and old != name:
+                    src = os.path.join(self.chats_dir, old)
+                    if os.path.isdir(src) and not os.path.isdir(dst):
+                        # 标题变了：把整个文件夹（含里面的产物和记忆）一起改名
+                        os.rename(src, dst)
+                os.makedirs(os.path.join(dst, "files"), exist_ok=True)
+            except Exception:
+                pass
+            if idx.get(cid) != name:
+                idx[cid] = name
+                self._save_index(idx)
+        return dst
+
+    def set_current(self, cid):
+        """切换"当前对话"——决定之后产物和对话记忆落到哪个文件夹。"""
+        cid = str(cid or "").strip()
+        self.current_cid = cid or None
+        self._cur_folder = self.conv_folder(cid, create=True) if cid else ""
+        return self.current_cid
+
+    def current_folder(self):
+        return self._cur_folder or ""
+
+    def conv_memory_file(self, cid=None):
+        """这个对话的记忆文件（`chats/<NN_标题>/MEMORY.md`）。"""
+        cid = str(cid or self.current_cid or "").strip()
+        if not cid:
+            return ""
+        p = self.conv_folder(cid, create=True)
+        return os.path.join(p, "MEMORY.md") if p else ""
 
     # ---------- 设置 ----------
     @staticmethod
@@ -184,6 +296,15 @@ class Workspace:
             conv["title"] = (first[:20] + "…") if len(first) > 20 else first or "未命名对话"
         with open(self._conv_path(conv["id"]), "w", encoding="utf-8") as f:
             json.dump(conv, f, ensure_ascii=False, indent=2)
+        # ★ v9.17.0：登记 / 按标题更新这个对话的文件夹。
+        #   新建对话时标题还叫「新对话」，第一轮发完消息后标题才定下来 ——
+        #   这里顺手把文件夹改名（连同里面已有的产物和 MEMORY.md 一起搬）。
+        try:
+            self.conv_folder(conv.get("id"), conv.get("title"), create=True)
+            if self.current_cid and str(self.current_cid) == str(conv.get("id")):
+                self.set_current(conv.get("id"))
+        except Exception:
+            pass
 
     def delete_conversation(self, cid):
         p = self._conv_path(cid)

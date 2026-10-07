@@ -45,6 +45,11 @@ _PARALLEL_SAFE_TOOLS = {
 # 并行度：4 条同时查已经够快，再多只会互相抢带宽/句柄
 _PARALLEL_MAX = 4
 
+# ★ v9.17.0：AI 提问的最长等待时间。用户一直不答就按"没答"处理
+#   （模型会按最合理的假设继续并在结论里注明），**不能无限等** ——
+#   否则整轮对话就永远卡在等答案那一步了。
+_ASK_TIMEOUT = 300.0
+
 
 def _plan_parallel(calls, runner):
     """挑出这一轮里可以并行执行的调用下标。
@@ -117,6 +122,8 @@ class ChatWorker(QThread):
     finished = pyqtSignal(list)        # 只含"本轮新增的、要显示给用户"的消息
     error = pyqtSignal(str)
     confirm_requested = pyqtSignal(str)  # 需要用户确认命令
+    # ★ v9.17.0 AI 主动提问：(问题, 选项列表, 小标题, 是否多选) -> 主窗口弹提问框
+    ask_requested = pyqtSignal(str, object, str, bool)
     plan_changed = pyqtSignal(dict)      # 任务计划有更新（跨线程安全）
     notice = pyqtSignal(str)             # 需要提示用户的事（模型切换、上下文压缩…）
     wrapup = pyqtSignal(dict)            # 本轮结束 -> 交给主窗口写「工作总结 + 自动记忆」
@@ -140,6 +147,12 @@ class ChatWorker(QThread):
         self._answering = False          # 本轮是否已经开始吐字（给状态行用）
         self._confirm_event = threading.Event()
         self._confirm_res = False
+        # ★ v9.17.0 向用户提问：工具跑在 worker 线程里，要靠"信号 + 事件"把问题
+        #   送回 UI 线程。ask_enabled 由界面接线时置 True；后台无人值守时保持
+        #   False —— 那样 ask_user 会立刻退化成"按合理假设继续"，**绝不干等**。
+        self._ask_event = threading.Event()
+        self._ask_res = ""
+        self.ask_enabled = False
         # 真思维链（reasoning_content）累积缓冲：只有支持思维链的模型才会往里写，
         # 其它模型回调 0 次，行为与以前完全一致。
         self._reason_buf = []
@@ -147,6 +160,31 @@ class ChatWorker(QThread):
     def confirm(self, ok: bool):
         self._confirm_res = ok
         self._confirm_event.set()
+
+    # ---------- ★ v9.17.0 AI 主动提问 ----------
+    def ask_answer(self, text):
+        """界面上用户答完了（或点了跳过 / 直接关掉）→ 唤醒正在等答案的工具线程。"""
+        self._ask_res = text or ""
+        self._ask_event.set()
+
+    def _ask_cb_impl(self, question, options=None, header="", multi=False):
+        """工具线程里被 `ask_user` 调用：把问题送回 UI 线程，等用户回答。
+
+        没有界面在听时（后台定时任务、无人值守）直接返回空串 —— **绝不干等**，
+        工具那边会退化成"按最合理的假设继续，并在结论里注明"。
+        """
+        if not getattr(self, "ask_enabled", False):
+            return ""
+        self._ask_event.clear()
+        self._ask_res = ""
+        try:
+            self.ask_requested.emit(str(question or ""), list(options or []),
+                                    str(header or ""), bool(multi))
+        except Exception:
+            return ""
+        if not self._ask_event.wait(timeout=_ASK_TIMEOUT):
+            return ""
+        return self._ask_res or ""
 
     def abort(self):
         """用户点了右下角的方形「停止」：立刻中断本轮。
@@ -458,6 +496,13 @@ class ChatWorker(QThread):
             # 每轮开始先把「上一轮写过的文件」清掉，否则工作总结/完成自检会把旧文件又报一遍
             try:
                 self.runner.written = []
+            except Exception:
+                pass
+            # ★ v9.17.0：把「向用户提问」的通道挂到这个 runner 上。
+            #   放在这里而不是构造期，是因为 runner 是外面建好传进来的，
+            #   而等待逻辑（事件 + 信号）在 worker 身上。
+            try:
+                self.runner.ask_cb = self._ask_cb_impl
             except Exception:
                 pass
             self._maybe_compact()

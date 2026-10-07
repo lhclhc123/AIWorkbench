@@ -12,7 +12,7 @@ import re
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QTextBrowser, QTextEdit, QPlainTextEdit, QFileDialog, QMessageBox,
-    QApplication,
+    QApplication, QDialog, QLineEdit, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QIcon, QFont as QGFont, QGuiApplication
@@ -70,6 +70,7 @@ def tool_label(content):
         ("已convert", "图片转格式"), ("已rotate", "图片旋转"),
         ("已flip", "图片翻转"), ("已crop", "图片裁剪"), ("已watermark", "加水印"),
         ("已设置提醒", "设置提醒"), ("提醒已设置", "设置提醒"),
+        ("用户回答：", "向用户提问"), ("用户没有回答", "向用户提问（未答）"),
         ("检查更新", "检查更新"), ("发现新版本", "检查更新"), ("已是最新", "检查更新"),
         ("无法识别", "模型错误"), ("你选择的模型", "模型错误"),
     )
@@ -591,11 +592,20 @@ class MessageCard(QWidget):
         vbox.addLayout(self.code_host)
 
         self.footer = QLabel(footer_text or "")
-        self.footer.setVisible(bool(footer_text))
         self.footer.setStyleSheet(
             f"color:{t['text_muted']};font-size:11px;background:transparent;")
         self.footer.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         vbox.addWidget(self.footer)
+        # ★★ v9.17.0 修「弹一堆小窗口」的真凶就在这一行：
+        #   控件**还没有父窗口**时调 `setVisible(True)` 等价于 `show()` ——
+        #   它会在那一瞬间变成一个**真实的独立小窗口**（实测 isVisible=True /
+        #   isWindow=True），紧接着 `addWidget` 把它收进布局、窗口才消失。
+        #   带 footer 的消息（助手回复的「实际使用模型：xxx」）每条都会闪一个，
+        #   于是用户看到的就是「一执行任务就弹一堆小窗，又很快消失」
+        #   （用户自己观察得很准：对话消息先被创建成窗口，再"烧制"进主界面）。
+        #   → 纪律：**setVisible(True) 永远放在 addWidget 之后**。
+        #   复现/验证：tests/probe_flicker_v9170.py（还原这一行顺序会立刻报泄漏）。
+        self.footer.setVisible(bool(footer_text))
 
         if role == "user":
             vbox.setContentsMargins(14, 9, 14, 9)
@@ -662,6 +672,30 @@ class MessageCard(QWidget):
                    footer_text=footer_text, label=label, timestamp=timestamp,
                    index=index, actions=actions, stats=stats, collapsed=collapsed,
                    emphasis=emphasis)
+
+    def update_live(self, text):
+        """流式期间**原地**更新这张卡片的正文（v9.17.0）。
+
+        为什么需要它：`_render_full()` 原来是「每次刷新把聊天区里所有卡片全部
+        删掉重建」，流式输出时每秒要重建十几次 —— 消息一多就肉眼可见地卡，
+        而且旧卡片在 `setParent(None)` 时还会瞬间闪成独立小窗口。
+        流式正文只影响**最后一张**卡片，前面已经稳定的消息完全没必要动。
+
+        返回 True 表示更新成功（调用方就不必再做全量重建了）。
+        """
+        try:
+            from .. import markdown_render
+            prose, blocks = markdown_render.render_with_blocks(text or "")
+        except Exception:
+            return False
+        self._raw = text or ""
+        self._prose = prose
+        self._blocks = blocks
+        try:
+            self._rebuild()
+        except Exception:
+            return False
+        return True
 
     def set_footer(self, text):
         t = themes.tokens()
@@ -733,3 +767,125 @@ class MessageCard(QWidget):
         self._collapsed = not self._collapsed
         self._apply_height_policy()
         self.collapse_changed.emit(self._collapsed)
+
+
+class AskUserDialog(QDialog):
+    """AI 主动向用户提问（v9.17.0，参考 WorkBuddy 的提问卡片）。
+
+    用户要求：「添加向用户提问的功能，有什么不懂的一定不要猜，可以向用户提问」。
+
+    `ask_user` 工具在 **worker 线程**里执行，靠信号把问题送到 UI 线程弹这个框，
+    用户答完再把字符串回传给工具 —— 所以这里只是个纯粹的"问一句、拿一句"。
+
+    行为约定：
+    - 给了 options：每个选项一个按钮，**点一下即为选中**（少一次点击）；
+    - multi=True：选项变复选框，需点「确定」；
+    - 永远保留「自己输入」框（选项不可能覆盖全部情况）；
+    - 点「跳过」/ 直接关掉 = **没回答**，工具那边会退化成"按合理假设继续并在
+      结论里注明"，绝不会把整轮卡死。
+    """
+
+    def __init__(self, question, options=None, header="", multi=False, parent=None):
+        super().__init__(parent)
+        t = themes.tokens()
+        self.answer = ""
+        self._multi = bool(multi)
+        self._boxes = []
+        self.setWindowTitle(header or "AI 想跟你确认一下")
+        self.setMinimumWidth(560)
+        try:
+            self.setStyleSheet(f"QDialog {{ background: {t['window_bg']}; }}")
+        except Exception:
+            pass
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        if header:
+            h = QLabel("❓ " + header)
+            h.setStyleSheet(f"color:{t['accent_text']};font-size:12px;font-weight:bold;")
+            lay.addWidget(h)
+
+        qlab = QLabel(question or "")
+        qlab.setWordWrap(True)
+        qlab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        qlab.setStyleSheet(f"color:{t['text']};font-size:{themes.fs(15)};")
+        lay.addWidget(qlab)
+
+        opts = [str(o) for o in (options or []) if str(o).strip()]
+        if opts:
+            if self._multi:
+                tip = QLabel("（可多选，选完点确定）")
+                tip.setStyleSheet(f"color:{t['text_muted']};font-size:11px;")
+                lay.addWidget(tip)
+            box = QVBoxLayout()
+            box.setSpacing(6)
+            for o in opts:
+                if self._multi:
+                    cb = QCheckBox(o)
+                    cb.setStyleSheet(f"color:{t['text']};font-size:{themes.fs(14)};")
+                    box.addWidget(cb)
+                    self._boxes.append((cb, o))
+                else:
+                    b = QPushButton(o)
+                    b.setCursor(Qt.CursorShape.PointingHandCursor)
+                    b.setStyleSheet(
+                        "QPushButton{text-align:left;padding:9px 13px;"
+                        f"font-size:{themes.fs(14)};border:1px solid {t['card_border']};"
+                        f"border-radius:8px;background:{t['card_bg']};color:{t['text']};}}"
+                        f"QPushButton:hover{{border-color:{t['accent']};"
+                        f"background:{t['accent_soft']};}}")
+                    b.clicked.connect(lambda _=False, txt=o: self._pick(txt))
+                    box.addWidget(b)
+            lay.addLayout(box)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("也可以直接在这里写…（点了确定就以这里为准）")
+        self.edit.setStyleSheet(
+            f"QLineEdit{{background:{t['input_bg']};color:{t['text']};"
+            f"border:1px solid {t['input_border']};border-radius:8px;"
+            f"padding:7px 10px;font-size:{themes.fs(14)};}}")
+        self.edit.returnPressed.connect(self._submit)
+        row.addWidget(self.edit, 1)
+
+        ok = QPushButton("确定")
+        ok.setDefault(True)
+        ok.setStyleSheet(
+            f"QPushButton{{padding:7px 16px;font-size:{themes.fs(14)};"
+            f"border:none;border-radius:8px;background:{t['accent']};color:#ffffff;}}"
+            f"QPushButton:hover{{background:{t['accent_hover']};}}")
+        ok.clicked.connect(self._submit)
+        row.addWidget(ok)
+
+        skip = QPushButton("跳过")
+        skip.setToolTip("不回答，让 AI 自己按最合理的假设继续做")
+        skip.setStyleSheet(
+            f"QPushButton{{padding:7px 14px;font-size:{themes.fs(14)};"
+            f"border:1px solid {t['btn_border']};border-radius:8px;"
+            f"background:{t['btn_bg']};color:{t['text_muted']};}}")
+        skip.clicked.connect(self.reject)
+        row.addWidget(skip)
+        lay.addLayout(row)
+
+        self.edit.setFocus()
+
+    def _pick(self, text):
+        self.answer = str(text or "").strip()
+        self.accept()
+
+    def _submit(self):
+        txt = (self.edit.text() or "").strip()
+        if txt:
+            # 手写的内容优先（用户可能想补充选项之外的第三种答案）
+            self.answer = txt
+        elif self._boxes:
+            picked = [o for cb, o in self._boxes if cb.isChecked()]
+            self.answer = "、".join(picked)
+            if not picked:
+                return          # 多选但一个都没勾 → 不关窗，等他勾
+        if not self.answer:
+            return
+        self.accept()

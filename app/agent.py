@@ -64,6 +64,8 @@ KNOWN_TOOLS = (
     "team_run", "team_status",
     # 工作总结
     "write_worklog", "read_worklog",
+    # ★ 向用户提问（v9.17.0）——「有什么不懂的一定不要猜」
+    "ask_user",
     # MCP
     "mcp_list", "mcp_call",
 )
@@ -120,6 +122,12 @@ TOOL_ALIAS = {
     "组队": "team_run", "团队协作": "team_run", "多智能体": "team_run",
     "team_progress": "team_status", "团队状态": "team_status",
     "团队进度": "team_status",
+    # ★ 向用户提问（v9.17.0）
+    "ask": "ask_user", "askuser": "ask_user", "question": "ask_user",
+    "confirm_with_user": "ask_user", "clarify": "ask_user",
+    "提问": "ask_user", "问用户": "ask_user", "询问用户": "ask_user",
+    "问一下": "ask_user", "让用户选": "ask_user", "让用户选择": "ask_user",
+    "询问": "ask_user", "确认一下": "ask_user",
     "bash": "run_command", "shell": "run_command",
     "worklog": "write_worklog", "work_log": "write_worklog",
     "summary": "write_worklog", "diary": "write_worklog",
@@ -1588,6 +1596,58 @@ _LANG_EXT = {
     "xml": ".xml", "markdown": ".md", "md": ".md",
 }
 
+# ★ v9.17.0：语言嗅探 + 扩展名纠正
+#   用户原话：「怎么我让他写一段 C++ 程序，给我生成 py 文件？」
+#   —— 文件名归模型自由发挥，但**语言是用户明确要的**，不能由着它写成 .py。
+#   策略：只在"扩展名明显与内容/语言不符"时纠正，且只针对 .py/.txt 这类
+#   默认扩展名（避免误伤 .h/.hpp/.ts 这些本来就是别的语言的文件）。
+_NON_DEFAULT_EXTS = {".h", ".hpp", ".hh", ".ts", ".tsx", ".jsx", ".vue", ".svelte"}
+
+
+def _sniff_lang(text):
+    """从代码正文猜语言（保守：只认特征非常明确的几种）。返回 _LANG_EXT 的键。"""
+    s = (text or "")[:6000]
+    if not s.strip():
+        return None
+    if re.search(r"#\s*include\s*[<\"]", s) or "std::" in s:
+        return "cpp"
+    if re.search(r"^\s*using\s+System\s*;", s, re.M):
+        return "cs"
+    if re.search(r"public\s+static\s+void\s+main\s*\(", s):
+        return "java"
+    if re.search(r"^\s*package\s+main\b", s, re.M) and re.search(r"\bfunc\s+main\s*\(", s):
+        return "go"
+    if re.search(r"^\s*fn\s+main\s*\(", s, re.M) or "println!(" in s:
+        return "rust"
+    return None
+
+
+def _fix_ext_for_language(path, content, lang_hint=None):
+    """把扩展名纠成与语言一致。返回 (新路径, 说明文字)；没动手则说明为空。
+
+    判定顺序：
+      ① 模型/工具显式给了 language → 以它为准；
+      ② 否则看内容特征（只有 .py/.txt 这类"默认扩展名"才纠正）。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    want = None
+    hint = str(lang_hint or "").strip().lower().lstrip(".")
+    if hint:
+        want = (_LANG_EXT.get(hint)
+                or _LANG_EXT.get(hint.replace("＋", "+"))
+                or _LANG_EXT.get(hint.replace("c++", "cpp"))
+                or None)
+    if not want and ext in ("", ".py", ".txt", ".pyw"):
+        lang = _sniff_lang(content)
+        if lang:
+            want = _LANG_EXT.get(lang)
+    if not want or want == ext or ext in _NON_DEFAULT_EXTS:
+        return path, ""
+    base = path[:len(path) - len(ext)] if ext else path
+    return (base + want,
+            f"（文件名按语言纠正：{ext or '无扩展名'} → {want}）")
+
+
 # 「截断保护」生效的代码类扩展名（文档类不适用：Markdown 天然不配平）
 _CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".h", ".cpp",
               ".hpp", ".cs", ".go", ".rs", ".sh", ".bat", ".ps1", ".sql",
@@ -2329,7 +2389,7 @@ class AgentRunner:
                  speak_cb=None, dingtalk_cb=None, update_cb=None,
                  reminder_cb=None, keys=None, subagent_cb=None,
                  dingtalk_api_cb=None, taskman=None, team_cb=None,
-                 bg_agent_cb=None, teamman=None):
+                 bg_agent_cb=None, teamman=None, ask_cb=None):
         self.files_dir = files_dir
         # 后台任务管理器（v9.16.0）：run_bg / bg_* 工具靠它把活儿甩到后台线程，
         # 自己立刻返回，从而"跑慢命令不阻塞模型继续思考"。UI 层注入。
@@ -2363,12 +2423,21 @@ class AgentRunner:
         self.reminder_cb = reminder_cb
         # subagent_cb(prompt, max_steps) -> str，子代理委派（UI 注入，独立上下文跑）
         self.subagent_cb = subagent_cb
+        # ★ ask_cb(question, options, header, multi) -> str，向用户提问（UI 注入）。
+        #   用户要求：「有什么不懂的一定不要猜，可以向用户提问」（参考 WorkBuddy）。
+        #   None 表示当前没有可提问的界面（后台/无人值守），工具会退化成"按合理假设继续"。
+        self.ask_cb = ask_cb
         # API Keys（语音识别等直接走网络的工具要用）
         self.keys = dict(keys or {})
         # 工作区根目录（文件沙箱 files/ 的上一层）；记忆、索引、追踪都放这里
         self.ws_path = os.path.abspath(workspace_path or
                                        os.path.dirname(os.path.abspath(files_dir)))
         self._mem = None
+        # ★ v9.17.0 当前对话的记忆（见下面的 conv_memory property）
+        self._cvm = None
+        self._cvm_path = ""
+        # conv_memory_path_cb() -> str，由 UI 层注入：返回"当前对话的记忆文件"路径
+        self.conv_memory_path_cb = None
         self._kb = None
         self._trace = None
         self._skills = None
@@ -2384,6 +2453,32 @@ class AgentRunner:
             from . import memory as memory_mod
             self._mem = memory_mod.MemoryStore(self.ws_path)
         return self._mem
+
+    @property
+    def conv_memory(self):
+        """★ v9.17.0 当前对话专属的记忆（`chats/<NN_标题>/MEMORY.md`）。
+
+        用户要求：「工作空间内每个对话都新建一个文件夹，分别存放产物和记忆，
+        还要有主记忆」。这里就是那个"每个对话自己的记忆"；工作区根的
+        MEMORY.md（`self.memory`）是跨对话共享的主记忆，两者都一直保留。
+
+        没有当前对话（老工作区刚启动、或后台无人值守通道）时返回 None，
+        调用方要回落到主记忆，绝不能因为拿不到就报错。
+        """
+        cb = getattr(self, "conv_memory_path_cb", None)
+        path = ""
+        if callable(cb):
+            try:
+                path = cb() or ""
+            except Exception:
+                path = ""
+        if not path:
+            return None
+        if self._cvm is None or self._cvm_path != path:
+            from . import memory as memory_mod
+            self._cvm = memory_mod.MemoryStore(os.path.dirname(path))
+            self._cvm_path = path
+        return self._cvm
 
     @property
     def kb(self):
@@ -2418,8 +2513,10 @@ class AgentRunner:
                           update_cb=None, reminder_cb=None, keys=None,
                           subagent_cb=None, dingtalk_api_cb=None,
                           taskman=None, team_cb=None, bg_agent_cb=None,
-                          teamman=None):
+                          teamman=None, ask_cb=None):
         """工作区切换后重新挂接回调。"""
+        if ask_cb is not None:
+            self.ask_cb = ask_cb
         if taskman is not None:
             self.taskman = taskman
         if team_cb is not None:
@@ -2859,6 +2956,40 @@ class AgentRunner:
             out.append("（还在跑。团队各角色在后台并行执行，你可以继续别的事。）")
         return "\n".join(out)
 
+    # ---------- 向用户提问（v9.17.0）----------
+    def _tool_ask_user(self, args):
+        """把问题抛给界面，等用户回答了再继续。
+
+        用户要求：「添加向用户提问的功能，有什么不懂的一定不要猜，可以向用户提问
+        （参考 workbuddy）」。所以这里是**阻塞式**的：界面弹一张提问卡片，
+        用户答完工具才返回。
+        没有界面时（后台定时任务 / 无人值守通道）**绝不干等**，而是明确让模型
+        "按最合理的假设继续、并在结论里注明"，避免整轮卡死。
+        """
+        q = str((args or {}).get("question") or "").strip()
+        if not q:
+            return ("[错误] question 不能为空：把你没弄明白、需要用户拍板的那件事，"
+                    "写成一句直接的问题。")
+        opts = (args or {}).get("options")
+        if isinstance(opts, str):
+            opts = [x for x in re.split(r"[,，、;；|]", opts) if x.strip()]
+        opts = [str(o).strip() for o in (opts or []) if str(o).strip()][:6]
+        header = str((args or {}).get("header") or "").strip()
+        multi = bool((args or {}).get("multi") or (args or {}).get("multiple"))
+        cb = getattr(self, "ask_cb", None)
+        if cb is None:
+            return ("[跳过] 现在没有可以直接提问的界面（例如后台定时任务里）。"
+                    "请**按最合理的假设继续做完**，并在最后明确写出你假设了什么、"
+                    "哪一步需要用户确认。")
+        try:
+            ans = cb(q, opts, header, multi) or ""
+        except Exception as e:                      # noqa: BLE001
+            return f"[错误] 提问没能送到界面上：{type(e).__name__}: {e}"
+        if not str(ans).strip():
+            return ("[跳过] 用户没有回答这次提问（可能直接关掉了）。"
+                    "请按最合理的默认做法继续，并在结论里注明这一点。")
+        return f"[成功] 用户回答：{ans}"
+
     def _dispatch(self, name, args, confirm_cb):
         """真正干活的派发逻辑。confirm_cb(cmd)->bool 用于命令/删除/杀进程确认。"""
         try:
@@ -2923,11 +3054,18 @@ class AgentRunner:
                             f"请换到其他位置（桌面、D:、E:、你的项目文件夹都行）。")
                 if os.path.isdir(path):
                     return f"[错误] {path} 是一个目录，不能用 write_file 写入，请换文件名"
+                # ★ v9.17.0：先拿到内容，再按「显式 language / 内容特征」纠正扩展名。
+                #   必须放在算 parent **之前**，否则改了扩展名却还用着旧的目录。
+                #   （用户报的「我要 C++，它给我个 .py」就在这一步兜住。）
+                content = args.get("content", "")
+                path, _ext_note = _fix_ext_for_language(
+                    path, content, args.get("language"))
+                if os.path.isdir(path):
+                    return f"[错误] {path} 是一个目录，不能用 write_file 写入，请换文件名"
                 parent = os.path.dirname(path)
                 if parent and os.path.exists(parent) and not os.path.isdir(parent):
                     return (f"[错误] 上级路径 {os.path.basename(parent)} 已经是一个文件，"
                             f"无法在它下面再创建文件")
-                content = args.get("content", "")
                 # 模型经常把换行双重转义成字面量 \n -> 落盘的代码就"一整行"。
                 # 落盘前统一还原成真换行/TAB（只在这一看就是被转义坏的情况下动手）。
                 if isinstance(content, str):
@@ -2962,7 +3100,7 @@ class AgentRunner:
                 # 界面侧解析「共 N 行」；老格式（没有该字段）仍用估算兜底。
                 lines = content.count("\n") + 1
                 return (f"[成功] 已写入 {len(content)} 字符，共 {lines} 行 → 完整路径：{path}"
-                        f"（{size} 字节，已确认落盘）")
+                        f"（{size} 字节，已确认落盘）{_ext_note}")
 
             elif name == "read_worklog":
                 days = int(args.get("days") or 1)
@@ -3626,21 +3764,42 @@ class AgentRunner:
                 text = args.get("text") or args.get("content") or ""
                 if not str(text).strip():
                     return "[错误] text 为空，请给出要记住的内容"
-                added, cat = self.memory.remember(str(text), args.get("category"))
+                # ★ v9.17.0：记忆分两处（用户要求「每个对话都新建一个文件夹，
+                #   分别存放产物和记忆，还要有主记忆」）：
+                #     scope 缺省/conv → **本对话记忆**（chats/<NN_标题>/MEMORY.md）
+                #     scope=main      → **主记忆**（工作区 MEMORY.md，跨对话共享）
+                scope = str(args.get("scope") or "").strip().lower()
+                store, where = self.memory, "主记忆（跨对话共享）"
+                if scope in ("", "conv", "conversation", "chat", "本对话",
+                             "对话", "对话记忆", "conversation_memory"):
+                    cm = self.conv_memory
+                    if cm is not None:
+                        store, where = cm, "本对话记忆"
+                added, cat = store.remember(str(text), args.get("category"))
                 if added:
-                    return (f"[成功] 已记入长期记忆（分类：{cat}）：{text}\n"
-                            f"当前记忆概况：{self.memory.summary_text()}")
-                return f"[提示] 这条内容已经在记忆里了，未重复添加（分类：{cat}）"
+                    return (f"[成功] 已记入{where}（分类：{cat}）：{text}\n"
+                            f"当前记忆概况：{store.summary_text()}")
+                return f"[提示] 这条内容已经在{where}里了，未重复添加（分类：{cat}）"
 
             elif name == "recall":
                 q = (args.get("query") or args.get("keyword") or "").strip()
-                hits = self.memory.search(q, limit=int(args.get("limit") or 20))
-                if not hits:
-                    return (f"长期记忆里没有找到与「{q}」相关的内容。"
-                            if q else "长期记忆目前是空的。")
-                lines = [f"- 【{c}】{t}" for c, t in hits]
-                return (f"长期记忆检索「{q}」，命中 {len(hits)} 条：\n"
-                        + "\n".join(lines))
+                lim = int(args.get("limit") or 20)
+                hits = self.memory.search(q, limit=lim)
+                # ★ v9.17.0：连本对话的记忆一起搜（用户既能查"长期记的"，
+                #   也能查"这个任务里记的"）
+                chits = []
+                cm = self.conv_memory
+                if cm is not None:
+                    try:
+                        chits = cm.search(q, limit=lim)
+                    except Exception:
+                        chits = []
+                if not hits and not chits:
+                    return (f"记忆里没有找到与「{q}」相关的内容。"
+                            if q else "记忆目前是空的。")
+                lines = [f"- 【主记忆·{c}】{t}" for c, t in hits]
+                lines += [f"- 【本对话·{c}】{t}" for c, t in chits]
+                return (f"记忆检索「{q}」，命中 {len(lines)} 条：\n" + "\n".join(lines))
 
             # ======================== 计划 ========================
             elif name == "update_plan":
@@ -4212,6 +4371,10 @@ class AgentRunner:
                 return self._tool_team_run(args)
             elif name == "team_status":
                 return self._tool_team_status(args)
+
+            # ---------- 向用户提问（v9.17.0）----------
+            elif name == "ask_user":
+                return self._tool_ask_user(args)
 
             else:
                 low = (name or "").lower().replace("-", "_")

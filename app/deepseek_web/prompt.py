@@ -47,7 +47,16 @@ def _role_of(msg):
 
 def _signature(msg):
     """消息的"身份指纹"：角色 + 内容，用于前缀比较。"""
-    return (_role_of(msg), _content_of(msg))
+    role = _role_of(msg)
+    if role == "system":
+        # ★ v9.17.0：system 每轮都在变 —— 我们拼的提示词里带了长期记忆 / 技能清单 /
+        #   定时任务 / 计划 / 时间，内容一轮一个样。如果拿它当"指纹"，那么
+        #   `diff_tail` 的"严格前缀"判定**每轮都不命中** → 每轮都新建一个网页对话
+        #   （正是用户反馈的："同一段对话，能不能不要在 DeepSeek 里换新对话？"）。
+        #   网页端本来就靠它自己的会话记忆保住上文，system 只在第一次随全量发过去，
+        #   所以这里**只认角色、不认内容**。
+        return (role, "")
+    return (role, _content_of(msg))
 
 
 def flatten(messages):

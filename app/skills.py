@@ -193,6 +193,24 @@ BUILTIN = [
             "有失败或没跑完的如实说，并给出可重试的一条命令。",
         ],
     },
+    {
+        "slug": "multi-language-code",
+        "name": "多语言代码生成",
+        "description": "用户要哪门语言的代码，就落成那门语言的文件（C++ 就给 .cpp，别一律给 .py）。",
+        "when": "用户说「写一段 C++/C/Java/Go/Rust/TypeScript… 程序」「用 xx 语言写」「编译一下这个 xx 文件」时",
+        "steps": [
+            "先认准语言：用户说 C++ 就是 C++，**不要**因为本机最方便跑 Python 就偷偷改成 .py —— "
+            "用户要的是那个语言的文件。",
+            "扩展名按语言取：C++→.cpp、C→.c、头文件→.h/.hpp、Java→.java、Go→.go、Rust→.rs、"
+            "C#→.cs、TypeScript→.ts、JavaScript→.js、Kotlin→.kt、Swift→.swift、Shell→.sh、Python→.py。"
+            "拿不准时把 language 参数一并传给 write_file，它会按语言纠正扩展名。",
+            "文件名用「能看出语言」的名字（hello.cpp / main.rs），别用 temp.txt 这种。",
+            "写完后：C/C++ 若本机有编译器就真编译一下（g++/gcc，或 run_command 调编译器）并把真实输出贴出来；"
+            "**没有编译器就如实说「本机没找到 g++，只做了语法层面的检查，没真编译」**，别假装编译过。",
+            "Java 之类需要 JDK 的同样道理：有就跑，没有就直说，并给出用户可以在自己机器上跑的命令。",
+            "最终回复里给出：产物**完整路径** + 用哪门语言 + 怎么跑（一条命令）。",
+        ],
+    },
 ]
 
 _FM = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)

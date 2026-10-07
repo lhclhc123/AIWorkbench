@@ -38,7 +38,7 @@ from .startup_dialog import StartupDialog
 from .panels import PlanPanel
 from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
                       strip_tool_markup, BODY_WIDTH, ChatInput, file_write_stats,
-                      StatusLine, tool_verb)
+                      StatusLine, tool_verb, AskUserDialog)
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
@@ -1055,6 +1055,9 @@ class MainWindow(QMainWindow):
             keys=self.settings.get("api_keys", {}))
         # 让工具层也能读到设置（比如「禁止弹出新窗口」开关）
         r.settings = self.settings
+        # ★ v9.17.0：把"当前对话的记忆文件"告诉工具层（remember/recall 用它决定
+        #   记到本对话还是主记忆）。用回调而不是一次性取值，切换对话后自动跟随。
+        r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
         return r
 
     # ================= 工作总结 + 自动记忆（每轮结束都会跑） =================
@@ -1417,7 +1420,7 @@ class MainWindow(QMainWindow):
         def _sub(task, steps=6):
             return self._agent_run_once(task, max_iter=int(steps) + 2,
                                         quiet=True)
-        return agent_mod.AgentRunner(
+        r = agent_mod.AgentRunner(
             self.workspace.files_dir,
             vision_cb=self._vision,
             workspace_path=self.workspace.path,
@@ -1428,6 +1431,8 @@ class MainWindow(QMainWindow):
             taskman=self.taskman, teamman=self.teamman,
             team_cb=self._team_start_sync, bg_agent_cb=self._bg_agent_run,
             subagent_cb=(_sub if allow_subagent else None))
+        r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
+        return r
 
     def _agent_run_once(self, prompt, max_iter=8, quiet=False,
                         wrapup_source=None):
@@ -1748,6 +1753,12 @@ class MainWindow(QMainWindow):
 
     def _new_conversation(self, silent=False):
         self.conv = self.workspace.new_conversation()
+        # ★ v9.17.0：切到新对话 → 之后产出的文件、记的事都落到它自己的文件夹
+        #   （`chats/<NN_标题>/`，里面 files/ 与 MEMORY.md）
+        try:
+            self.workspace.set_current(self.conv.get("id"))
+        except Exception:
+            pass
         self.live_text = ""
         self.pending_tool = []
         self._card_collapsed = {}      # 换会话：折叠记录随之清空
@@ -1763,6 +1774,11 @@ class MainWindow(QMainWindow):
         conv = self.workspace.load_conversation(cid)
         if conv:
             self.conv = conv
+            # ★ v9.17.0：跟着切换"当前对话目录"
+            try:
+                self.workspace.set_current(conv.get("id"))
+            except Exception:
+                pass
             self.live_text = ""
             self.pending_tool = []
             self._card_collapsed = {}  # 换会话：折叠记录随之清空
@@ -3125,6 +3141,20 @@ class MainWindow(QMainWindow):
                 parts.append(block)
         except Exception:
             pass
+        # ★ v9.17.0：本对话自己的记忆也要带上（用户要求「每个对话一个文件夹，
+        #   分别存放产物和记忆，还要有主记忆」——上面那块是主记忆，这块是本对话的）。
+        try:
+            cm = self.workspace.conv_memory_file()
+            if cm and os.path.isfile(cm):
+                with open(cm, "r", encoding="utf-8") as f:
+                    _txt = f.read().strip()
+                if _txt:
+                    parts.append("# 本对话的记忆（只属于当前这个对话，跨对话不共享）\n"
+                                 "（要往这里记：remember(..., scope=\"conv\")；"
+                                 "要记长期/跨对话的事：remember(..., scope=\"main\")）\n"
+                                 + _txt)
+        except Exception:
+            pass
         # 技能清单（只有名字 + 适用场景，正文要模型自己 use_skill 取，省上下文）
         try:
             lines = self.skills.summary_lines()
@@ -3267,6 +3297,9 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
         self.worker.confirm_requested.connect(self._on_confirm)
+        # ★ v9.17.0：AI 主动提问（用户要求"有什么不懂的一定不要猜"）
+        self.worker.ask_requested.connect(self._on_ask_user)
+        self.worker.ask_enabled = True      # 有界面在听 → 提问才会真的弹框
         self.worker.plan_changed.connect(self._on_plan_changed)
         self.worker.notice.connect(self._on_notice)
         self.worker.wrapup.connect(self._on_wrapup)
@@ -3414,6 +3447,31 @@ class MainWindow(QMainWindow):
         # 收尾渲染同样不强制贴底：用户若正在上翻看历史，不该被拽走。
         self._render()
 
+    # ---------- ★ v9.17.0 AI 主动提问 ----------
+    def _on_ask_user(self, question, options, header, multi):
+        """AI 通过 `ask_user` 提问 → 弹一张卡片，把答案回传给正在等的工具线程。
+
+        工具在 worker 线程里阻塞等待（见 `ChatWorker._ask_cb_impl`），这里在 UI
+        线程开一个模态对话框；用户答完 / 跳过之后唤醒它。
+        **点跳过或直接关掉 = 没回答**，工具会退化成"按最合理的假设继续并在结论里
+        注明"，所以不会把整轮对话卡死。
+        """
+        ans = ""
+        try:
+            dlg = AskUserDialog(question, list(options or []), header or "",
+                                bool(multi), parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                ans = dlg.answer or ""
+        except Exception as exc:                      # noqa: BLE001
+            try:
+                self.statusBar().showMessage(f"提问框弹出失败：{exc}", 5000)
+            except Exception:
+                pass
+        try:
+            self.worker.ask_answer(ans)
+        except Exception:
+            pass
+
     def _on_confirm(self, cmd):
         # ① 设置里关掉了确认 -> 直接放行（危险命令在 agent 层已被拦截）
         if not self.settings.get("confirm_commands", True):
@@ -3552,11 +3610,15 @@ class MainWindow(QMainWindow):
             if w is not None:
                 if hasattr(w, "stop"):
                     w.stop()
-                # ★ 先 setParent(None) 立刻脱离父子关系，再 deleteLater。
-                #   只调 deleteLater 的话，控件要等事件循环才真正销毁，
-                #   在那之前它仍然是 chat_container 的子控件、**仍会按原位绘制** ——
-                #   所以重建时会出现「旧卡片 / 欢迎页和新消息叠在一起」的残影
-                #   （2026-09-30 截图复现）。
+                # ★★ v9.17.0 修「弹一堆小窗口」：
+                #   `setParent(None)` 会把控件**变成顶层窗口**，而且它此刻还是
+                #   **可见**的 —— Qt 会让它立刻以独立窗口的身份显示出来（任务栏上
+                #   一闪而过），直到 deleteLater() 真正销毁它才消失。
+                #   每次重建都会对**所有**旧卡片做一遍，所以消息越多、弹得越多，
+                #   用户看到的就是"一执行任务就弹一堆小窗，又很快消失"。
+                #   → 关键一步：**先 hide() 再 setParent(None)**，
+                #     这样它脱离父子关系时是隐藏状态，不会再变成可见的顶层窗口。
+                w.hide()
                 w.setParent(None)
                 w.deleteLater()
 
@@ -3583,20 +3645,46 @@ class MainWindow(QMainWindow):
         at_bottom = True if stick is True else (sb.value() >= sb.maximum() - 40)
         old_value = sb.value()
 
+        plan = (self.conv or {}).get("plan")
+        display = list(self.conv.get("messages", [])) if self.conv else []
+        for t in self.pending_tool:
+            display.append(t)
+        live_shown = strip_tool_markup(self.live_text) if self.live_text else ""
+
+        # ★★ v9.17.0 渲染短路 + 流式增量 —— 修用户反馈的「一执行任务就很卡、
+        #    弹一堆小窗口」。
+        #    老逻辑：每次 _render_full 都把聊天区**所有**卡片删掉重建；
+        #    流式输出时这个函数每秒被调十几次，消息一多就卡，而且每张旧卡片
+        #    在 setParent(None) 时还会闪成小窗口（见 _clear_chat）。
+        #    现在两道拦截：
+        #      ① 整块内容一模一样 → 直接什么都不做；
+        #      ② 只有流式正文在长、其余没变 → 只原地刷新最后那张 live 卡片。
+        base_sig = tuple((m.get("role"), m.get("content", "")) for m in display)
+        sig = (base_sig, bool(self.running),
+               live_shown if self.running else "", str(plan))
+        prev = getattr(self, "_render_sig", None)
+        if prev == sig:
+            return
+        if (prev is not None and prev[0] == base_sig and prev[1] == bool(self.running)
+                and prev[3] == str(plan) and self._live_card is not None
+                and self.running and live_shown and not self.pending_tool):
+            if self._live_card.update_live(live_shown):
+                self._render_sig = sig
+                self._pending_scroll = (at_bottom, old_value)
+                QTimer.singleShot(0, self._after_render)
+                return
+
         self._clear_chat()
         self._cards = []
         self._live_card = None
         try:
-            self.plan_panel.set_plan((self.conv or {}).get("plan"))
+            self.plan_panel.set_plan(plan)
         except Exception:
             pass
 
-        display = list(self.conv.get("messages", [])) if self.conv else []
-        for t in self.pending_tool:
-            display.append(t)
-
         if not display and not self.running:
             self._stack_welcome()
+            self._render_sig = sig
             return
 
         for i, m in enumerate(display):
@@ -3647,10 +3735,10 @@ class MainWindow(QMainWindow):
             ind = ThinkingIndicator()
             self.chat_layout.addWidget(ind)
             self._cards.append(ind)
-        elif strip_tool_markup(self.live_text):
-            shown = strip_tool_markup(self.live_text)
-            prose, blocks = markdown_render.render_with_blocks(shown)
-            card = MessageCard("assistant", prose, blocks, raw_text=shown, actions=False)
+        elif live_shown:
+            prose, blocks = markdown_render.render_with_blocks(live_shown)
+            card = MessageCard("assistant", prose, blocks, raw_text=live_shown,
+                               actions=False)
             self.chat_layout.addWidget(card)
             self._cards.append(card)
             self._live_card = card
@@ -3658,6 +3746,7 @@ class MainWindow(QMainWindow):
         self.chat_layout.addStretch(1)
         # 此刻布局还没最终确定，直接读滚动条最大值不准 —— 延后一帧再恢复位置
         self._pending_scroll = (at_bottom, old_value)
+        self._render_sig = sig          # ★ 记住这次渲染的指纹（供上面的短路判断用）
         QTimer.singleShot(0, self._after_render)
 
     def _copy_msg(self, m):
