@@ -25,6 +25,55 @@ def _has_real_proof(text):
 
 _PREVIEW_MAX_LINES = 60
 
+# ---------------------------------------------------------------------------
+# ★ v9.16.0：一轮里多个工具调用 —— 只读、无副作用的可以**并行跑**。
+#   用户原话：「模型在跑我本地命令的时候不影响它继续思考，也可以多条链路同时执行」。
+#   老版本一轮拿到 5 个调用就逐个串行 execute，查 5 个网页/5 个文件要等 5 次往返。
+#
+#   为什么只放这些工具：并行执行最大的风险是**互相干扰** ——
+#     · 写入类（write_file 等）会改同一个工作目录，必须串行；
+#     · run_command / run_python 可能改环境、装包、删文件，必须串行；
+#     · 需要用户确认的（命令、删除）本来就该一个一个弹窗，不能并行；
+#     · 会改共享状态的（remember / update_plan / schedule_task）也不能并行。
+#   只读工具即使同时跑，也只是"同时查几个东西"，结果互不影响。
+_PARALLEL_SAFE_TOOLS = {
+    "read_file", "list_dir", "read_document", "system_info", "now",
+    "web_scrape", "http_request", "fetch_url", "web_search",
+    "list_processes", "read_worklog", "list_skills", "github",
+    "bg_list", "bg_status", "team_status", "check_update", "list_tasks",
+}
+# 并行度：4 条同时查已经够快，再多只会互相抢带宽/句柄
+_PARALLEL_MAX = 4
+
+
+def _plan_parallel(calls, runner):
+    """挑出这一轮里可以并行执行的调用下标。
+
+    两道额外护栏：
+      ① 同一个**显式 session 名**的网页请求不能并行 —— `requests.Session`
+         不是线程安全的，两条链共用同一个会话会串 Cookie；
+      ② 需要用户确认的工具（run_command / file_op 删除）绝不并行。
+    """
+    picked = set()
+    seen_session = set()
+    out = []
+    for i, call in enumerate(calls):
+        name = runner.canonical_name(call.get("name"))
+        if name not in _PARALLEL_SAFE_TOOLS:
+            continue
+        args = call.get("arguments") or {}
+        sess = ""
+        if isinstance(args, dict):
+            sess = str(args.get("session") or "").strip()
+        if sess:
+            if sess in seen_session:
+                continue          # 同一个会话只能串行
+            seen_session.add(sess)
+        picked.add(i)
+        out.append(i)
+    # 只有一个就没必要开线程池（线程开销反而更大）
+    return out if len(out) >= 2 else []
+
 
 def _write_preview(call):
     """把写入类工具的正文做成 Markdown 代码块，供界面展开查看。
@@ -113,6 +162,31 @@ class ChatWorker(QThread):
                 cb()
         except Exception:
             pass
+
+    # ---------- 并行执行一批只读工具（v9.16.0）----------
+    def _run_parallel_calls(self, pairs):
+        """并行跑一批只读工具，返回 {下标: 结果文本}。
+
+        为什么不用 QThread：这些活儿是**纯 IO/等待**（读文件、发 HTTP），
+        标准线程池最省事，也不会和 Qt 事件循环纠缠。真正的工具信号
+        （tool_start / tool_result）仍然由本线程按原顺序发，界面行为不变。
+
+        ⚠️ 任何一个线程抛异常都不能拖垮整轮 —— 把它转成 [错误] 文本，
+           让模型看到失败原因并自己决定下一步（和串行时的行为一致）。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(_PARALLEL_MAX, len(pairs)),
+                                thread_name_prefix="awb-par") as pool:
+            futs = {pool.submit(self.runner.execute, call, None): idx
+                    for idx, call in pairs}
+            for fut in futs:
+                idx = futs[fut]
+                try:
+                    out[idx] = fut.result()
+                except Exception as exc:               # noqa: BLE001
+                    out[idx] = f"[错误] {type(exc).__name__}: {exc}"
+        return out
 
     # ---------- 真思维链（reasoning_content）----------
     def _collect_reason(self, delta):
@@ -704,7 +778,16 @@ class ChatWorker(QThread):
                 # ---------- 真正执行工具（一条回复里可能有多个调用，全部执行）----------
                 feedback_parts = []
                 blocked_repeat = False
-                for call in calls:
+                # ★ v9.16.0：先把"只读无副作用"的那几个**并行**跑掉。
+                #   它们不改工作目录、不需要确认，同时执行只是"同时查几个东西"。
+                #   结果按下标存好，下面仍按原顺序逐个做后处理 —— 这样
+                #   fail_counts / write_done / verified_after_write 的语义**完全不变**。
+                pre = {}
+                _par = _plan_parallel(calls, self.runner)
+                if _par:
+                    self.phase.emit("tool", f"并行 {len(_par)} 个只读工具")
+                    pre = self._run_parallel_calls([(i, calls[i]) for i in _par])
+                for _ci, call in enumerate(calls):
                     if self._abort:
                         break
                     name = call.get("name")
@@ -737,7 +820,11 @@ class ChatWorker(QThread):
                             self._confirm_event.wait()
                             return self._confirm_res
 
-                    result = self.runner.execute(call, confirm_cb)
+                    if _ci in pre:
+                        # 已在并行批次里跑完（只读工具，不需要确认）
+                        result = pre[_ci]
+                    else:
+                        result = self.runner.execute(call, confirm_cb)
                     self.tool_result.emit(result)
                     tool_done += 1
                     tools_used.add(name)

@@ -18,6 +18,11 @@ DEFAULT_SETTINGS = {
     # —— 密钥（落盘时会被 DPAPI 加密，磁盘上不存在明文）——
     "api_keys": dict(config.DEFAULT_API_KEYS),
     "github_token": "",
+    # —— 并行任务 / 团队（v9.16.0）——
+    # 后台链路没有界面弹"确认执行这条命令"的框，所以默认**拒绝**命令类操作；
+    # 用户在「⚡ 并行任务」页勾选后才放行（危险命令仍会被工具层单独拦截）。
+    "bg_allow_commands": False,
+    "bg_max_parallel": 4,          # 同时最多跑几条后台链路（超出的排队）
     # —— 对话 ——
     "system_prompt": config.DEFAULT_SYSTEM_PROMPT,
     "prompt_version": config.PROMPT_VERSION,

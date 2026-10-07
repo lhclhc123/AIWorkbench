@@ -75,16 +75,68 @@ def selftest():
             raise RuntimeError("缺少依赖：" + ", ".join(missing))
         return f"{len(mods)} 个依赖全部可用"
 
+    # ★ v9.16.0 修正：老版本这里是「手写清单 + 手写数字 26」，
+    #   实际列了 27 个、数字也早就对不上，而且漏了 skills/assistant/winproc/
+    #   webcap/hotkey/scheduler 以及新增的 taskman/team —— 等于自检从没验证过
+    #   这些模块能不能导入。现在改成：清单写全 + 数字动态算 + 再扫一遍做交叉核对，
+    #   以后加模块忘了改清单，自检会自己把漏掉的点出来。
+    #   注：_keyblobs 是本机密钥密文模块（gitignore，仓库版没有），不列入。
+    _APP_MODS = [
+        "agent", "asr", "assistant", "config", "dingtalk", "docread",
+        "docwrite", "folders", "hotkey", "knowledge", "llm_client",
+        "markdown_render", "mcp_client", "memory", "plan", "scheduler",
+        "security", "skills", "taskman", "team", "themes", "trace",
+        "tts", "updater", "version", "webcap", "winproc", "worklog",
+        "workspace",
+    ]
+    _GUI_MODS = [
+        "chat_worker", "main_window", "pages", "panels",
+        "startup_dialog", "voice_bar", "widgets",
+    ]
+    # 历史残留、产品代码零引用、因此不进包（列进来会让冻结版自检误报）。
+    # 设置界面早就改成 pages.SettingsPage 了；app/gui/settings_dialog.py 只是早期对话框的遗留文件。
+    _IGNORE_MODS = {"app.gui.settings_dialog"}
+
+    def _scan_extra_modules():
+        """扫一遍包里还有哪些模块没进上面的清单（扫不动就算了，不误报）。"""
+        try:
+            import pkgutil
+            import app as _pkg
+            from app import gui as _gpkg
+            known = ({"app." + n for n in _APP_MODS}
+                     | {"app.gui." + n for n in _GUI_MODS}
+                     | _IGNORE_MODS)
+            found = set()
+            for _p, prefix in ((_pkg, "app."), (_gpkg, "app.gui.")):
+                for mod in pkgutil.iter_modules(_p.__path__):
+                    if mod.name.startswith("_") or mod.ispkg:
+                        continue
+                    found.add(prefix + mod.name)
+            return sorted(found - known)
+        except Exception:
+            return []
+
     def _app_modules():
-        from app import (config, llm_client, agent, docread, docwrite,   # noqa
-                         memory, plan, knowledge, trace, mcp_client,
-                         workspace, themes, markdown_render,
-                         version, security, asr, tts, dingtalk, updater,
-                         folders, worklog)                              # noqa
-        from app.gui import (main_window, chat_worker, panels,           # noqa
-                             widgets, pages, voice_bar)
+        import importlib
         from app import version as _v
-        return f"应用模块（v{_v.VERSION} 共 26 个）全部导入成功"
+        bad = []
+        for n in _APP_MODS:
+            try:
+                importlib.import_module("app." + n)
+            except Exception as e:                      # noqa: BLE001
+                bad.append(f"{n}: {type(e).__name__}: {e}")
+        for n in _GUI_MODS:
+            try:
+                importlib.import_module("app.gui." + n)
+            except Exception as e:                      # noqa: BLE001
+                bad.append(f"gui.{n}: {type(e).__name__}: {e}")
+        if bad:
+            raise RuntimeError("导入失败：" + "; ".join(bad))
+        total = len(_APP_MODS) + len(_GUI_MODS)
+        extra = _scan_extra_modules()
+        tail = f"；另有未列入清单的模块：{', '.join(extra)}" if extra else ""
+        return (f"应用模块（v{_v.VERSION} 共 {total} 个）"
+                f"全部导入成功{tail}")
 
     def _seed_keys():
         """内置种子密钥有没有随包带上（决定首次启动能不能直接用免费模型）。"""

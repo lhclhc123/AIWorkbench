@@ -25,6 +25,8 @@ PAGES = [
     ("tasks", "⏰", "定时"),
     ("memory", "🧠", "记忆"),
     ("tools", "📊", "工具"),
+    ("bg", "⚡", "并行任务"),
+    ("team", "👥", "团队"),
     ("integrations", "🔌", "集成"),
     ("settings", "⚙", "设置"),
     ("about", "ℹ", "关于"),
@@ -2357,3 +2359,325 @@ class TasksPage(QWidget):
         self.reload()
         self.changed.emit()
 
+
+
+# ===========================================================================
+# ★ v9.16.0 新增两页：并行任务 / 团队
+#   用户原话：「模型在跑我本地命令的时候不影响它继续思考，也可以多条链路同时
+#   执行」「增加一个像 WorkBuddy 这样的团队的功能，各个工程师、产品经理独立跑，
+#   不影响主进程」。
+#   这两页就是那两件事的**可见入口**：能看见有几条链路在跑、各自跑到哪了、
+#   产物落在哪，也能一键取消 / 手动加任务 / 手动起一支团队。
+# ===========================================================================
+_STATUS_COLOR = {
+    "queued": "#c08a00", "running": "#1a7f37", "done": "#1a7f37",
+    "failed": "#c0392b", "cancelled": "#888",
+}
+
+
+class BgTasksPage(QWidget):
+    """⚡ 并行任务：所有后台链路一览（跑慢命令、后台 AI、团队子任务都在这里）。"""
+
+    cancel_one = pyqtSignal(str)      # 请求取消某个任务
+    cancel_all = pyqtSignal()
+    clear_done = pyqtSignal()
+    refresh = pyqtSignal()
+    allow_cmd = pyqtSignal(bool)      # "允许后台任务执行命令"开关
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.man = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 18, 18, 18)
+        v.setSpacing(10)
+
+        head = QHBoxLayout()
+        self.title = QLabel("⚡ 并行任务")
+        self.title.setObjectName("PageTitle")
+        head.addWidget(self.title)
+        head.addStretch(1)
+        self.hint = QLabel("")
+        self.hint.setObjectName("PageSub")
+        head.addWidget(self.hint)
+        v.addLayout(head)
+
+        tip = QLabel(
+            "这里能看到**所有在后台跑的链路**：跑的长命令、后台 AI 自主任务、"
+            "团队里各个角色，全都在这里。它们在独立线程里跑，**不影响主对话** —— "
+            "你可以一边让它打包，一边继续问别的问题。点一行看实时日志和产物。")
+        tip.setWordWrap(True)
+        tip.setObjectName("PageSub")
+        v.addWidget(tip)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["任务", "类型", "状态", "用时", "产物"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        for c in (1, 2, 3, 4):
+            self.table.horizontalHeader().setSectionResizeMode(
+                c, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._show)
+        v.addWidget(self.table, 2)
+
+        self.detail = QPlainTextEdit()
+        self.detail.setReadOnly(True)
+        self.detail.setPlaceholderText("选中上面任意一个任务，这里会显示它的实时日志与结果。")
+        v.addWidget(self.detail, 3)
+
+        row = QHBoxLayout()
+        self.cancel_btn = QPushButton("停止选中任务")
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.all_btn = QPushButton("停止全部")
+        self.all_btn.clicked.connect(self.cancel_all.emit)
+        self.clear_btn = QPushButton("清理已结束")
+        self.clear_btn.clicked.connect(self.clear_done.emit)
+        self.re_btn = QPushButton("刷新")
+        self.re_btn.clicked.connect(self.refresh.emit)
+        for b in (self.cancel_btn, self.all_btn, self.clear_btn, self.re_btn):
+            row.addWidget(b)
+        # 后台没有界面弹"确认执行这条命令"的框，所以**默认拒绝**命令类操作。
+        # 用户明确勾了这个开关才放行（危险命令在工具层仍会被单独拦截）。
+        self.allow_cb = QCheckBox("允许后台任务执行本地命令")
+        self.allow_cb.setToolTip(
+            "不勾：后台链路里的 run_command / 删除文件会被直接拒绝（更安全，默认）。\n"
+            "勾上：允许它们执行（危险命令如删除/格式化仍会被拦截）。")
+        self.allow_cb.toggled.connect(self.allow_cmd.emit)
+        row.addWidget(self.allow_cb)
+        row.addStretch(1)
+        self.path_lbl = QLabel("")
+        self.path_lbl.setObjectName("PageSub")
+        row.addWidget(self.path_lbl)
+        v.addLayout(row)
+
+    def bind(self, man):
+        self.man = man
+        if man is not None:
+            self.path_lbl.setText("记录目录：" + getattr(man, "dir", ""))
+        self.reload()
+
+    def set_allow_cmd(self, flag):
+        """由主窗口把设置里的值同步到复选框（别触发一轮信号回环）。"""
+        self.allow_cb.blockSignals(True)
+        self.allow_cb.setChecked(bool(flag))
+        self.allow_cb.blockSignals(False)
+
+    def _current_id(self):
+        it = self.table.currentItem()
+        if it is None:
+            return ""
+        row = it.row()
+        cell = self.table.item(row, 0)
+        return cell.data(Qt.ItemDataRole.UserRole) if cell else ""
+
+    def _cancel(self):
+        tid = self._current_id()
+        if tid:
+            self.cancel_one.emit(tid)
+
+    def reload(self):
+        if self.man is None:
+            return
+        keep = self._current_id()
+        tasks = self.man.list(limit=80)
+        self.table.setRowCount(len(tasks))
+        for r, t in enumerate(tasks):
+            s = t.snapshot(log_tail=0)
+            it = QTableWidgetItem(("" if s["status"] not in ("queued", "running")
+                                   else "▶ ") + (s["title"] or s["id"]))
+            it.setData(Qt.ItemDataRole.UserRole, s["id"])
+            self.table.setItem(r, 0, it)
+            self.table.setItem(r, 1, QTableWidgetItem(s["kind"]))
+            st = QTableWidgetItem(s["status_text"])
+            from PyQt6.QtGui import QColor
+            st.setForeground(QColor(_STATUS_COLOR.get(s["status"], "#333")))
+            self.table.setItem(r, 2, st)
+            self.table.setItem(r, 3, QTableWidgetItem(f"{s['elapsed']}s"))
+            self.table.setItem(r, 4, QTableWidgetItem(str(len(s["files"]))))
+            if s["id"] == keep:
+                self.table.selectRow(r)
+        active = sum(1 for t in tasks if t.status in ("queued", "running"))
+        self.hint.setText(f"共 {len(tasks)} 个任务，其中 {active} 个在跑/排队"
+                          if tasks else "还没有后台任务")
+        self._show()
+
+    def _show(self):
+        tid = self._current_id()
+        if self.man is None or not tid:
+            return
+        t = self.man.get(tid)
+        if t is None:
+            return
+        s = t.snapshot(log_tail=200)
+        lines = [f"{s['title']}   [{s['status_text']}]",
+                 f"任务号：{s['id']}    类型：{s['kind']}    用时：{s['elapsed']}s"]
+        if s["detail"]:
+            lines += ["", "指令/目标：", "  " + str(s["detail"])[:1500]]
+        if s["progress"]:
+            lines += ["", "当前：" + s["progress"]]
+        if s["files"]:
+            lines += ["", "产物："] + [f"  · {f['path']}（{f['size']} 字节）"
+                                       for f in s["files"]]
+        if s["error"]:
+            lines += ["", "错误：" + s["error"]]
+        if s["log"]:
+            lines += ["", "日志："] + ["  " + ln for ln in s["log"]]
+        if s["result"]:
+            lines += ["", "结果：", s["result"][:6000]]
+        self.detail.setPlainText("\n".join(lines))
+
+
+class TeamPage(QWidget):
+    """👥 团队：一键起一支"产品经理 + 架构师 + 工程师 + 测试 + 组长"的小队。"""
+
+    start_run = pyqtSignal(str, list, int)     # goal, roles, max_steps
+    cancel_run = pyqtSignal(str)
+    refresh = pyqtSignal()
+
+    ROLE_CHOICES = [
+        ("pm", "📋 产品经理"), ("arch", "🏗 架构师"), ("dev", "💻 工程师"),
+        ("qa", "🧪 测试工程师"), ("lead", "🧭 组长"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.man = None
+        self._cur = ""
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 18, 18, 18)
+        v.setSpacing(10)
+
+        head = QHBoxLayout()
+        self.title = QLabel("👥 团队协作")
+        self.title.setObjectName("PageTitle")
+        head.addWidget(self.title)
+        head.addStretch(1)
+        self.hint = QLabel("")
+        self.hint.setObjectName("PageSub")
+        head.addWidget(self.hint)
+        v.addLayout(head)
+
+        tip = QLabel(
+            "把一整件事交给一支小队：**产品经理**定需求与验收标准 → **架构师**出方案、"
+            "把活拆成互不重叠的几份 → **多个工程师并行实现**（各写各的目录，互不覆盖）→ "
+            "**测试工程师**独立验证 → **组长**汇总交付。全程在后台跑，你可以继续用主对话。")
+        tip.setWordWrap(True)
+        tip.setObjectName("PageSub")
+        v.addWidget(tip)
+
+        form = QHBoxLayout()
+        self.goal = QLineEdit()
+        self.goal.setPlaceholderText(
+            "要做的事（说清目标即可，拆活交给团队）…  例：做一个成绩统计小工具，"
+            "能读 Excel 并输出排名表")
+        form.addWidget(self.goal, 1)
+        self.steps = QSpinBox()
+        self.steps.setRange(2, 12)
+        self.steps.setValue(6)
+        self.steps.setPrefix("每人最多 ")
+        self.steps.setSuffix(" 步")
+        form.addWidget(self.steps)
+        self.n_dev = QSpinBox()
+        self.n_dev.setRange(1, 4)
+        self.n_dev.setValue(2)
+        self.n_dev.setPrefix("工程师 ")
+        self.n_dev.setSuffix(" 人")
+        form.addWidget(self.n_dev)
+        self.go_btn = QPushButton("🚀 组建团队开工")
+        self.go_btn.clicked.connect(self._start)
+        form.addWidget(self.go_btn)
+        v.addLayout(form)
+
+        body = QHBoxLayout()
+        self.runs = QListWidget()
+        self.runs.setMaximumWidth(260)
+        self.runs.currentRowChanged.connect(self._pick)
+        body.addWidget(self.runs)
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        body.addWidget(self.view, 1)
+        v.addLayout(body, 1)
+
+        row = QHBoxLayout()
+        self.stop_btn = QPushButton("停止这支队")
+        self.stop_btn.clicked.connect(self._stop)
+        self.re_btn = QPushButton("刷新")
+        self.re_btn.clicked.connect(self.refresh.emit)
+        row.addWidget(self.stop_btn)
+        row.addWidget(self.re_btn)
+        row.addStretch(1)
+        v.addLayout(row)
+
+    def bind(self, man):
+        self.man = man
+        self.reload()
+
+    def _start(self):
+        goal = self.goal.text().strip()
+        if not goal:
+            QMessageBox.information(self, "还差一步", "先写清楚要做的事，再组建团队。")
+            return
+        roles = ["pm", "arch", f"dev:{self.n_dev.value()}", "qa", "lead"]
+        self.start_run.emit(goal, roles, self.steps.value())
+        self.goal.clear()
+
+    def _stop(self):
+        if self._cur:
+            self.cancel_run.emit(self._cur)
+
+    def reload(self):
+        if self.man is None:
+            return
+        cur = self._cur
+        runs = self.man.list(limit=40)
+        self.runs.clear()
+        for r in runs:
+            s = r.snapshot()
+            icon = {"running": "▶", "done": "✅", "failed": "❌",
+                    "cancelled": "⛔"}.get(s["status"], "·")
+            it = QListWidgetItem(f"{icon} {s['goal'][:22]}\n   {s['id']}")
+            it.setData(Qt.ItemDataRole.UserRole, s["id"])
+            self.runs.addItem(it)
+            if s["id"] == cur:
+                self.runs.setCurrentRow(self.runs.count() - 1)
+        active = sum(1 for r in runs if r.status in ("queued", "running"))
+        self.hint.setText(f"共 {len(runs)} 支团队，{active} 支在跑" if runs else "还没跑过团队")
+        self._pick(self.runs.currentRow())
+
+    def _pick(self, row):
+        if self.man is None or row < 0:
+            return
+        it = self.runs.item(row)
+        if it is None:
+            return
+        rid = it.data(Qt.ItemDataRole.UserRole)
+        self._cur = rid
+        run = self.man.get(rid)
+        if run is None:
+            return
+        s = run.snapshot()
+        cards = []
+        for c in s["cards"]:
+            color = _STATUS_COLOR.get(c["status"], "#333")
+            files = ""
+            if c.get("files"):
+                files = ("<br><span style='color:#888'>产物："
+                         + "、".join(_esc(f["path"]) for f in c["files"][:8]) + "</span>")
+            note = (f"<span style='color:#888'> · {_esc(c['note'])}</span>"
+                    if c.get("note") else "")
+            body = _esc(str(c.get("text") or "")[:2500]).replace("\n", "<br>")
+            cards.append(
+                f"<div style='margin:6px 0;padding:8px 10px;border-left:3px solid {color}'>"
+                f"<b>{_esc(c['title'])}</b> "
+                f"<span style='color:{color}'>[{c['status']}]</span>{note}"
+                f"{files}<br><span style='color:#555'>{body}</span></div>")
+        head = (f"<h2>{_esc(s['goal'][:80])}</h2>"
+                f"<p style='color:#888'>{s['id']} · {s['status']} · 用时 {s['elapsed']}s"
+                f"<br>工作目录：{_esc(s['dir'])}</p>")
+        rep = ""
+        if s["report"]:
+            rep = ("<h3>组长汇总</h3><pre style='white-space:pre-wrap'>"
+                   + _esc(s["report"][:8000]) + "</pre>")
+        self.view.setHtml(head + "".join(cards) + rep)

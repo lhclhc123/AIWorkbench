@@ -5,9 +5,15 @@
 """
 import os
 import json
+import threading
 import time
 
 MAX_KEEP = 2000
+
+# ★ v9.16.0：一轮里多个工具会**并行**执行，它们会同时往同一个 jsonl 追加。
+#   Windows 下两个线程各自 open(...,"a") 写同一文件可能互相踩（甚至 PermissionError），
+#   而 _trim() 还会整体重写文件 —— 和追加撞上就是丢数据。加一把模块级锁最省事。
+_WRITE_LOCK = threading.RLock()
 
 
 class TraceLog:
@@ -32,8 +38,9 @@ class TraceLog:
             "extra": extra or {},
         }
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            with _WRITE_LOCK:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
         self._trim()
@@ -45,10 +52,11 @@ class TraceLog:
                 return
             if os.path.getsize(self.path) < 4 * 1024 * 1024:
                 return
-            with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-            with open(self.path, "w", encoding="utf-8") as f:
-                f.writelines(lines[-MAX_KEEP:])
+            with _WRITE_LOCK:
+                with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                with open(self.path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-MAX_KEEP:])
         except Exception:
             pass
 

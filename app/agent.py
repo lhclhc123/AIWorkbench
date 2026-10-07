@@ -57,6 +57,11 @@ KNOWN_TOOLS = (
     # 技能 / 定时任务 / 子代理
     "list_skills", "use_skill", "schedule_task", "list_tasks",
     "cancel_task", "run_task", "spawn_agent",
+    # ★ 并行后台任务 + 团队（v9.16.0）
+    #   ⚠️ 别和上面的定时任务撞名：`list_tasks` / `cancel_task` / `run_task`
+    #   已经被"定时任务"占了，所以后台任务一律用 bg_ 前缀。
+    "run_bg", "bg_list", "bg_status", "bg_wait", "bg_cancel",
+    "team_run", "team_status",
     # 工作总结
     "write_worklog", "read_worklog",
     # MCP
@@ -95,6 +100,26 @@ TOOL_ALIAS = {
     "batch_form": "web_form_batch", "query_site": "web_form_batch",
     "批量查询": "web_form_batch", "网站查询": "web_form_batch",
     "gh": "github", "github_api": "github", "git_hub": "github",
+    # 并行后台任务 + 团队（模型爱用的各种叫法）
+    "background": "run_bg", "run_background": "run_bg", "bg": "run_bg",
+    "async_run": "run_bg", "run_async": "run_bg", "parallel": "run_bg",
+    "background_run": "run_bg",
+    "后台执行": "run_bg", "后台运行": "run_bg", "并行执行": "run_bg",
+    "并行任务": "run_bg", "异步执行": "run_bg",
+    "bg_tasks": "bg_list", "list_bg": "bg_list", "background_list": "bg_list",
+    "后台任务": "bg_list", "任务列表": "bg_list",
+    "bg_check": "bg_status", "check_bg": "bg_status", "task_status": "bg_status",
+    "任务进度": "bg_status", "查看进度": "bg_status",
+    "bg_join": "bg_wait", "wait_bg": "bg_wait", "wait_task": "bg_wait",
+    "等待任务": "bg_wait", "等任务": "bg_wait",
+    "bg_stop": "bg_cancel", "kill_bg": "bg_cancel",
+    "停止任务": "bg_cancel", "取消后台任务": "bg_cancel",
+    "team": "team_run", "spawn_team": "team_run", "multi_agent": "team_run",
+    "agents": "team_run", "squad": "team_run", "tribe": "team_run",
+    "团队": "team_run", "多角色": "team_run", "工程团队": "team_run",
+    "组队": "team_run", "团队协作": "team_run", "多智能体": "team_run",
+    "team_progress": "team_status", "团队状态": "team_status",
+    "团队进度": "team_status",
     "bash": "run_command", "shell": "run_command",
     "worklog": "write_worklog", "work_log": "write_worklog",
     "summary": "write_worklog", "diary": "write_worklog",
@@ -467,6 +492,29 @@ _XMLARG_BARE_RE = re.compile(
 _XMLARG_NOARG_RE = re.compile(
     r"<tool_call>\s*([\w\u4e00-\u9fff][\w\-]*)\s*</tool_call>", re.IGNORECASE)
 _XMLARG_MAX_ARG = 200000
+
+# ---------------------------------------------------------------------------
+# 「把工具调用从正文里剔掉」的**唯一一份**正则（v9.16.0 起）。
+# 以前 chat_worker / main_window / markdown_render 各写一套，早晚漂移：
+#   · TOOL_BLOCK_RE：完整的 <tool_call>…</tool_call>
+#   · TOOL_BODY_RE ：漏写闭合的 XML 参数风调用 —— 只吃「调用本体」，
+#     ⚠️ 不能用 `<tool_call>.*$`：调用夹在正文中间时会**把后半段结论一起吃掉**，
+#        气泡直接变空（实测过）。
+# markdown_render 直接从这儿 import，别再抄第二份。
+# ---------------------------------------------------------------------------
+TOOL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+TOOL_BODY_RE = re.compile(
+    r"<tool_call>\s*[\w\u4e00-\u9fff][\w\-]*\s*"
+    r"(?:(?:<arg_key>.*?</arg_key>\s*)?<arg_value>.*?</arg_value>\s*)+"
+    r"(?:</tool_call>)?",
+    re.DOTALL)
+
+
+def strip_tool_text(text):
+    """把所有工具调用标记从一段文字里去掉，返回剩下的正文（已 strip）。"""
+    if not text:
+        return ""
+    return TOOL_BODY_RE.sub("", TOOL_BLOCK_RE.sub("", str(text))).strip()
 
 
 def _xmlarg_value(raw):
@@ -2280,8 +2328,20 @@ class AgentRunner:
                  search_cb=None, plan_cb=None, mcp_manager=None,
                  speak_cb=None, dingtalk_cb=None, update_cb=None,
                  reminder_cb=None, keys=None, subagent_cb=None,
-                 dingtalk_api_cb=None):
+                 dingtalk_api_cb=None, taskman=None, team_cb=None,
+                 bg_agent_cb=None, teamman=None):
         self.files_dir = files_dir
+        # 后台任务管理器（v9.16.0）：run_bg / bg_* 工具靠它把活儿甩到后台线程，
+        # 自己立刻返回，从而"跑慢命令不阻塞模型继续思考"。UI 层注入。
+        self.taskman = taskman
+        # team_cb(goal, roles, max_steps) -> TeamRun 或提示文本；UI 层注入
+        # （团队引擎需要真实模型客户端，所以放在 UI 层构造）。
+        self.team_cb = team_cb
+        # 团队管理器（team_status 查进度用）
+        self.teamman = teamman
+        # bg_agent_cb(task, title, max_steps) -> {"text","files"}，
+        # 让"后台 AI 自主跑一条链路"（run_bg kind=agent）能用。UI 层注入。
+        self.bg_agent_cb = bg_agent_cb
         # vision_cb(image_path, prompt) -> str，用于图片识别（由 UI 层注入，带 LLM 客户端）
         self.vision_cb = vision_cb
         # search_cb(query) -> str，联网搜索（由 UI 层注入，用带联网能力的模型）
@@ -2356,8 +2416,18 @@ class AgentRunner:
     def attach_subsystems(self, vision_cb=None, search_cb=None, plan_cb=None,
                           mcp_manager=None, speak_cb=None, dingtalk_cb=None,
                           update_cb=None, reminder_cb=None, keys=None,
-                          subagent_cb=None, dingtalk_api_cb=None):
+                          subagent_cb=None, dingtalk_api_cb=None,
+                          taskman=None, team_cb=None, bg_agent_cb=None,
+                          teamman=None):
         """工作区切换后重新挂接回调。"""
+        if taskman is not None:
+            self.taskman = taskman
+        if team_cb is not None:
+            self.team_cb = team_cb
+        if teamman is not None:
+            self.teamman = teamman
+        if bg_agent_cb is not None:
+            self.bg_agent_cb = bg_agent_cb
         if vision_cb is not None:
             self.vision_cb = vision_cb
         if search_cb is not None:
@@ -2494,6 +2564,300 @@ class AgentRunner:
         except Exception:
             pass
         return out
+
+    # =====================================================================
+    # 并行后台任务 + 团队（v9.16.0）
+    #
+    # ★ 核心纪律：下面这些工具**必须立刻返回**，绝不能在这里等任务跑完 ——
+    #   否则就又变成"跑一条慢命令卡住整条对话"，正是这一版要解决的问题。
+    #   只有 `bg_wait` 是有意等待的（而且给了 120 秒上限），用于"我确实需要结果
+    #   才能继续"的场合。
+    # =====================================================================
+    def _bg_ready(self):
+        if self.taskman is None:
+            return ("[错误] 当前环境没有挂接后台任务管理器（需要新版界面层支持）。")
+        return ""
+
+    def _tool_run_bg(self, args):
+        """把一个活儿甩到后台跑，立刻返回任务号。"""
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        import json as _json
+
+        if not isinstance(args, dict):
+            args = {}
+        cmd = str(args.get("command") or "").strip()
+        code = str(args.get("code") or "").strip()
+        task_txt = str(args.get("task") or args.get("prompt") or "").strip()
+        goal = str(args.get("goal") or "").strip()
+        kind = str(args.get("kind") or "").strip().lower()
+        if kind in ("cmd", "shell", "bash"):
+            kind = "command"
+        if kind in ("py", "python3"):
+            kind = "python"
+        if not kind:
+            # 按给了什么自动判断，别让模型为"填哪个 kind"卡住
+            if cmd:
+                kind = "command"
+            elif code:
+                kind = "python"
+            elif goal:
+                kind = "team"
+            elif task_txt:
+                kind = "agent"
+        title = str(args.get("title") or "").strip()
+        try:
+            timeout = int(float(args.get("timeout") or 600))
+        except Exception:
+            timeout = 600
+        timeout = max(10, min(timeout, 3600))
+        try:
+            max_steps = int(float(args.get("max_steps") or 8))
+        except Exception:
+            max_steps = 8
+        max_steps = max(2, min(max_steps, 20))
+
+        # ---- 危险命令照样拦（后台跑不等于可以乱来）----
+        if kind == "command":
+            if not cmd:
+                return "[错误] kind=command 需要 command 参数（要跑的命令）"
+            if _is_dangerous(cmd):
+                return "[拒绝] 该命令过于危险，已被拦截（删除/格式化/关机等）。"
+            wn = window_spawning(cmd)
+            if wn:
+                return (f"[拒绝] 这条命令会新开窗口：{wn}\n"
+                        "请改成不弹窗的写法（直接跑脚本 / 用 run_python）。")
+            from . import taskman as _tm
+            t = self.taskman.submit(
+                "command", title or f"后台命令：{cmd[:36]}",
+                _tm.make_command_fn(cmd, cwd=self.files_dir, timeout=timeout),
+                detail=cmd, dedup_key="cmd:" + cmd)
+            return (f"[已提交] 后台任务 {t.id}（命令）已在后台开始跑，**你现在不用等它**。\n"
+                    f"命令行：`{cmd[:160]}`\n"
+                    f"接下来你可以继续做别的事；需要结果时用 bg_status/bg_wait 查 {t.id}。")
+
+        if kind == "python":
+            if not code:
+                return "[错误] kind=python 需要 code 参数（要执行的 Python 代码）"
+            from . import taskman as _tm
+            t = self.taskman.submit(
+                "python", title or "后台 Python",
+                _tm.make_python_fn(code, cwd=self.files_dir, timeout=timeout),
+                detail=code[:200], dedup_key="py:" + code[:120])
+            return (f"[已提交] 后台任务 {t.id}（Python）已在后台开始跑，**你现在不用等它**。\n"
+                    f"可以继续做别的事，需要结果时用 bg_status/bg_wait 查 {t.id}。")
+
+        if kind == "agent":
+            if not task_txt:
+                return "[错误] kind=agent 需要 task 参数（让这个后台 AI 去做什么）"
+            if not getattr(self, "bg_agent_cb", None):
+                return ("[错误] 当前环境没有挂接后台 AI 执行器"
+                        "（后台 AI 需要模型客户端支持）。")
+            from . import taskman as _tm
+            holder = {}
+            cb = self.bg_agent_cb
+
+            def _fn(task=None):
+                if task is not None:
+                    task.log_line("后台 AI 开始")
+                res = cb(task_txt, title or task_txt[:30], max_steps)
+                holder["r"] = res
+                if isinstance(res, dict):
+                    for f in (res.get("files") or []):
+                        if task is not None and f.get("path"):
+                            task.add_file(f["path"])
+                    return res.get("text", "")
+                return str(res)
+
+            t = self.taskman.submit("agent", title or f"后台 AI：{task_txt[:36]}",
+                                    _fn, detail=task_txt[:300],
+                                    dedup_key="agent:" + task_txt[:160])
+            return (f"[已提交] 后台任务 {t.id}（AI 自主执行）正在后台跑，**你现在不用等它**。\n"
+                    f"任务：{task_txt[:200]}\n"
+                    f"你可以同时再派别的任务；需要结果时用 bg_status/bg_wait 查 {t.id}。")
+
+        if kind == "team":
+            if not goal:
+                return ("[错误] kind=team 需要 goal 参数（把要做的整件事说清楚，"
+                        "团队会自己拆活儿）")
+            return self._tool_team_run({"goal": goal, "roles": args.get("roles"),
+                                        "max_steps": max_steps,
+                                        "title": title})
+
+        return ("[错误] 认不出要跑什么。请给 command（命令）/ code（Python）/ "
+                "task（让后台 AI 做的事）/ goal（交给团队的目标）其中之一。")
+
+    def _tool_bg_list(self, args):
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        try:
+            limit = int(float((args or {}).get("limit") or 20))
+        except Exception:
+            limit = 20
+        only_active = bool((args or {}).get("active_only"))
+        ts = self.taskman.list(limit=limit, active_only=only_active)
+        if not ts:
+            return "当前没有后台任务。"
+        lines = [f"后台任务（共 {len(ts)} 个，正在跑/排队 {self.taskman.running_count()} 个）："]
+        for t in ts:
+            lines.append("  · " + t.summary())
+        lines.append("")
+        lines.append("查详情用 bg_status(id)；等它跑完用 bg_wait(id)；不想跑了用 bg_cancel(id)。")
+        return "\n".join(lines)
+
+    def _tool_bg_status(self, args):
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        tid = str((args or {}).get("id") or (args or {}).get("task_id") or "").strip()
+        if not tid:
+            return ("[错误] 需要 id 参数。可以先 bg_list 看有哪些任务；"
+                    "或者不给 id 时会返回所有正在跑的任务。")
+        t = self.taskman.get(tid)
+        if t is None:
+            return f"[错误] 没有这个后台任务：{tid}（用 bg_list 看现有任务号）"
+        s = t.snapshot(log_tail=int((args or {}).get("log_lines") or 30))
+        out = [f"任务 {s['id']}｜{s['status_text']}｜{s['title']}",
+               f"用时 {s['elapsed']}s" + (f"｜{s['progress']}" if s["progress"] else "")]
+        if s["files"]:
+            out.append("产物：")
+            out += [f"  · {f['path']}（{f['size']} 字节）" for f in s["files"]]
+        if s["error"]:
+            out.append("错误：" + s["error"])
+        if s["log"]:
+            out.append("最近日志：")
+            out += ["  " + ln for ln in s["log"]]
+        if s["status"] in ("queued", "running"):
+            out.append("")
+            out.append("（还在跑。你可以先去做别的，稍后再查；"
+                       "或用 bg_wait 等它结束。）")
+        elif s["result"]:
+            out.append("")
+            out.append("结果：")
+            out.append(s["result"][:4000])
+        return "\n".join(out)
+
+    def _tool_bg_wait(self, args):
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        raw = (args or {}).get("ids") or (args or {}).get("id") \
+            or (args or {}).get("task_id")
+        if isinstance(raw, str):
+            ids = [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
+        elif isinstance(raw, (list, tuple)):
+            ids = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            return "[错误] 需要 id 或 ids 参数（要等哪些后台任务）"
+        try:
+            timeout = int(float((args or {}).get("timeout") or 60))
+        except Exception:
+            timeout = 60
+        # ★ 上限 120 秒：等太久又变成"卡住不动"了，那就违背了后台任务的初衷
+        timeout = max(5, min(timeout, 120))
+        parts = []
+        for tid in ids[:8]:
+            t = self.taskman.get(tid)
+            if t is None:
+                parts.append(f"· {tid}：不存在")
+                continue
+            done = self.taskman.wait(tid, timeout=timeout)
+            if done is None:
+                parts.append(f"· {tid}：等了 {timeout}s 还没结束（{t.status}）；"
+                             f"你可以先干别的，稍后再查")
+            else:
+                parts.append(f"· {tid}｜{t.status}｜{t.title}\n{t.result[:2000] or '（无输出）'}")
+        return "等待结果：\n" + "\n\n".join(parts)
+
+    def _tool_bg_cancel(self, args):
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        tid = str((args or {}).get("id") or (args or {}).get("task_id") or "").strip()
+        if tid in ("", "all", "*"):
+            n = self.taskman.cancel_all()
+            return f"已请求取消全部后台任务（{n} 个）。"
+        if not self.taskman.cancel(tid):
+            return (f"[错误] 取消失败：{tid} 不存在或已经结束了。"
+                    "（用 bg_list 看还在跑的任务号）")
+        return f"已请求取消 {tid}（正在跑的进程会被一起结束）。"
+
+    def _tool_team_run(self, args):
+        miss = self._bg_ready()
+        if miss:
+            return miss
+        if not getattr(self, "team_cb", None):
+            return ("[错误] 当前环境没有挂接团队执行器（团队需要模型客户端支持）。")
+        goal = str((args or {}).get("goal") or (args or {}).get("task")
+                   or (args or {}).get("requirement") or "").strip()
+        if not goal:
+            return ("[错误] 需要 goal 参数：把用户要做的整件事描述清楚"
+                    "（团队会自己拆需求、出方案、并行实现、再验证）。")
+        roles = (args or {}).get("roles")
+        if isinstance(roles, str):
+            roles = [r.strip() for r in roles.replace("，", ",").split(",") if r.strip()]
+        try:
+            max_steps = int(float((args or {}).get("max_steps") or 6))
+        except Exception:
+            max_steps = 6
+        max_steps = max(2, min(max_steps, 12))
+        try:
+            res = self.team_cb(goal, roles, max_steps)
+        except Exception as exc:                       # noqa: BLE001
+            return f"[错误] 团队启动失败：{type(exc).__name__}: {exc}"
+        if isinstance(res, str):
+            return res
+        rid = getattr(res, "id", "")
+        return (f"[已启动] 团队 {rid} 已经开始干活（**不影响你继续对话**）。\n"
+                f"角色编排：产品经理定需求 → 架构师拆任务 → 工程师**并行**实现 → "
+                f"测试工程师验证 → 组长汇总。\n"
+                f"目标：{goal[:200]}\n"
+                f"你可以先干别的；看进度用 team_status，结果会写进 "
+                f"`team/{rid}/report.md`。")
+
+    def _tool_team_status(self, args):
+        tm = getattr(self, "teamman", None)
+        if tm is None:
+            return "[错误] 当前环境没有团队管理器。"
+        rid = str((args or {}).get("id") or (args or {}).get("run_id") or "").strip()
+        if not rid:
+            runs = tm.list(limit=10)
+            if not runs:
+                return "还没有跑过团队。可以用 team_run(goal=\"要做的事\") 起一支。"
+            out = ["最近几支团队："]
+            for r in runs:
+                s = r.snapshot()
+                out.append(f"  · {s['id']}｜{s['status']}｜用时 {s['elapsed']}s｜{s['goal'][:40]}")
+            out.append("")
+            out.append("看某支的详情：team_status(id=\"...\")")
+            return "\n".join(out)
+        run = tm.get(rid)
+        if run is None:
+            return f"[错误] 没有这支团队：{rid}"
+        s = run.snapshot()
+        out = [f"团队 {s['id']}｜{s['status']}｜用时 {s['elapsed']}s",
+               f"目标：{s['goal'][:200]}", "各角色："]
+        for c in s["cards"]:
+            line = f"  · {c['title']}｜{c['status']}"
+            if c.get("note"):
+                line += f"｜{c['note']}"
+            if c.get("files"):
+                line += f"｜产物 {len(c['files'])} 个"
+            out.append(line)
+            if c.get("text") and c["status"] in ("done", "failed"):
+                out.append("      " + str(c["text"]).replace("\n", " ")[:220])
+        out.append("")
+        out.append(f"工作目录：{s['dir']}")
+        if s["report"]:
+            out.append("")
+            out.append("组长汇总：")
+            out.append(s["report"][:4000])
+        elif s["status"] in ("running", "queued"):
+            out.append("")
+            out.append("（还在跑。团队各角色在后台并行执行，你可以继续别的事。）")
+        return "\n".join(out)
 
     def _dispatch(self, name, args, confirm_cb):
         """真正干活的派发逻辑。confirm_cb(cmd)->bool 用于命令/删除/杀进程确认。"""
@@ -3832,6 +4196,22 @@ class AgentRunner:
                     steps = 6
                 res = self.subagent_cb(task, steps)
                 return f"[成功] 子代理完成（最多 {steps} 步）：\n{res}"
+
+            # ---------- 并行后台任务 + 团队（v9.16.0）----------
+            elif name == "run_bg":
+                return self._tool_run_bg(args)
+            elif name == "bg_list":
+                return self._tool_bg_list(args)
+            elif name == "bg_status":
+                return self._tool_bg_status(args)
+            elif name == "bg_wait":
+                return self._tool_bg_wait(args)
+            elif name == "bg_cancel":
+                return self._tool_bg_cancel(args)
+            elif name == "team_run":
+                return self._tool_team_run(args)
+            elif name == "team_status":
+                return self._tool_team_status(args)
 
             else:
                 low = (name or "").lower().replace("-", "_")

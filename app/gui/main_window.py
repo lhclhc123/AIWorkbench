@@ -30,7 +30,8 @@ from .. import (config, llm_client, workspace as ws_mod, agent as agent_mod,
                 dingtalk as dt_mod, updater, version as ver,
                 skills as skills_mod, scheduler as _sched_mod,
                 hotkey as _hotkey_mod, worklog as _worklog_mod,
-                assistant as assistant_mod)
+                assistant as assistant_mod,
+                taskman as _taskman_mod, team as _team_mod)
 from ..deepseek_web import service as _dsw_service
 from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
@@ -41,7 +42,8 @@ from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
-                    SkillsPage, TasksPage, AssistantPage, PAGES)
+                    SkillsPage, TasksPage, AssistantPage, PAGES,
+                    BgTasksPage, TeamPage)
 
 RADIUS_CARD = 12
 
@@ -105,6 +107,10 @@ class MainWindow(QMainWindow):
     _dsw_selftest_ready = pyqtSignal(list)
     # GitHub 检测（v9.15.0）
     _gh_status_ready = pyqtSignal(bool, str)
+    # 并行任务 / 团队（v9.16.0）：后台线程改了任务状态 -> 通知界面刷新
+    _bg_changed = pyqtSignal(str)          # 传任务号（只用于区分，界面整体刷新）
+    _team_changed = pyqtSignal(str)
+    _bg_notice = pyqtSignal(str)           # 后台 AI/团队完成后的提示
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
@@ -142,6 +148,20 @@ class MainWindow(QMainWindow):
         self._dsw_selftest_ready.connect(self._dsw_on_selftest)
         self.memory = memory_mod.MemoryStore(self.workspace.path)
         self.trace = trace_mod.TraceLog(self.workspace.path)
+        # ---- 并行任务 + 团队（v9.16.0）----
+        # 用户要的是"跑慢命令不阻塞模型继续思考 / 多条链路同时执行 / 一支小队独立跑"。
+        # 这里建两个管理器，并把它们的变更接到 Qt 信号上 ——
+        # ⚠️ 回调是在**后台线程**里触发的，绝不能直接去摸控件，必须转成信号
+        #    （队列连接）再在 UI 线程刷新，否则就是随机崩。
+        self.taskman = _taskman_mod.TaskManager(
+            self.workspace.path,
+            max_running=int(self.settings.get("bg_max_parallel", 4) or 4))
+        self.teamman = _team_mod.TeamManager(self.workspace.path)
+        self.taskman.subscribe(self._on_bg_changed)
+        self.teamman.subscribe(self._on_team_changed)
+        self._bg_changed.connect(self._refresh_bg_pages)
+        self._team_changed.connect(self._refresh_team_pages)
+        self._bg_notice.connect(self._on_bg_notice)
         self.mcp = mcp_client.MCPManager(self.workspace.path)
         self.speaker = tts_mod.Speaker()
         self.speaker.engine = self.settings.get("tts_engine", "sapi")
@@ -672,6 +692,20 @@ class MainWindow(QMainWindow):
         self.page_tools = TracePage()
         self.stack.addWidget(self.page_tools)
 
+        self.page_bg = BgTasksPage()
+        self.stack.addWidget(self.page_bg)
+        self.page_bg.cancel_one.connect(self._bg_cancel_one)
+        self.page_bg.cancel_all.connect(self._bg_cancel_all)
+        self.page_bg.clear_done.connect(self._bg_clear_done)
+        self.page_bg.refresh.connect(lambda: self.page_bg.reload())
+        self.page_bg.allow_cmd.connect(self._bg_set_allow_cmd)
+
+        self.page_team = TeamPage()
+        self.stack.addWidget(self.page_team)
+        self.page_team.start_run.connect(self._team_start)
+        self.page_team.cancel_run.connect(self._team_cancel)
+        self.page_team.refresh.connect(lambda: self.page_team.reload())
+
         self.page_integrations = IntegrationPage()
         self.stack.addWidget(self.page_integrations)
         self.page_integrations.dingtalk_saved.connect(self._save_dingtalk)
@@ -984,6 +1018,12 @@ class MainWindow(QMainWindow):
             self.page_memory.bind(self.memory, self.workspace.path)
         elif key == "tools":
             self.page_tools.bind(self.trace)
+        elif key == "bg":
+            self.page_bg.bind(self.taskman)
+            self.page_bg.set_allow_cmd(
+                bool(self.settings.get("bg_allow_commands", False)))
+        elif key == "team":
+            self.page_team.bind(self.teamman)
         elif key == "integrations":
             self.page_integrations.load_dingtalk(self._ding_cfg())
             self.page_integrations.load_update(self.settings)
@@ -1010,6 +1050,8 @@ class MainWindow(QMainWindow):
             update_cb=self._update_text,
             reminder_cb=self._add_reminder,
             subagent_cb=self._run_subagent,
+            taskman=self.taskman, team_cb=self._team_start_sync,
+            teamman=self.teamman, bg_agent_cb=self._bg_agent_run,
             keys=self.settings.get("api_keys", {}))
         # 让工具层也能读到设置（比如「禁止弹出新窗口」开关）
         r.settings = self.settings
@@ -1145,6 +1187,231 @@ class MainWindow(QMainWindow):
             pass
 
     # ================= 后台无人值守执行（定时任务 / 子代理） =================
+    # =====================================================================
+    # 并行任务 + 团队（v9.16.0）
+    # 用户原话：「模型在跑我本地命令的时候不影响它继续思考，也可以多条链路
+    # 同时执行」「增加一个像 WorkBuddy 这样的团队的功能，各个工程师、产品经理
+    # 独立跑，不影响主进程」。
+    #
+    # 这一段的职责就一句话：**把活儿甩到后台线程，然后立刻回来**。
+    # 界面只订阅状态、在 UI 线程刷新，绝不在后台线程里碰控件。
+    # =====================================================================
+    def _on_bg_changed(self, task, light=False):
+        """后台线程回调：转成 Qt 信号（队列连接），回到 UI 线程再刷新。
+
+        ⚠️ 这里必须节流：打包这类任务的日志每秒可能几百行，
+           每行都刷一次表格会把 UI 线程淹掉（表现就是"界面卡了"）。
+           状态变化（light=False）不节流 —— 那是用户最需要马上看到的。
+        """
+        try:
+            if light:
+                now = time.time()
+                if now - getattr(self, "_bg_last_ui", 0) < 0.4:
+                    return
+                self._bg_last_ui = now
+            self._bg_changed.emit(task.id if task else "")
+        except Exception:
+            pass
+
+    def _on_team_changed(self, run):
+        try:
+            self._team_changed.emit(getattr(run, "id", ""))
+        except Exception:
+            pass
+
+    def _refresh_bg_pages(self, _tid=""):
+        try:
+            if getattr(self, "page_bg", None) is not None and \
+                    self.stack.currentWidget() is self.page_bg:
+                self.page_bg.reload()
+            n = self.taskman.running_count()
+            if n:
+                self.statusBar().showMessage(f"⚡ 后台有 {n} 个任务在跑")
+        except Exception:
+            pass
+
+    def _refresh_team_pages(self, _rid=""):
+        try:
+            if getattr(self, "page_team", None) is not None and \
+                    self.stack.currentWidget() is self.page_team:
+                self.page_team.reload()
+        except Exception:
+            pass
+
+    def _on_bg_notice(self, text):
+        try:
+            self.statusBar().showMessage(str(text)[:180], 8000)
+        except Exception:
+            pass
+
+    # ---------- 取消 / 清理 ----------
+    def _bg_cancel_one(self, tid):
+        self.taskman.cancel(tid)
+        self.page_bg.reload()
+
+    def _bg_cancel_all(self):
+        n = self.taskman.cancel_all()
+        self.page_bg.reload()
+        self.statusBar().showMessage(f"已请求取消 {n} 个后台任务", 5000)
+
+    def _bg_clear_done(self):
+        self.taskman.clear_finished()
+        self.page_bg.reload()
+
+    def _bg_set_allow_cmd(self, flag):
+        self.settings["bg_allow_commands"] = bool(flag)
+        try:
+            self.workspace.save_settings(self.settings)
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            "后台任务：允许执行本地命令" if flag else
+            "后台任务：不允许执行本地命令（默认，更安全）", 5000)
+
+    # ---------- 后台 AI：一条独立链路 ----------
+    def _bg_agent_confirm(self, cmd):
+        """后台任务里的命令确认。
+
+        后台没有界面可以弹确认框 —— 于是：
+          · 默认**拒绝**并记进任务日志（宁可不做，也不偷偷跑用户没看过的命令）；
+          · 用户在「并行任务」页勾了"允许后台执行命令"才放行（危险命令在
+            run_command 内部仍会被 _is_dangerous / window_spawning 拦掉）。
+        """
+        allow = bool(self.settings.get("bg_allow_commands", False))
+        try:
+            cur = self.taskman.list(active_only=True)
+            if cur:
+                cur[0].log_line(("允许" if allow else "已拒绝（后台默认不跑命令）")
+                                + f"命令：{cmd[:120]}")
+        except Exception:
+            pass
+        return allow
+
+    def _bg_agent_run(self, task_text, title="", max_steps=8):
+        """在**当前线程**（后台任务线程）里跑一条独立 AI 链路，返回 {"text","files"}。
+
+        为什么要自己建 client：`self.bg_client` 是共享实例，多个后台 AI 同时用它
+        会互相抢状态（模型选择、取消标志、流式回调）。**每条链路一个客户端**才干净。
+        """
+        import uuid as _uuid
+        tag = time.strftime("%m%d-%H%M") + "-" + _uuid.uuid4().hex[:4]
+        base = os.path.join(self.workspace.path, "bgagent", tag)
+        files_dir = os.path.join(base, "files")
+        os.makedirs(files_dir, exist_ok=True)
+
+        cli = llm_client.LLMClient()
+        try:
+            cli.policy = getattr(self.client, "policy", "strict")
+            cli.set_keys(self.settings.get("api_keys", {}))
+            cli.set_web_gate(self.dsw.auto_ready)
+        except Exception:
+            pass
+
+        runner = agent_mod.AgentRunner(
+            files_dir, workspace_path=base,
+            search_cb=lambda q: cli.web_search(q),
+            mcp_manager=getattr(self, "mcp", None),
+            keys=self.settings.get("api_keys", {}),
+            taskman=self.taskman, teamman=self.teamman,
+            team_cb=self._team_start_sync, bg_agent_cb=self._bg_agent_run)
+        runner.settings = self.settings
+        runner.written = []
+
+        sys_prompt = self._build_system_prompt()
+        sys_prompt += (
+            "\n\n【你现在是后台自主链路（v9.16）】\n"
+            "- 你在**独立线程**里跑，用户不会实时看到你的每一步，所以最后必须"
+            "用一段清楚的中文说明你做了什么、文件在哪。\n"
+            "- 你的工作目录是独立沙箱，写文件用相对路径即可。\n"
+            "- ⚠️ 你**不能执行需要用户确认的危险操作**（run_command / 删除文件）："
+            "这类调用会被直接拒绝。要跑代码请用 run_python。\n"
+            "- 不要编造结果；没做到就如实说没做到。"
+        )
+        msgs = [{"role": "system", "content": sys_prompt},
+                {"role": "user", "content": task_text}]
+        model_sel = self.settings.get("selected_model", "auto")
+        tools_used, last = set(), ""
+        for _ in range(max(1, min(int(max_steps or 8), 20))):
+            try:
+                text = cli.chat(msgs, model_sel, False, None, 150)
+            except Exception as exc:                   # noqa: BLE001
+                last = f"[错误] 模型调用失败：{type(exc).__name__}: {exc}"
+                break
+            text = text or ""
+            calls = agent_mod.parse_tool_calls(text, limit=3)
+            clean = agent_mod.strip_tool_text(text)
+            if clean:
+                last = clean
+            if not calls:
+                break
+            fb = []
+            for call in calls:
+                nm = runner.canonical_name(call.get("name"))
+                try:
+                    res = runner.execute(call, self._bg_agent_confirm)
+                except Exception as exc:               # noqa: BLE001
+                    res = f"[错误] {type(exc).__name__}: {exc}"
+                tools_used.add(nm)
+                fb.append(f"[工具 {nm} 返回]\n{str(res)[:4000]}")
+            msgs.append({"role": "assistant", "content": text})
+            msgs.append({"role": "user",
+                         "content": "\n\n".join(fb) +
+                         "\n\n（继续；如果任务已完成就直接给出最终答复文字。）"})
+        files = []
+        for w in (runner.written or []):
+            p = w.get("path") if isinstance(w, dict) else w
+            if not p:
+                continue
+            try:
+                files.append({"path": p, "size": os.path.getsize(p)})
+            except Exception:
+                files.append({"path": p, "size": 0})
+        body = (last or "（没有产出文字结论）")
+        return {"text": body,
+                "files": files,
+                "dir": base,
+                "tools": sorted(tools_used)}
+
+    # ---------- 团队 ----------
+    def _team_start(self, goal, roles=None, max_steps=6):
+        """起一支团队：立刻返回 TeamRun，真正的执行在后台任务里。"""
+        run = self.teamman.create(goal, self._bg_agent_run,
+                                  taskman=self.taskman,
+                                  roles=roles, max_steps=max_steps)
+        holder = {}
+
+        def _fn(task=None):
+            if task is not None:
+                task.log_line(f"团队 {run.id} 开始编排")
+            rep = run.run()
+            holder["r"] = rep
+            files = []
+            for c in run.cards.values():
+                for f in (c.get("files") or []):
+                    files.append({"path": f.get("path"), "size": f.get("size", 0)})
+            if task is not None:
+                for f in files:
+                    if f.get("path"):
+                        task.add_file(f["path"])
+            self._bg_notice.emit(f"团队 {run.id} 已结束（{run.status}）")
+            return rep or "（团队无汇总）"
+
+        self.taskman.submit("team", f"团队：{goal[:40]}", _fn,
+                            detail=goal[:300],
+                            dedup_key=f"teamrun:{run.id}")
+        return run
+
+    # 供工具层调用（同名不同用途，保持一处实现）
+    def _team_start_sync(self, goal, roles=None, max_steps=6):
+        return self._team_start(goal, roles, max_steps)
+
+    def _team_cancel(self, rid):
+        run = self.teamman.get(rid)
+        if run is not None:
+            run.cancel()
+            self.page_team.reload()
+            self.statusBar().showMessage(f"已请求停止团队 {rid}", 5000)
+
     def _plain_runner(self, allow_subagent=True):
         """给后台线程用的 AgentRunner：只挂不碰界面的回调。"""
         def _sub(task, steps=6):
@@ -1158,6 +1425,8 @@ class MainWindow(QMainWindow):
             mcp_manager=getattr(self, "mcp", None),
             dingtalk_cb=self._dingtalk,
             keys=self.settings.get("api_keys", {}),
+            taskman=self.taskman, teamman=self.teamman,
+            team_cb=self._team_start_sync, bg_agent_cb=self._bg_agent_run,
             subagent_cb=(_sub if allow_subagent else None))
 
     def _agent_run_once(self, prompt, max_iter=8, quiet=False,
@@ -1421,6 +1690,23 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.trace = trace_mod.TraceLog(self.workspace.path)
+        # ★ 换工作区：后台任务 / 团队也换数据目录（旧任务继续在旧目录里跑完，
+        #   不强行掐断 —— 掐断可能打断用户正在等的一次打包）。订阅要重挂。
+        try:
+            self.taskman = _taskman_mod.TaskManager(
+                self.workspace.path,
+                max_running=int(self.settings.get("bg_max_parallel", 4) or 4))
+            self.teamman = _team_mod.TeamManager(self.workspace.path)
+            self.taskman.subscribe(self._on_bg_changed)
+            self.teamman.subscribe(self._on_team_changed)
+            if getattr(self, "page_bg", None) is not None:
+                self.page_bg.bind(self.taskman)
+                self.page_bg.set_allow_cmd(
+                    bool(self.settings.get("bg_allow_commands", False)))
+            if getattr(self, "page_team", None) is not None:
+                self.page_team.bind(self.teamman)
+        except Exception:
+            pass
         self.mcp = mcp_client.MCPManager(self.workspace.path)
         self.skills = skills_mod.SkillStore(self.workspace.path)
         # 换工作区 -> 调度器换数据文件（先停旧的，避免两个线程同时写）

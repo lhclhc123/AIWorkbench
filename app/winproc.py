@@ -136,3 +136,34 @@ def popen(args, **kw):
     merged.update(kw)
     _log_spawn(args, merged)
     return subprocess.Popen(args, **merged)
+
+
+def kill_tree(proc):
+    """杀掉一个子进程**连同它的所有子孙**，返回是否成功。
+
+    为什么不能只 proc.kill()：后台任务跑的可能是 `npm run build` 这种
+    "壳进程 + 真干活的孙进程"结构，只杀壳的话孙进程会变成孤儿继续跑，
+    用户点了"取消"却发现磁盘还在转。Windows 上用 taskkill /T 才能连根拔。
+
+    ⚠️ 这里必须走 subprocess.run 而不是 self.run()，避免 taskkill 失败时
+       又去记一条 spawn 日志、递归调用自己。
+    """
+    if proc is None:
+        return False
+    ok = False
+    try:
+        if IS_WIN and getattr(proc, "pid", None):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, **no_window_kwargs())
+            ok = True
+    except Exception:
+        ok = False
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+            ok = True
+        except Exception:
+            pass
+    return ok
