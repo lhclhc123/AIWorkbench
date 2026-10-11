@@ -166,7 +166,40 @@ QStatusBar {{ background: {t['status_bg']}; color: {t['accent_text']}; }}
 QToolTip {{ color: {t['text']}; background: {t['panel_bg']}; border: 1px solid {t['border']}; }}
 
 /* ---------- v9：侧边导航 ---------- */
-QWidget#NavRail {{ background: {t['nav_bg']}; border-right: 1px solid {t['nav_border']}; }}
+/* ---------- v9.18.0（需求 10）：全局侧栏 + 几行导航小格子 ---------- */
+/* 侧栏是窗口最左那一列：上半部是导航格子，下半部是对话列表。 */
+QWidget#SidePanel {{
+    background: {t['nav_bg']};
+    border-right: 1px solid {t['nav_border']};
+}}
+/* 导航区自身透明，底色由 SidePanel 提供，避免两层色块叠出色差 */
+QWidget#NavRail {{ background: transparent; }}
+/* 第一行「对话」：常驻高亮，一眼能回到主战场 */
+QPushButton#NavHome {{
+    background: {t['nav_active_bg']}; color: {t['nav_active_text']};
+    border: none; border-radius: 10px; padding: 8px 6px;
+    font-size: 13px; font-weight: bold; text-align: center;
+}}
+QPushButton#NavHome:hover {{ background: {t['nav_hover_bg']}; }}
+QPushButton#NavHome:checked {{
+    background: {t['nav_active_bg']}; color: {t['nav_active_text']};
+}}
+/* 其余功能页：3 列小格子，紧凑、不抢戏 */
+QPushButton#NavChip {{
+    background: transparent; color: {t['nav_text']}; border: none;
+    border-radius: 9px; padding: 6px 2px; font-size: 12px; text-align: center;
+}}
+QPushButton#NavChip:hover {{ background: {t['nav_hover_bg']}; color: {t['text']}; }}
+QPushButton#NavChip:checked {{
+    background: {t['nav_active_bg']}; color: {t['nav_active_text']}; font-weight: bold;
+}}
+QLabel#SideTitle {{ color: {t['text']}; font-size: 13px; font-weight: bold; padding-left: 2px; }}
+/* 侧栏最底部那行小字：进去老的「工具调用轨迹」页（需求 10 把它从导航里拿掉了） */
+QPushButton#SideLink {{
+    background: transparent; color: {t['text_muted']}; border: none;
+    border-radius: 8px; padding: 5px 4px; font-size: 11px; text-align: center;
+}}
+QPushButton#SideLink:hover {{ background: {t['nav_hover_bg']}; color: {t['accent_text']}; }}
 QPushButton#NavBtn {{
     background: transparent; color: {t['nav_text']}; border: none;
     border-radius: 10px; padding: 9px 6px; font-size: 12px; text-align: center;

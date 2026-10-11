@@ -14,6 +14,8 @@ openpyxl>=3.1
 pdfminer.six>=20231228
 beautifulsoup4>=4.12
 lxml>=5.0
+# PDF 合并/拆分/加页码/抽页（pdf_op 工具）：优先 pypdf，缺失时回落本机 PyPDF2
+pypdf>=4.0
 
 # ---- 文档生成（写）----
 python-pptx>=0.6.23

@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """Agent 工具执行：文件读写 / 文档生成 / 系统操作 / 联网 / 记忆 / 计划 / MCP。
 
-安全模型（用户已授权）：
-- 读：任意盘符只读；
-- 写：除系统关键目录（Windows / Program Files / ProgramData / 本程序目录）外均可写；
-- 删除、杀进程、危险代码：必须经用户确认，删除只进回收站；
-- 命令执行：必须经用户确认，危险命令直接拦截。
+安全模型（v9.18.0 收紧后）：
+- 读：工作区外只读，且结果里如实标注「工作区外只读」；
+  相对路径里的 `..` 钻出工作区 = 直接判「路径越界」（要读外面就给绝对路径）；
+- 写：**默认只能落在工作区里**；工作区外 / 受保护目标（.awb、系统目录、
+  AppData、启动项…）默认拒绝，只有用户在弹出的确认框里点头才放行；
+- 删除、杀进程、危险代码：必须经用户确认，删除只进回收站；没有确认界面时**拒绝**；
+- 命令执行：结构 + 关键字双重审计（拆段、解包 cmd /c、解 base64），
+  危险命令直接拦截；其余命令经用户确认才跑。
+- 所有拒绝都返回**中文说明**并记进 trace（app/trace.py），绝不静默放过。
 """
 import os
 import re
@@ -24,8 +28,14 @@ _TOOL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 # 「桌面 / 文档 / 下载 / 图片…」别名 -> Windows 真实路径
 from . import folders as _folders  # noqa: E402
 from . import winproc as _winproc  # noqa: E402（子进程一律走它，避免弹黑窗口）
+# ★ v9.18.0 统一沙箱策略（路径展开/边界判定/受保护目标/命令结构审计）
+from . import security as _sec  # noqa: E402
 # 工作总结
 from . import worklog as _worklog  # noqa: E402
+# ★ v9.18.0：扩容工具集（12 个：文档/图片/编译/磁盘/代码）。实现在 app/tools_more.py，
+#   风格与 webcap 一致（fn(args, ctx=None) -> str，永远返回中文、永远不抛异常）。
+#   import 放在这里；TOOLS_MORE / readonly_tools() / resolve_flags() 都在 tools_more 里。
+from . import tools_more as _tools_more  # noqa: E402
 
 # 定时任务的文案工具（describe / next_text 在 agent 里要直接用）
 from . import scheduler as _sched_mod  # noqa: E402
@@ -41,7 +51,9 @@ KNOWN_TOOLS = (
     "run_command", "run_python", "build_exe", "list_processes", "kill_process",
     "clipboard", "screenshot", "notify",
     # 联网
-    "web_search", "download_file", "http_request",
+    #   ★ v9.18.0 新增 web_visit：真·浏览器内核打开网页（能拿 JS 渲染后的 DOM
+    #     和页面发出的全部请求），跟 web_search 并列放在"联网"这一组。
+    "web_search", "web_visit", "download_file", "http_request",
     # 网页采集 / GitHub（v9.15.0）
     "web_scrape", "web_form_batch", "github",
     # 记忆 / 计划 / 知识库
@@ -58,7 +70,7 @@ KNOWN_TOOLS = (
     "list_skills", "use_skill", "schedule_task", "list_tasks",
     "cancel_task", "run_task", "spawn_agent",
     # ★ 并行后台任务 + 团队（v9.16.0）
-    #   ⚠️ 别和上面的定时任务撞名：`list_tasks` / `cancel_task` / `run_task`
+    #   ⚠ 别和上面的定时任务撞名：`list_tasks` / `cancel_task` / `run_task`
     #   已经被"定时任务"占了，所以后台任务一律用 bg_ 前缀。
     "run_bg", "bg_list", "bg_status", "bg_wait", "bg_cancel",
     "team_run", "team_status",
@@ -68,6 +80,10 @@ KNOWN_TOOLS = (
     "ask_user",
     # MCP
     "mcp_list", "mcp_call",
+    # ★ 扩容工具集（v9.18.0，需求「工具再多一点」）—— 实现在 app/tools_more.py
+    "excel_op", "pdf_op", "image_batch", "compile_run", "disk_usage",
+    "find_duplicate", "file_hash", "text_diff", "pip_manage", "git_op",
+    "net_info", "text_op",
 )
 
 # 「真的产出了文件」的写入类工具。
@@ -75,6 +91,14 @@ KNOWN_TOOLS = (
 #   它决定 write_done（假成功防御）、完成度看门狗、以及工作总结里的「成功/未完成」。
 WRITE_TOOLS = ("write_file", "create_document", "archive",
                "download_file", "screenshot", "build_exe")
+
+# ★ v9.18.0：会产生文件、必须过"写沙箱闸门"的工具（比 WRITE_TOOLS 更全）——
+#   多出来的 file_op / image_op / create_chart / web_form_batch 也能写文件，
+#   只是不进 write_done 统计（那套语义另说），所以单独一张表。
+#   UI 层用它在这些工具上挂"确认框"，好让**工作区外的写入**能由用户点头。
+SANDBOX_WRITE_TOOLS = ("write_file", "create_document", "archive", "download_file",
+                       "screenshot", "build_exe", "file_op", "image_op",
+                       "create_chart", "web_form_batch")
 
 # 模型偶尔会用「别名 / 技能名 / 近似名」当工具名（实测：会把技能 slug
 # 直接当工具名调）。这里做一次友好归一，既能自动路由，也能让日志/界面
@@ -92,6 +116,12 @@ TOOL_ALIAS = {
     "speak": "speak_text", "tts": "speak_text",
     "asr": "transcribe_audio", "stt": "transcribe_audio",
     "search": "web_search", "http": "http_request",
+    # 联网搜索 / 浏览器式访问的各种叫法（v9.18.0）
+    "search_web": "web_search", "web_query": "web_search",
+    "联网搜索": "web_search", "网页搜索": "web_search",
+    "browser": "web_visit", "visit": "web_visit",
+    "open_page": "web_visit", "goto": "web_visit", "render": "web_visit",
+    "browse": "web_visit", "浏览网页": "web_visit", "打开网页": "web_visit",
     "fetch": "fetch_url", "python": "run_python",
     # 网页采集（模型爱用的各种叫法）
     "scrape": "web_scrape", "crawl": "web_scrape", "crawler": "web_scrape",
@@ -408,7 +438,7 @@ def _degraded_call(text):
 _DSML_BAR = "[｜|]"
 _DSML_INVOKE_RE = re.compile(
     r"<\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR +
-    # ⚠️ 工具名首字符必须允许 Unicode：TOOL_ALIAS 里有中文别名（"打包"/"打包exe"/
+    # ⚠ 工具名首字符必须允许 Unicode：TOOL_ALIAS 里有中文别名（"打包"/"打包exe"/
     # "编译exe"/"工作总结"），早先写成 [A-Za-z_] 会把它们全挡在门外（实测漏检）。
     r"\s*invoke\s+name\s*=\s*[\"']?([\w][\w\-]*)[\"']?\s*>"
     r"(.*?)"
@@ -438,7 +468,7 @@ def _dsml_name(raw):
 
 def _dsml_calls(text):
     """解析 DSML 工具调用，返回 [{name, arguments}, ...]；解析不出就返回 []。"""
-    # ⚠️ 这里的守卫必须大小写不敏感：下面的正则是 IGNORECASE，
+    # ⚠ 这里的守卫必须大小写不敏感：下面的正则是 IGNORECASE，
     # 早先写成 "DSML" not in text，会把全小写 <｜dsml｜…> 拦在门外，
     # 让 IGNORECASE 变成死代码（实测漏检，复验时被打出来）。
     if not text or "dsml" not in text.lower():
@@ -506,7 +536,7 @@ _XMLARG_MAX_ARG = 200000
 # 以前 chat_worker / main_window / markdown_render 各写一套，早晚漂移：
 #   · TOOL_BLOCK_RE：完整的 <tool_call>…</tool_call>
 #   · TOOL_BODY_RE ：漏写闭合的 XML 参数风调用 —— 只吃「调用本体」，
-#     ⚠️ 不能用 `<tool_call>.*$`：调用夹在正文中间时会**把后半段结论一起吃掉**，
+#     ⚠ 不能用 `<tool_call>.*$`：调用夹在正文中间时会**把后半段结论一起吃掉**，
 #        气泡直接变空（实测过）。
 # markdown_render 直接从这儿 import，别再抄第二份。
 # ---------------------------------------------------------------------------
@@ -539,7 +569,7 @@ def _xmlarg_value(raw):
 
 def _xmlarg_calls(text):
     """解析智谱 XML 风格工具调用，返回 [{name, arguments}, ...]；解析不出返回 []。"""
-    # ⚠️ 守卫只能看 <tool_call> —— 别写成 "arg_value" not in text：
+    # ⚠ 守卫只能看 <tool_call> —— 别写成 "arg_value" not in text：
     #    零参数写法（<tool_call>system_info</tool_call>）里根本没有 arg_value，
     #    那样会被误挡在门外（写完立刻被 parser_cases 打出来）。
     if not text or "<tool_call>" not in text.lower():
@@ -630,7 +660,7 @@ def _parse_tool_call_once(text):
         return _dg
 
     # 2) 带 name 的 JSON 对象
-    #    ⚠️ JSON 里的 "name" 不一定是工具名 —— 所以「name 是已知工具」的优先；
+    #    ⚠ JSON 里的 "name" 不一定是工具名 —— 所以「name 是已知工具」的优先；
     #    不是已知工具的（可能是技能 slug）只留作最后兜底，不要立刻采信。
     fallback_call = None
     for _s, _e, obj in _json_objects(stripped):
@@ -901,7 +931,7 @@ _EXE_ACTION = ("打包", "帮我", "请你", "给我", "做成", "生成", "转�
 def needs_exe(user_text):
     """用户这句话是不是明确要打包出 exe / 安装包。
 
-    ⚠️ 两道闸：① 只认「exe / 可执行文件 / 安装包 / 打包」这类明确说法
+    ⚠ 两道闸：① 只认「exe / 可执行文件 / 安装包 / 打包」这类明确说法
     （免得"写个程序"也天天被催）；② 「什么是 exe 文件」这种纯概念提问不算。
     """
     t = (user_text or "").lower()
@@ -1053,8 +1083,18 @@ def completion_gaps(user_text, tools_used, write_done, verified_after_write,
                                                    "web_search", "read_worklog"}):
         gaps.append("用户要查看/列出数据，但**一次都没真的去读**")
 
+    # ★ v9.18.0 行为修复（根因 A）：这个 gap **必须**有前置条件才允许报。
+    #   旧写法无条件报 —— 而 main_window.py:3824 会把**上一轮遗留的** conv["plan"]
+    #   带进新一轮，于是用户只是问一句「你是谁」，也被判定成"这轮没做完"，
+    #   看门狗（chat_worker.py:908-919）拿它当欠账催办，模型跑去补完历史任务
+    #   （真实事故：助手自作主张去写完洛谷 P1576，刷出几十条工具调用）。
+    #   现在：只有**这一轮确实在干/用户确实在派活**时才报——
+    #     · tools_used 非空（模型这轮已经动手了），**或**
+    #     · needs_project_flow(t)（用户这句话是要开发一个成品），**或**
+    #     · count_requests(t) >= 1（用户这句话确实提出了具体请求）
+    #   纯聊天/身份类消息（「你是谁」）三者都为假 → 不产生这个 gap，不许催办。
     pending = [s for s in (plan_steps or []) if s.get("status") != "done"]
-    if pending:
+    if pending and (tools_used or needs_project_flow(t) or count_requests(t) >= 1):
         gaps.append(f"任务清单里还有 {len(pending)} 步没标完成："
                     + "、".join(str(s.get("text"))[:14] for s in pending[:4]))
 
@@ -1185,7 +1225,7 @@ VERIFY_FIX_HINT = (
     "4) 改完**立刻再运行一次**（run_python 跑刚写的那个文件），把真实输出贴出来；\n"
     "5) 还报错就重复 1~4，**直到真的跑通**（退出码 0、没有 Traceback）。\n"
     "需要查第三方库用法或报错含义时，可以先 web_search 搜一次再动手改。\n"
-    "⚠️ 绝不许说完「已修复」却没有重新运行；也绝不许把报错说成通过。"
+    "⚠ 绝不许说完「已修复」却没有重新运行；也绝不许把报错说成通过。"
 )
 
 
@@ -1544,7 +1584,7 @@ def _looks_mojibake(txt):
 def _loose_call(text):
     """JSON 严格解析失败时的最后兜底：用正则把 name / 参数抠出来。
 
-    ⚠️ 注意：这个兜底只适合**短参数**（path / command 这种一行就写完的）。
+    ⚠ 注意：这个兜底只适合**短参数**（path / command 这种一行就写完的）。
     长文本参数（content / code / markdown）只要里面出现了 \" 转义，
     正则就会在第一个 \" 处截断，把半截代码写进文件还报「成功」——
     实测真实故障：186 字节的残缺 bank_simulation.py。
@@ -1781,21 +1821,51 @@ def _safe_path(files_dir, path, allow_outside=False):
     base = os.path.abspath(files_dir)
     if p == base or p.startswith(base + os.sep):
         return p
-    # 走到这里说明是相对路径，但解析后仍在沙箱外（如 "..\\..\\Windows"）
-    if allow_outside:
-        abs_p = os.path.abspath(p)
-        if os.path.isabs(abs_p) and os.path.splitdrive(abs_p)[0]:
-            return os.path.normpath(abs_p)
-        raise ValueError(f"路径越界：只读工具无法解析该路径，收到 {path!r}")
-    raise ValueError("路径越界：写操作只能发生在工作区 files/ 目录内")
+    # 走到这里说明是相对路径，但解析后仍在沙箱外（如 "..\\..\\Windows"）。
+    # ★ v9.18.0：相对路径里的 `..` 钻出沙箱 —— 一律判**越界**，读也不放行。
+    #   （要读工作区外的文件，必须写**绝对路径**，那样才会走上面的分支并带
+    #     「工作区外只读」标注；用 `..` 偷偷钻出去是典型的越界写法。）
+    raise ValueError(
+        f"路径越界：相对路径 {path!r} 里的 `..` 钻到了工作区之外。"
+        f"允许的范围是 {base}。"
+        f"要读工作区外的文件请直接给**绝对路径**（会标注「工作区外只读」）；"
+        f"要写就请用工作区内的相对路径。")
+
+
+def _danger_reason(cmd):
+    """返回 (是否危险, 中文原因)。
+
+    ★ v9.18.0：判据从"整串关键字黑名单"升级为**黑名单 + 结构检查** ——
+      按 `& | ; 换行` 拆段、逐段递归解包（cmd /c、powershell -Command /
+      -EncodedCommand）、再逐段查关键字，最后补一遍整串正则兜底。
+      这样 `echo hi & del /f x`、`cmd /c cmd /c ...`、`powershell -enc <b64>`
+      都不会漏。老的 `_DANGER_PATTERNS` 仍然生效（只是不再单独扛）。
+    """
+    why = ""
+    for pat in _DANGER_PATTERNS:
+        if re.search(pat, cmd or "", re.I):
+            why = "命中危险命令特征"
+            break
+    if not why:
+        try:
+            danger, reason = _sec.audit_command(cmd)
+        except Exception:
+            danger, reason = False, ""
+        if danger:
+            return True, reason or "命中危险命令特征"
+        return False, ""
+    # 老黑名单命中时，也尽量拿到更具体的原因
+    try:
+        _d, _r = _sec.audit_command(cmd)
+        if _d and _r:
+            why = _r
+    except Exception:
+        pass
+    return True, why
 
 
 def _is_dangerous(cmd):
-    c = cmd.lower()
-    for pat in _DANGER_PATTERNS:
-        if re.search(pat, c):
-            return True
-    return False
+    return _danger_reason(cmd)[0]
 
 
 # 禁止写入的系统关键目录：用户已授权放开普通目录写入，但 OS 与本程序本体仍锁死，
@@ -1863,16 +1933,39 @@ def is_readonly_command(cmd):
     return False
 
 
+def _as_error(err, prefix=""):
+    """把"路径解析/沙箱闸门"返回的说明包装成给模型看的错误串。
+
+    ★ v9.18.0：闸门拒绝时返回的串本身已经带 `[拒绝]` / `[取消]` 前缀了，
+    这里不能再套一个 `[错误]`，否则会变成 `[错误] [拒绝] ...`（难看，也不好被
+    上层判定成"被拦"）。已带标签的原样返回。
+    """
+    e = str(err or "").strip()
+    if e.startswith(("[拒绝]", "[取消]", "[错误]")):
+        return e
+    return "[错误] " + (prefix or "") + e
+
+
 def _is_system_path(path):
+    r"""是不是系统关键位置。
+
+    ★ v9.18.0：改走 security 的统一判定 —— 先展开（%VAR% / ~ / \\?\ 前缀）
+    再解析符号链接 / junction / 8.3 短名，最后比真实路径。原来只比原始字符串，
+    `\\?\C:\Windows`、`C:\PROGRA~1`、大小写变形都能溜过去。
+    """
+    try:
+        if _sec.is_system_protected(path):
+            return True
+    except Exception:
+        pass
+    # 老清单兜底（即便 security 判定异常也要挡住）
     p = os.path.normcase(os.path.normpath(path or ""))
     for d in _SYSTEM_WRITE_GUARD:
         d2 = os.path.normcase(os.path.normpath(d))
         if p == d2 or p.startswith(d2 + os.sep):
             return True
     prog = os.path.normcase(os.path.normpath(_PROG_DIR))
-    if p == prog or p.startswith(prog + os.sep):
-        return True
-    return False
+    return p == prog or p.startswith(prog + os.sep)
 
 
 def _human_size(n):
@@ -1920,9 +2013,12 @@ def _to_recycle_bin(path):
 # Python 代码里出现这些 = 有破坏性，执行前必须用户确认
 _PY_DANGER = re.compile(
     r"(shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|os\.removedirs|"
-    r"\brm\s+-rf|format\s+[a-z]:|subprocess\.(run|Popen|call).*(rm|del|format)|"
-    r"open\s*\([^)]*['\"]w['\"].*Windows|winreg|ctypes\.windll|"
-    r"shutdown|taskkill|diskpart)", re.I)
+    r"\brm\s+-rf|format\s+[a-z]:|"
+    r"subprocess\.(run|Popen|call)[^\n]*(rm|del|format|shutdown|diskpart)|"
+    r"open\s*\([^)]*['\"]w['\"][^\n]*Windows|winreg|ctypes\.windll|ctypes\.WinDLL|"
+    r"\bRemove-Item\b|reg\s+(add|delete|import)|schtasks|"
+    r"\bnet\s+user\b|\bshutdown\b|\btaskkill\b|\bdiskpart\b|"
+    r"vssadmin|bcdedit|os\.system)", re.I)
 
 
 def _py_dangerous(code):
@@ -1971,6 +2067,42 @@ def _arg_bool(v, default=False):
     if s in ("0", "false", "no", "n", "off", "否", "假"):
         return False
     return default
+
+
+def _rc_hint(rc, out):
+    """把子进程的退出码翻译成一句"给模型看的硬提醒"。
+
+    复盘包实测的真实坑：结果里平铺一行 `退出码：1`，模型会当成"已经跑完了"
+    继续往下编。所以非 0 必须在**首行**喊出来（首行由调用方加），这里给结尾的
+    补充说明；退出码 0 但一个字节输出都没有时，也要提醒它别当成产出。
+    """
+    if rc != 0:
+        return ("\n[注意] 退出码非 0，这一步没有成功跑完，不要当成已完成；"
+                "先看上面的报错。")
+    if not str(out or "").strip():
+        return ("\n[提示] 退出码 0，但没有任何输出；如果这一步本该产出文件或结果，"
+                "请确认产物是否真的存在。")
+    return ""
+
+
+def _busy_err(e):
+    """是不是"文件被别的程序占用 / 没权限"这类**值得重试**的错误。"""
+    if isinstance(e, PermissionError):
+        return True
+    return getattr(e, "errno", None) in (13, 32)
+
+
+def _utf8_env(base=None):
+    """子进程统一 UTF-8。
+
+    winproc 只管"不弹黑窗"，**不碰编码**；中文 Windows 上子进程默认走 GBK，
+    一遇到中文路径 / 中文输出就乱码。这里给所有经过 agent 起的子进程补上
+    PYTHONUTF8 / PYTHONIOENCODING（Python 子进程立刻受益，其它程序无害）。
+    """
+    env = dict(base if base is not None else os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
 
 
 def _python_candidates():
@@ -2390,7 +2522,14 @@ class AgentRunner:
                  reminder_cb=None, keys=None, subagent_cb=None,
                  dingtalk_api_cb=None, taskman=None, team_cb=None,
                  bg_agent_cb=None, teamman=None, ask_cb=None):
-        self.files_dir = files_dir
+        # ★ v9.18.0 行为修复（根因 D）：产物目录原来在构造时一次性固化，
+        #   而 _make_runner() 只在启动/换工作区时调用、早于对话加载，那时
+        #   workspace.current_cid 还是 None → files_dir 永远落在
+        #   `chats/00_历史文件/files`，切对话后不更新，所有对话的产物全混在一起。
+        #   现在改成 property 实时取值：UI 层注入 files_dir_cb（返回当前对话的
+        #   产物目录），没注入时回退到构造时传入的目录（子代理/团队场景不受影响）。
+        self._files_dir = files_dir
+        self.files_dir_cb = None
         # 后台任务管理器（v9.16.0）：run_bg / bg_* 工具靠它把活儿甩到后台线程，
         # 自己立刻返回，从而"跑慢命令不阻塞模型继续思考"。UI 层注入。
         self.taskman = taskman
@@ -2445,6 +2584,23 @@ class AgentRunner:
         # 本轮真实写出来的文件（路径/大小/是否存在），供工作总结与完成自检
         self.written = []
         os.makedirs(files_dir, exist_ok=True)
+
+    @property
+    def files_dir(self):
+        """当前产物目录 —— **实时**从 UI 层注入的 files_dir_cb 取。
+
+        这样切对话后工具层写文件的真实路径会跟着变（需求 8：每个对话一个
+        文件夹放产物）；取不到时回退到构造时传进来的目录。
+        """
+        cb = getattr(self, "files_dir_cb", None)
+        if callable(cb):
+            try:
+                d = cb()
+            except Exception:
+                d = None
+            if d:
+                return d
+        return self._files_dir
 
     # ---------- 懒加载子系统 ----------
     @property
@@ -2555,9 +2711,70 @@ class AgentRunner:
             return os.path.normpath(raw)
         return os.path.normpath(os.path.join(self.files_dir, _normalize_rel(raw)))
 
-    def _resolve_write(self, raw):
-        """写入类路径解析 + 系统目录拦截。返回 (路径, 错误信息)。"""
+    def _note_blocked(self, what, path, kind):
+        """把"沙箱拒绝"如实记进 trace，方便用户事后查（绝不静默）。"""
+        try:
+            self.trace.add(
+                "sandbox_denied",
+                {"op": what, "path": path, "kind": kind},
+                result=f"[拒绝] {kind}：{path}", ok=False,
+                extra={"sandbox": "denied"})
+        except Exception:
+            pass
+
+    def _guard_write_path(self, path, confirm_cb=None, what="写入"):
+        r"""★ v9.18.0 统一"写闸门"：返回 None=放行；否则返回**已带前缀**的中文拒绝说明。
+
+        规则（先展开、再判，绝不只看原始字符串）：
+          · 工作区**内部数据**（.awb/、settings.json、mcp.json、MEMORY.md…）
+            → 受保护；要改必须用户确认；
+          · 工作区内的普通路径 → 放行（正常产物）；
+          · 系统关键位置（Windows / 程序目录 / AppData / 启动项…）→ 受保护；
+          · 其余工作区外的位置 → 默认拒绝，除非用户确认（桌面/D:/E: 等）。
+        路径里的 `%VAR%` / `~` / `\\?\` / 符号链接 / junction 都会先被解析成
+        真实最终位置，所以这些花招绕不过去。
+        """
+        if not path:
+            return None
+        try:
+            real = _sec.real_path(path)
+            # 写沙箱 = 当前对话的产物目录（<ws>/chats/<NN>/files）。产物一律写这里，
+            # 用户在工作区里一眼就能看到；工作区根的 .awb / 配置 / 记忆属于内部数据。
+            sandbox = _sec.real_path(self.files_dir)
+            if _sec.is_workspace_internal(real, self.ws_path):
+                if confirm_cb is not None and confirm_cb(
+                        f"{what}工作区的内部数据（配置 / 密钥 / 轨迹 / 记忆）：\n{real}"):
+                    return None
+                self._note_blocked(what, real, "受保护：工作区内部数据")
+                return "[拒绝] " + _sec.protected_reason(real, sandbox)
+            if _sec.is_within(sandbox, real):
+                return None
+            if _sec.is_system_protected(real):
+                if confirm_cb is not None and confirm_cb(
+                        f"{what}系统关键位置：\n{real}"):
+                    return None
+                self._note_blocked(what, real, "受保护：系统关键位置")
+                return "[拒绝] " + _sec.protected_reason(real, sandbox)
+            if confirm_cb is not None and confirm_cb(
+                    f"{what}工作区**之外**的文件：\n{real}"):
+                return None
+            self._note_blocked(what, real, "工作区之外")
+            return "[拒绝] " + _sec.outside_reason(real, sandbox)
+        except Exception as e:                       # noqa: BLE001
+            return (f"[错误] 路径安全检查没跑成功（{type(e).__name__}: {e}），"
+                    f"为稳妥起见已拒绝这次写入。请换一个工作区内的相对路径重试。")
+
+    def _resolve_write(self, raw, confirm_cb=None, what="写入"):
+        """写入类路径解析 + 沙箱闸门。返回 (路径, 错误信息)。
+
+        ★ v9.18.0：在原来的"系统目录拦截"之上，加了**工作区边界**与
+        **工作区内部数据保护**；越界时默认拒绝，只有拿到用户确认才放行。
+        `%TEMP%` / `~` / `\\?\\` 之类的写法会先展开成真实位置再判。
+        """
+        # ① 别名（桌面 / 文档 / ~）与盘符归一 -> 真实路径
         raw = _folders.resolve((raw or "").strip())
+        # ② 展开环境变量 / 命名空间前缀（先展开，再判，不看原始串）
+        raw = _sec.normalize_path(raw) or raw
         if not raw or raw == "." or raw.endswith(("/", "\\")):
             return None, (f"path 必须是一个文件名，不能是目录：{raw!r}。"
                           f"例：out/report.docx 或 桌面\\周报.docx")
@@ -2565,9 +2782,10 @@ class AgentRunner:
             path = os.path.normpath(raw)
         else:
             path = os.path.normpath(os.path.join(self.files_dir, _normalize_rel(raw)))
-        if _is_system_path(path):
-            return None, (f"出于安全，禁止写入系统关键目录：{path}。"
-                          f"请换到其他位置（桌面、D:、E:、你的项目文件夹都行）。")
+        # ③ 统一写闸门（受保护目标 / 工作区边界）
+        err = self._guard_write_path(path, confirm_cb, what)
+        if err:
+            return None, err
         if os.path.isdir(path):
             return None, f"{path} 是一个目录，请换一个文件名"
         parent = os.path.dirname(path)
@@ -2663,6 +2881,101 @@ class AgentRunner:
         return out
 
     # =====================================================================
+    # 浏览器式网页访问（v9.18.0）
+    #
+    # 跟 web_scrape 的分工：
+    #   · web_scrape = 纯 HTTP GET/POST，快；但拿不到 JS 渲染后的内容，
+    #                  也看不见页面自己发了哪些 XHR/Fetch；
+    #   · web_visit  = 真·浏览器内核（Chromium）跑一遍 JS，取渲染后的 DOM 正文，
+    #                  并把页面发出的全部请求抓下来（照着重放接口）。
+    # =====================================================================
+    def _tool_web_visit(self, args):
+        a = args if isinstance(args, dict) else {}
+        url = str(a.get("url") or a.get("href") or a.get("link")
+                  or a.get("target") or a.get("u") or "").strip()
+        if not url:
+            return "[错误] 需要 url 参数（要打开的网址，例如 https://example.com）"
+        if not url.lower().startswith(("http://", "https://")):
+            return "[错误] url 必须以 http:// 或 https:// 开头"
+        try:
+            wait_ms = int(float(a.get("wait_ms") or a.get("wait")
+                               or a.get("delay") or 2500))
+        except Exception:
+            wait_ms = 2500
+        wait_ms = max(0, min(wait_ms, 15000))      # clamp 0~15000
+        try:
+            timeout = int(float(a.get("timeout") or 30))
+        except Exception:
+            timeout = 30
+        timeout = max(5, min(timeout, 120))        # clamp 5~120
+        sniff = _arg_bool(a.get("sniff"), True)
+        find_api = _arg_bool(a.get("find_api"), True)
+        full = _arg_bool(a.get("full"), False)
+
+        from . import webengine as _we            # 延迟 import，跟 webcap 一致
+        try:
+            res = _we.fetch_rendered(url, wait_ms=wait_ms, timeout=timeout,
+                                     sniff=sniff)
+        except Exception as e:
+            # fetch_rendered 内部已自兜底，但绝不能把任何异常抛穿 Agent 循环
+            return f"[错误] 打开网页失败：{type(e).__name__}: {e}"
+        if not isinstance(res, dict):
+            return "[错误] 打开网页失败：浏览器内核没有返回结果"
+
+        rtext = res.get("text") or ""
+        html = res.get("html") or ""
+        reqs = res.get("requests") or []
+        xhr = (res.get("xhr") or []) if find_api else []
+        engine = res.get("engine") or "?"
+        status = res.get("status", 0)
+        title = (str(res.get("title") or "").strip() or "(无标题)")
+        final_url = res.get("final_url") or url
+        warn = str(res.get("warn") or "").strip()
+
+        head = (f"[浏览器内核] engine={engine} status={status} title={title}\n"
+                f"final_url: {final_url}\n"
+                f"requests={len(reqs)}（疑似数据接口 {len(xhr)} 条）")
+        if warn:
+            head += f"\n[注意] {warn}"
+
+        parts = [head]
+
+        # ---- 正文（截到 6000 字）----
+        MAX_TEXT = 6000
+        if len(rtext) > MAX_TEXT:
+            body = rtext[:MAX_TEXT]
+            body += (f"\n（正文已截断，全文共 {len(rtext)} 字；"
+                     f"需要全文请用 web_scrape）")
+        else:
+            body = rtext
+        parts.append("## 正文\n" + (body or "（没有提取到正文）"))
+
+        # ---- 疑似数据接口（最多 12 条）----
+        if find_api and xhr:
+            lines = ["## 疑似数据接口（页面自己发出的 XHR/Fetch，可照着复现）"]
+            for it in xhr[:12]:
+                lines.append(f"{it.get('method') or 'GET'} {it.get('url') or ''}")
+                why = str(it.get("why") or "").strip()
+                if why:
+                    lines.append(f"   ← {why}")
+                bd = str(it.get("body") or "").strip()
+                if bd:
+                    lines.append(f"   body: {bd}")
+            if len(xhr) > 12:
+                lines.append(f"（还有 {len(xhr) - 12} 条未列出）")
+            parts.append("\n".join(lines))
+
+        # ---- 原始 HTML（只在 full=True 时给，截到 12000 字）----
+        if full:
+            MAX_HTML = 12000
+            h = html
+            if len(h) > MAX_HTML:
+                h = h[:MAX_HTML] + f"\n（原始 HTML 已截断，共 {len(html)} 字）"
+            parts.append("## 原始 HTML\n```html\n" + h + "\n```")
+
+        return "\n\n".join(parts)
+
+    # =====================================================================
     # 并行后台任务 + 团队（v9.16.0）
     #
     # ★ 核心纪律：下面这些工具**必须立刻返回**，绝不能在这里等任务跑完 ——
@@ -2719,8 +3032,10 @@ class AgentRunner:
         if kind == "command":
             if not cmd:
                 return "[错误] kind=command 需要 command 参数（要跑的命令）"
-            if _is_dangerous(cmd):
-                return "[拒绝] 该命令过于危险，已被拦截（删除/格式化/关机等）。"
+            _danger, _why = _danger_reason(cmd)
+            if _danger:
+                return (f"[拒绝] 该命令过于危险，已被拦截：{_why}。"
+                        "后台运行不等于可以乱来。")
             wn = window_spawning(cmd)
             if wn:
                 return (f"[拒绝] 这条命令会新开窗口：{wn}\n"
@@ -2732,7 +3047,9 @@ class AgentRunner:
                 detail=cmd, dedup_key="cmd:" + cmd)
             return (f"[已提交] 后台任务 {t.id}（命令）已在后台开始跑，**你现在不用等它**。\n"
                     f"命令行：`{cmd[:160]}`\n"
-                    f"接下来你可以继续做别的事；需要结果时用 bg_status/bg_wait 查 {t.id}。")
+                    f"接下来你可以继续做别的事；需要结果时用 bg_status/bg_wait 查 {t.id}。\n"
+                    f"[注意] 后台命令**还没跑完**，现在不能当成已完成；跑完后请用 "
+                    f"bg_status/bg_wait 查 {t.id} 的退出码，**退出码 0 才算成功**。")
 
         if kind == "python":
             if not code:
@@ -2743,7 +3060,9 @@ class AgentRunner:
                 _tm.make_python_fn(code, cwd=self.files_dir, timeout=timeout),
                 detail=code[:200], dedup_key="py:" + code[:120])
             return (f"[已提交] 后台任务 {t.id}（Python）已在后台开始跑，**你现在不用等它**。\n"
-                    f"可以继续做别的事，需要结果时用 bg_status/bg_wait 查 {t.id}。")
+                    f"可以继续做别的事，需要结果时用 bg_status/bg_wait 查 {t.id}。\n"
+                    f"[注意] 后台代码**还没跑完**，现在不能当成已完成；跑完后请用 "
+                    f"bg_status/bg_wait 查 {t.id} 的退出码，**退出码 0 才算成功**。")
 
         if kind == "agent":
             if not task_txt:
@@ -3025,11 +3344,11 @@ class AgentRunner:
                     full = os.path.join(path, e)
                     try:
                         if os.path.isdir(full):
-                            entries.append("📁 " + e + "/")
+                            entries.append("▰ " + e + "/")
                         else:
-                            entries.append(f"📄 {e}  （{_human_size(os.path.getsize(full))}）")
+                            entries.append(f"▭ {e}  （{_human_size(os.path.getsize(full))}）")
                     except Exception:
-                        entries.append("📄 " + e)
+                        entries.append("▭ " + e)
                 if not entries:
                     entries = ["（空）"]
                 tag = "（工作区外只读）" if outside else ""
@@ -3037,27 +3356,77 @@ class AgentRunner:
 
             elif name == "write_file":
                 raw = _folders.resolve((args.get("path") or "").strip())
+                # ★ v9.18.0：先展开 `%TEMP%` / `~` / `\\?\` 前缀，再判（不看原始串）
+                raw = _sec.normalize_path(raw) or raw
                 # 末尾带分隔符（out/、out\）说明把它当目录用了，直接拒绝，
                 # 否则会造出一个名叫 out 的文件，把后面所有 out/xxx 都堵死
                 if (not raw or raw == "." or raw.endswith(("/", "\\"))):
                     return (f"[错误] path 必须是一个文件名，不能是目录：{raw!r}。"
                             f"例：out/deep.txt 或 桌面\\a.txt")
-                # 用户已授权：允许写入工作区之外（桌面 / D: / E: / 项目文件夹等），
-                # 但系统关键目录仍禁止写入，避免误伤操作系统或本程序。
                 if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
                     path = os.path.normpath(raw)
                 else:
                     path = os.path.normpath(os.path.join(
                         self.files_dir, _normalize_rel(raw)))
-                if _is_system_path(path):
-                    return (f"[拒绝] 出于安全，禁止写入系统关键目录：{path}。"
-                            f"请换到其他位置（桌面、D:、E:、你的项目文件夹都行）。")
+                # 系统目录拦截统一交给下面的 _guard_write_path —— 那里会**先判
+                # "是不是在工作区里"**再判"是不是系统目录"，顺序才对：
+                # 否则工作区本身恰好落在 %LOCALAPPDATA%\Temp 时会被误伤。
                 if os.path.isdir(path):
                     return f"[错误] {path} 是一个目录，不能用 write_file 写入，请换文件名"
                 # ★ v9.17.0：先拿到内容，再按「显式 language / 内容特征」纠正扩展名。
                 #   必须放在算 parent **之前**，否则改了扩展名却还用着旧的目录。
                 #   （用户报的「我要 C++，它给我个 .py」就在这一步兜住。）
-                content = args.get("content", "")
+                # ★★ v9.18.0：**绝不允许"空内容写入"**（复盘包实测抓出来的真 bug）。
+                #
+                #   背景：提示词教模型用"两步写法"保证长代码不被 JSON 转义写坏 ——
+                #     第 1 步：单独发一行 <tool_call>{"name":"write_file",
+                #              "arguments":{"path":"x.py"}}</tool_call>
+                #     第 2 步：紧接着跟一个 ```代码块```，系统把代码块当内容
+                #   （第 2 步由 `_salvage_from_fence` 在解析阶段补进 content。）
+                #
+                #   但模型经常**只做第 1 步就跑了**（或者把代码块留到了下一条消息）。
+                #   老代码这时 `content == ""`，会一路走到 open(path,"w") 写个空文件，
+                #   然后回一句「[成功] 已写入 0 字符，共 1 行 → 路径（0 字节，已确认落盘）」
+                #   —— 三重伤害：① 谎报成功；② 如果这个文件**本来就写好过**，
+                #   会被静默截断成 0 字节，用户直接丢代码；③ 用户以为完成了，
+                #   下一轮又重发同一句话（"用户反复重发同一句"的元凶之一）。
+                #
+                #   所以这里做**最后一道硬闸**：内容为空就拒绝 + 明确告诉它怎么补。
+                #   宁可让模型多跑一轮，也绝不落一个空文件。
+                content = None
+                for _k in ("content", "text", "body", "data", "code", "source"):
+                    _v = args.get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        content = _v
+                        break
+                if content is None:
+                    _raw_v = args.get("content")
+                    _existed = os.path.isfile(path)
+                    _old = ""
+                    if _existed:
+                        try:
+                            _old = f"（它**已经存在**，当前 {os.path.getsize(path)} 字节 —— 我一个字都没动）"
+                        except Exception:
+                            _old = "（它已经存在 —— 我一个字都没动）"
+                    if isinstance(_raw_v, str) and _raw_v != "":
+                        _why = f"收到的 content 只有空白字符（{len(_raw_v)} 个）"
+                    elif _raw_v is None:
+                        _why = ("调用里**完全没有 content 字段**"
+                                "（只给了 path —— 这正是『两步写法』只做了第 1 步的样子）")
+                    else:
+                        _why = "content 是空字符串"
+                    return (
+                        f"[错误] 我**没有写入** {path}：{_why}{_old}。\n"
+                        "空文件是有害的，所以宁可让你重发一次也不落盘。\n"
+                        "请二选一重发：\n"
+                        "  · 一步写完（内容短、没有换行麻烦）：\n"
+                        "    <tool_call>{\"name\":\"write_file\",\"arguments\":"
+                        "{\"path\":\"" + (path or "a.txt") + "\",\"content\":\"这里是完整正文\"}}</tool_call>\n"
+                        "  · 内容长 / 带大量换行（推荐）：**两步**，而且两步要在**同一条回复里**：\n"
+                        "    1) <tool_call>{\"name\":\"write_file\",\"arguments\":"
+                        "{\"path\":\"" + (path or "a.py") + "\"}}</tool_call>\n"
+                        "    2) 紧接着一个 ```代码块```，把完整正文放进去"
+                        "（真实换行，不要写成 \\\\n）。")
                 path, _ext_note = _fix_ext_for_language(
                     path, content, args.get("language"))
                 if os.path.isdir(path):
@@ -3085,12 +3454,56 @@ class AgentRunner:
                                 "2) 紧接着跟一个 ```代码块```，把**完整代码**放进去"
                                 "（真实换行，不要写成 \\\\n，不要把长代码塞进 JSON）。\n"
                                 "系统会自动把代码块的内容当作文件内容。")
-                try:
-                    os.makedirs(parent, exist_ok=True)
-                    with open(path, "w", encoding="utf-8") as f:
+                # ★ v9.18.0：最后一道统一"写闸门" —— 受保护目标 / 工作区边界。
+                #   放在真正落盘之前，保证"拒绝"时一个字节都没写出去。
+                _g = self._guard_write_path(path, confirm_cb, "写入文件")
+                if _g:
+                    return _g
+                # ★ v9.18.0：落盘失败不再"一次就放弃"。
+                #   复盘包里有"文件被 Word/Excel 占着 -> PermissionError ->
+                #   直接报错收工"的案例。这里按下面的顺序自救：
+                #     ① 原路径重试一次（文件可能刚被别的进程释放）；
+                #     ② 加 _1/_2/_3 后缀换名写（最多 3 次）；
+                #   换名成功就**如实告诉模型真实落盘路径**，别让它以为写的是原路径。
+                def _try_write(p):
+                    par = os.path.dirname(p)
+                    if par:
+                        os.makedirs(par, exist_ok=True)
+                    with open(p, "w", encoding="utf-8") as f:
                         f.write(content)
-                except Exception as e:
-                    return f"[错误] 写入失败：{type(e).__name__}: {e}（目标 {path}）"
+
+                renamed_note = ""
+                last_err = None
+                for _ in range(2):                  # ① 原路径，最多试 2 次
+                    try:
+                        _try_write(path)
+                        last_err = None
+                        break
+                    except OSError as e:
+                        last_err = e
+                        if not _busy_err(e):
+                            break
+                        time.sleep(0.15)
+                if last_err is not None and _busy_err(last_err):
+                    _base, _ext = os.path.splitext(path)
+                    for _i in (1, 2, 3):            # ② 换名写
+                        _cand = f"{_base}_{_i}{_ext}"
+                        try:
+                            _try_write(_cand)
+                            path = _cand
+                            renamed_note = ("（原路径被占用，已改名为 "
+                                            f"{os.path.basename(_cand)}）")
+                            last_err = None
+                            break
+                        except OSError as e:
+                            last_err = e
+                            if not _busy_err(e):
+                                break
+                if last_err is not None:
+                    return (f"[错误] 写入失败：{type(last_err).__name__}: "
+                            f"{last_err}（路径 {path}）\n"
+                            "建议：该文件可能正被 Word/Excel/记事本打开着，"
+                            "请先关闭再重试；或者换一个文件名。")
                 # 写完立刻复核：文件真的在、字节数对，才敢说成功
                 if not os.path.isfile(path):
                     return f"[错误] 写入后没找到文件：{path}（可能被安全软件拦截）"
@@ -3100,7 +3513,7 @@ class AgentRunner:
                 # 界面侧解析「共 N 行」；老格式（没有该字段）仍用估算兜底。
                 lines = content.count("\n") + 1
                 return (f"[成功] 已写入 {len(content)} 字符，共 {lines} 行 → 完整路径：{path}"
-                        f"（{size} 字节，已确认落盘）{_ext_note}")
+                        f"（{size} 字节，已确认落盘）{_ext_note}{renamed_note}")
 
             elif name == "read_worklog":
                 days = int(args.get("days") or 1)
@@ -3138,8 +3551,18 @@ class AgentRunner:
                 cmd = args.get("command", "")
                 if not cmd.strip():
                     return "[错误] 命令为空"
-                if _is_dangerous(cmd):
-                    return "[拒绝] 该命令过于危险，已被拦截（删除/格式化/关机等）。"
+                _danger, _why = _danger_reason(cmd)
+                if _danger:
+                    try:
+                        self.trace.add("sandbox_denied",
+                                       {"op": "run_command", "command": cmd},
+                                       result=f"[拒绝] 危险命令：{_why}", ok=False,
+                                       extra={"sandbox": "denied"})
+                    except Exception:
+                        pass
+                    return (f"[拒绝] 该命令过于危险，已被拦截：{_why}。\n"
+                            "出于安全，这类删除/格式化/关机/改注册表/建计划任务的命令"
+                            "不允许 AI 直接执行。请改用安全的方式，或让用户自己操作。")
                 # 会新开窗口的命令一律拦掉：这类命令才是"啪一下冒个窗口又消失"的元凶
                 # （start / cmd /k / explorer 都会另起一个可见窗口，而且往往瞬间退出）
                 _wn = window_spawning(cmd)
@@ -3161,12 +3584,18 @@ class AgentRunner:
                         to = 60.0
                     to = max(5, min(to, 600))   # 打包 exe 这类长命令可给到 10 分钟
                     proc = _winproc.run(cmd, shell=True, cwd=self.files_dir,
-                                        capture_output=True, timeout=to)
+                                        capture_output=True, timeout=to,
+                                        env=_utf8_env())
                     out = _decode(proc.stdout) + _decode(proc.stderr)
                     if len(out) > 8000:
                         out = out[:8000] + "\n...（输出已截断）"
-                    return (f"命令：`{cmd}`\n退出码：{proc.returncode}\n"
-                            f"超时上限：{int(to)} 秒\n输出：\n```\n{out}\n```")
+                    _rc = proc.returncode
+                    # ★ v9.18.0：非 0 退出码必须在**首行**喊出来 ——
+                    #   复盘包实测模型看到"退出码：1"会当成已完成继续往下编。
+                    _head = f"[失败] 退出码 {_rc}\n" if _rc != 0 else ""
+                    return (_head + f"命令：`{cmd}`\n退出码：{_rc}\n"
+                            f"超时上限：{int(to)} 秒\n输出：\n```\n{out}\n```"
+                            + _rc_hint(_rc, out))
                 except subprocess.TimeoutExpired:
                     return ("[错误] 命令执行超时。如果是 PyInstaller 打包这类长命令，"
                             "请在 arguments 里带 timeout=600 再试一次。")
@@ -3232,7 +3661,7 @@ class AgentRunner:
                         p = os.path.join(root, fn)
                         scanned += 1
                         if pattern and fnmatch.fnmatch(fn.lower(), pattern.lower()):
-                            hits.append(f"📄 {os.path.relpath(p, base)}")
+                            hits.append(f"▭ {os.path.relpath(p, base)}")
                             continue
                         if keyword and _dr.ext_of(p) in _dr.TEXT_EXTS:
                             try:
@@ -3240,7 +3669,7 @@ class AgentRunner:
                                     continue
                                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                                     if keyword.lower() in f.read().lower():
-                                        hits.append(f"📄 {os.path.relpath(p, base)}  （内容含“{keyword}”）")
+                                        hits.append(f"▭ {os.path.relpath(p, base)}  （内容含“{keyword}”）")
                             except Exception:
                                 continue
                     if len(hits) >= maxn:
@@ -3252,13 +3681,20 @@ class AgentRunner:
 
             elif name == "file_op":
                 op = (args.get("op") or "").strip().lower()
-                src = self._resolve(args.get("src") or "")
-                dst = self._resolve(args.get("dst") or "") if (args.get("dst") or "").strip() else ""
+                # ★ v9.18.0：先展开环境变量，再解析（`%TEMP%\x` 不再被当成相对路径）
+                src_raw = _sec.normalize_path((args.get("src") or "")) or (args.get("src") or "")
+                dst_raw = _sec.normalize_path((args.get("dst") or "")) if (args.get("dst") or "").strip() else ""
+                src = self._resolve(src_raw)
+                dst = self._resolve(dst_raw) if dst_raw else ""
                 if op not in ("copy", "move", "rename", "delete"):
                     return "[错误] op 必须是 copy / move / rename / delete 之一"
                 if not os.path.exists(src):
                     return f"[错误] 源不存在：{src}"
                 if op == "delete":
+                    # 删/移都会**改动源文件**，所以源路径同样过写闸门
+                    _g = self._guard_write_path(src, confirm_cb, "删除")
+                    if _g:
+                        return _g
                     if confirm_cb is not None and not confirm_cb("删除（移入回收站）：" + src):
                         return "[取消] 用户拒绝删除。"
                     if _to_recycle_bin(src):
@@ -3266,6 +3702,14 @@ class AgentRunner:
                     return f"[错误] 移入回收站失败：{src}"
                 if not dst:
                     return "[错误] 该操作需要 dst 参数（目标路径/新名字）"
+                # 目标路径是"写" —— 统一过闸门（move/rename 还要额外看源）
+                _g = self._guard_write_path(dst, confirm_cb, "复制/移动目标")
+                if _g:
+                    return _g
+                if op in ("move", "rename"):
+                    _g2 = self._guard_write_path(src, confirm_cb, "移动/重命名源")
+                    if _g2:
+                        return _g2
                 if os.path.exists(dst) and not os.path.isdir(dst):
                     return f"[错误] 目标已存在，为避免覆盖已中止：{dst}"
                 try:
@@ -3349,9 +3793,9 @@ class AgentRunner:
                 content = args.get("content") or args.get("markdown") or ""
                 if not str(content).strip():
                     return "[错误] content 为空，请把要写进文档的 Markdown 正文放进 content"
-                path, err = self._resolve_write(raw)
+                path, err = self._resolve_write(raw, confirm_cb, "生成文档")
                 if err:
-                    return f"[错误] {err}"
+                    return _as_error(err)
                 if not docwrite.supported(path):
                     return (f"[错误] 只支持生成 .docx / .xlsx / .pptx / .pdf，"
                             f"收到的是 {os.path.splitext(path)[1] or '（无扩展名）'}")
@@ -3374,20 +3818,57 @@ class AgentRunner:
                         f"| 表格 | / ```代码块```）")
 
             # ============================ 联网 ============================
+            elif name == "web_visit":
+                return self._tool_web_visit(args)
+
             elif name == "web_search":
                 q = (args.get("query") or args.get("q") or "").strip()
+                site = str(args.get("site") or args.get("domain")
+                           or args.get("in_site") or "").strip()
                 if not q:
                     return "[错误] query 为空"
+                try:
+                    limit = int(float(args.get("limit") or 10))
+                except Exception:
+                    limit = 10
+                limit = max(1, min(limit, 30))
+                # 有站点限定时，标题里带上，方便模型/用户一眼看到搜索范围
+                shown = q + (f"（限定站点：{site}）" if site else "")
+
+                # ★ v9.18.0：首选 webcap 的**真·关键词定向搜索**（Bing/百度/
+                #   DuckDuckGo 多引擎自动切换，支持 site: 限定，返回的已经是
+                #   排版好的中文文本）。注意 site 走**独立参数**，别自己往 q 里
+                #   拼 —— webcap._with_site 已经拼过一次，重复拼会变成
+                #   "site:x site:x"。
+                chans = []
+                text = ""
+                try:
+                    from . import webcap as _wc
+                    text = _wc.web_search(q, site=(site or None), limit=limit)
+                except Exception as e:
+                    text = ""
+                    chans.append(f"webcap 异常 {type(e).__name__}: {e}")
+                if text and not str(text).startswith("搜索失败"):
+                    m = re.search(r"引擎：([^\s，,、]+)", str(text))
+                    eng = m.group(1) if m else "多引擎"
+                    return (f"联网搜索「{shown}」\n通道：webcap/{eng}\n\n{text}")
+                if text:
+                    chans.append(str(text).strip().splitlines()[0][:120])
+
+                # 回落：界面注入的端点搜索（模型端点自带的联网能力）
                 if not self.search_cb:
-                    return ("[错误] 当前没有可用的联网搜索通道。"
-                            "请在顶部勾选「联网搜索」或换一个支持联网的模型端点。")
+                    err = ("[错误] 当前没有可用的联网搜索通道。"
+                           "请在顶部勾选「联网搜索」或换一个支持联网的模型端点。")
+                    if chans:
+                        err += "\n（webcap 也没拿到结果：" + "；".join(chans) + "）"
+                    return err
                 try:
                     out = self.search_cb(q)
                 except Exception as e:
                     return f"[错误] 联网搜索失败：{e}"
                 if not out:
                     return f"[错误] 联网搜索「{q}」没有返回内容"
-                return f"联网搜索「{q}」的结果：\n{out}"
+                return (f"联网搜索「{shown}」\n通道：端点搜索\n\n{out}")
 
             elif name == "download_file":
                 url = (args.get("url") or "").strip()
@@ -3397,9 +3878,9 @@ class AgentRunner:
                 if not raw:
                     name = url.split("?")[0].rstrip("/").split("/")[-1] or "download.bin"
                     raw = name
-                path, err = self._resolve_write(raw)
+                path, err = self._resolve_write(raw, confirm_cb, "下载保存")
                 if err:
-                    return f"[错误] {err}"
+                    return _as_error(err)
                 try:
                     import requests
                     with requests.get(url, stream=True, timeout=(10, 60),
@@ -3436,7 +3917,22 @@ class AgentRunner:
                             "<tool_call>{\"name\":\"run_python\",\"arguments\":{}}</tool_call>，"
                             "紧接着跟一个 ```python 代码块``` 放完整代码（真实换行）。")
                 if _py_dangerous(code):
-                    if confirm_cb is not None and not confirm_cb(
+                    # ★ v9.18.0：以前 confirm_cb 为 None 时这个判断直接被跳过 ——
+                    #   也就是"没人确认 = 放行"。后台/定时任务里那就是个缺口。
+                    #   现在改成：没人能确认 -> **拒绝**（宁可不跑，也不默默跑危险代码）。
+                    if confirm_cb is None:
+                        try:
+                            self.trace.add("sandbox_denied",
+                                           {"op": "run_python", "code": code[:200]},
+                                           result="[拒绝] 危险 Python（无确认界面）",
+                                           ok=False, extra={"sandbox": "denied"})
+                        except Exception:
+                            pass
+                        return ("[拒绝] 这段 Python 代码里检测到删除 / 系统级操作"
+                                "（rmtree、winreg、ctypes.windll、reg add、schtasks 等），"
+                                "而当前**没有可以确认的界面**，已拒绝执行。\n"
+                                "请改写成只读写工作区、不碰系统的写法再跑。")
+                    if not confirm_cb(
                             "执行 Python 代码（检测到删除/系统级操作）：\n" + code[:800]):
                         return "[取消] 用户拒绝执行该代码。"
                 exe = _find_python()
@@ -3466,13 +3962,18 @@ class AgentRunner:
                     env = dict(os.environ)
                     env["PYTHONPATH"] = (self.files_dir + os.pathsep
                                          + env.get("PYTHONPATH", ""))
+                    env = _utf8_env(env)        # ★ v9.18.0：子进程统一 UTF-8
                     proc = _winproc.run([exe, tf.name], cwd=self.files_dir,
                                         capture_output=True, timeout=to, env=env)
                     out = _decode(proc.stdout) + _decode(proc.stderr)
                     if len(out) > 8000:
                         out = out[:8000] + "\n...（输出已截断）"
-                    return (f"已执行 Python 代码（解释器：{exe}，工作目录：{self.files_dir}）\n"
-                            f"退出码：{proc.returncode}\n输出：\n```\n{out}\n```")
+                    _rc = proc.returncode
+                    _head = f"[失败] 退出码 {_rc}\n" if _rc != 0 else ""
+                    return (_head
+                            + f"已执行 Python 代码（解释器：{exe}，工作目录：{self.files_dir}）\n"
+                            + f"退出码：{_rc}\n输出：\n```\n{out}\n```"
+                            + _rc_hint(_rc, out))
                 except subprocess.TimeoutExpired:
                     return "[错误] Python 代码执行超时"
                 except Exception as e:
@@ -3552,6 +4053,11 @@ class AgentRunner:
                         cmd += [x for x in shlex.split(str(extra_raw)) if x]
                     except Exception:
                         cmd += str(extra_raw).split()
+                # ★ v9.18.0：extra 里若带 --distpath/--workpath/--specpath，
+                #   会在 PyInstaller 里**覆盖**我们设的产出位置（写到工作区外）。
+                #   这里把三个目录参数在 extra 之后再钉一遍，保证产物永远落在工作区。
+                cmd += ["--distpath", dist_dir, "--workpath", work_dir,
+                        "--specpath", work_dir]
                 cmd.append(py_path)
 
                 try:
@@ -3561,7 +4067,8 @@ class AgentRunner:
                 to = max(60, min(to, 1800))
                 try:
                     proc = _winproc.run(cmd, cwd=os.path.dirname(py_path),
-                                        capture_output=True, timeout=to)
+                                        capture_output=True, timeout=to,
+                                        env=_utf8_env())
                 except subprocess.TimeoutExpired:
                     return (f"[错误] 打包超时（超过 {int(to)} 秒）。"
                             "如果脚本依赖很多，可以在 arguments 里加大 timeout。")
@@ -3644,9 +4151,9 @@ class AgentRunner:
                     raw = "screenshot_" + time.strftime("%Y%m%d_%H%M%S") + ".png"
                 if not os.path.splitext(raw)[1]:
                     raw += ".png"
-                path, err = self._resolve_write(raw)
+                path, err = self._resolve_write(raw, confirm_cb, "保存截图")
                 if err:
-                    return f"[错误] {err}"
+                    return _as_error(err)
                 region = args.get("region")
                 if not _grab_screen(path, region if isinstance(region, list) else None):
                     return "[错误] 截屏失败（可能没有桌面会话权限）"
@@ -3859,7 +4366,12 @@ class AgentRunner:
                 kw = (args.get("keyword") or args.get("query") or "").strip()
                 if not kw:
                     return "[错误] keyword 为空"
-                cdir = os.path.join(self.ws_path, "conversations")
+                # ★ v9.18.0（需求 8）：对话记录搬到了工作区的隐藏内部目录
+                #   （`<工作区>/.awb/conversations`），根目录只留产物。
+                #   用 workspace.internal_dir 走"新位置优先、老位置兜底"的逻辑，
+                #   老工作区没迁移完也照样能搜到。
+                from .workspace import internal_dir as _internal_dir
+                cdir = _internal_dir(self.ws_path, "conversations")
                 if not os.path.isdir(cdir):
                     return "还没有任何历史对话。"
                 low = kw.lower()
@@ -3899,9 +4411,9 @@ class AgentRunner:
                         raw = os.path.basename(src.rstrip("\\/")) + ".zip"
                     if not raw.lower().endswith(".zip"):
                         raw += ".zip"
-                    dst, err = self._resolve_write(raw)
+                    dst, err = self._resolve_write(raw, confirm_cb, "生成压缩包")
                     if err:
-                        return f"[错误] {err}"
+                        return _as_error(err)
                     try:
                         if os.path.isdir(src):
                             base = os.path.dirname(dst)
@@ -3917,15 +4429,20 @@ class AgentRunner:
                         return f"[错误] 压缩失败：{e}"
                     return f"[成功] 已压缩：{path}（{_human_size(os.path.getsize(path))}）"
                 if op in ("unzip", "解压", "extract"):
-                    src = self._resolve(args.get("src") or "")
+                    src = self._resolve(_sec.normalize_path(args.get("src") or "")
+                                        or (args.get("src") or ""))
                     if not os.path.isfile(src):
                         return f"[错误] 压缩包不存在：{src}"
                     raw = (args.get("dst") or "").strip()
                     if raw:
-                        out = self._resolve(raw)
+                        out = self._resolve(_sec.normalize_path(raw) or raw)
                     else:
                         out = os.path.join(os.path.dirname(src),
                                            os.path.splitext(os.path.basename(src))[0])
+                    # 解压 = 往 out 里大量写文件 —— 必须过写闸门
+                    _g = self._guard_write_path(out, confirm_cb, "解压")
+                    if _g:
+                        return _g
                     try:
                         with zipfile.ZipFile(src) as z:
                             z.extractall(out)
@@ -4050,9 +4567,9 @@ class AgentRunner:
                 dst_raw = (args.get("dst") or "").strip()
                 dst = None
                 if dst_raw:
-                    dst, err = self._resolve_write(dst_raw)
+                    dst, err = self._resolve_write(dst_raw, confirm_cb, "保存图片")
                     if err:
-                        return f"[错误] {err}"
+                        return _as_error(err)
                 try:
                     return "[成功] " + _image_op(src, dst, op, args)
                 except Exception as e:
@@ -4060,9 +4577,9 @@ class AgentRunner:
 
             elif name == "create_chart":
                 raw = (args.get("path") or "chart.png").strip()
-                path, err = self._resolve_write(raw)
+                path, err = self._resolve_write(raw, confirm_cb, "生成图表")
                 if err:
-                    return f"[错误] {err}"
+                    return _as_error(err)
                 try:
                     return "[成功] " + _create_chart(
                         path, args.get("chart") or "bar",
@@ -4172,9 +4689,9 @@ class AgentRunner:
                             or args.get("path") or "").strip()
                 save_path, err = (None, None)
                 if raw_save:
-                    save_path, err = self._resolve_write(raw_save)
+                    save_path, err = self._resolve_write(raw_save, confirm_cb, "保存查询结果")
                     if err:
-                        return f"[错误] save_to 不合法：{err}"
+                        return _as_error(err, "save_to 不合法：")
                 else:
                     # 批量查询必须有产物：模型忘了给路径时，程序自动补一个。
                     # 阈值 2：≥2 个值就算批量（用户验收看的就是这份表）；
@@ -4375,6 +4892,15 @@ class AgentRunner:
             # ---------- 向用户提问（v9.17.0）----------
             elif name == "ask_user":
                 return self._tool_ask_user(args)
+
+            # ---------- 扩容工具集（v9.18.0，需求「工具再多一点」）----------
+            #   实现都在 app/tools_more.py（fn 永远返回中文、永远不抛异常）。
+            #   这里只做「按名分发 + 传 ctx（Agent 实例，供工具取工作目录）」。
+            elif name in _tools_more.TOOLS_MORE:
+                try:
+                    return _tools_more.TOOLS_MORE[name]["fn"](args, self)
+                except Exception as e:            # 双保险：fn 内部已兜，这里再兜一层
+                    return f"[错误] {name} 执行异常：{e}"
 
             else:
                 low = (name or "").lower().replace("-", "_")

@@ -31,21 +31,33 @@ from .. import (config, llm_client, workspace as ws_mod, agent as agent_mod,
                 skills as skills_mod, scheduler as _sched_mod,
                 hotkey as _hotkey_mod, worklog as _worklog_mod,
                 assistant as assistant_mod,
-                taskman as _taskman_mod, team as _team_mod)
+                taskman as _taskman_mod, team as _team_mod, icons as _icons_mod,
+                # ★ v9.18.0（需求 13）：预置团队人设（谁在协作），对话内团队条要用
+                team_presets)
 from ..deepseek_web import service as _dsw_service
 from .chat_worker import ChatWorker
 from .startup_dialog import StartupDialog
 from .panels import PlanPanel
 from .widgets import (MessageCard, ThinkingIndicator, make_icon, tool_label,
                       strip_tool_markup, BODY_WIDTH, ChatInput, file_write_stats,
-                      StatusLine, tool_verb, AskUserDialog)
+                      StatusLine, tool_verb, AskUserDialog, ProcessGroup,
+                      ReasoningCard)
 from .voice_bar import VoiceInput
 from .pages import (NavRail, WelcomeView, MemoryPage, TracePage,
                     IntegrationPage, SettingsPage, AboutPage,
                     SkillsPage, TasksPage, AssistantPage, PAGES,
-                    BgTasksPage, TeamPage)
+                    BgTasksPage, TeamPage, BrowserPage)
+# ★ v9.18.0（需求 13）：对话内「团队」条 —— 用户要的是"在对话里选团队"，
+#   不是跳去另一个页面点。控件自包含（不反向 import 本文件），可以独立测试。
+from .team_bar import TeamBar
 
 RADIUS_CARD = 12
+
+# 用户消息里"带了附件"那行标注的前缀。
+# ★ v9.18.0（需求 16）：字形从 `app/icons.py` 取，**这里和 _visible_user_text()
+#   必须用同一个常量** —— 以前两处各写一遍字面量 emoji，换图标时就会漏掉一处，
+#   表现为"编辑消息后附件标注被当成正文带回输入框"。
+ATTACH_MARK = _icons_mod.ic("attach") + " 已附："
 
 # 自动化测试（离屏）时不要弹模态框，否则会一直等人点确定。
 _NO_MODAL = bool(os.environ.get("AIWORKBENCH_TEST"))
@@ -82,6 +94,80 @@ class TitleWorker(QThread):
             self.done.emit("")
 
 
+class TeamJob(QThread):
+    """在后台线程里跑完整支团队（v9.18.0，需求 13）。
+
+    `TeamRun.run()` 是**同步**的（4 个阶段：总监派单 → 并行建造 → 独立校验 →
+    总监汇总），直接在主线程调用会把界面冻住几分钟，所以丢进 QThread。
+
+    过程事件不走这里 —— `TeamRun` 构造时注入的 `on_event` 内部只做
+    `self._team_evt.emit(...)`（纯信号，不碰控件），因此从哪个线程抛来都安全。
+    这里只负责"跑完了"这一刻，把整个 TeamRun 交回 UI 线程。
+
+    ⚠ 必须持有引用（`MainWindow._team_jobs`），否则 QThread 对象被 GC 掉会
+      `QThread: Destroyed while thread is still running` 直接崩。
+    """
+
+    done_one = pyqtSignal(str, object)      # (cid, TeamRun)
+
+    def __init__(self, trun, cid="", parent=None):
+        super().__init__(parent)
+        self.trun = trun
+        self.cid = cid
+
+    def run(self):
+        try:
+            self.trun.run()
+        except Exception as e:                       # noqa: BLE001
+            # 团队引擎自己会吞掉大部分异常；真的漏出来也要落成错误，
+            # 不能只留一个静默死掉的线程（用户会看到"一直在跑"）。
+            try:
+                self.trun.error = f"{type(e).__name__}: {e}"
+                self.trun.status = "failed"
+            except Exception:
+                pass
+        self.done_one.emit(self.cid, self.trun)
+
+
+class ConvRun:
+    """**一个对话自己的**运行时状态（v9.18.0，需求 7）。
+
+    用户原话：「增加多任务、多进程、多对话可以同时进行，每个对话都是独立的，
+    可以同时运行，现在就是在一个对话思考的时候点到别的对话会显示思考中，
+    然后真正对话中本轮之前的输出内容也可能会消失，修复这个 bug」。
+
+    病根：老实现把这些状态（`running` / `live_text` / `worker` / `pending_tool`）
+    直接挂在 `MainWindow` 上 —— **整整一个程序只有一份**。于是在 A 对话思考时切到
+    B 对话：B 会显示成"A 还在思考"（读的是同一个 `self.running`），而 A 本轮已经
+    产出、但还没写进对话记录的过程/正文，被切走时清掉就再也回不来了。
+
+    现在每个对话一份，互不干扰：切走→状态留在自己那份里；切回来→原样恢复。
+    """
+
+    __slots__ = ("cid", "worker", "running", "live_text", "pending_tool",
+                 "live_card", "last_model_label", "dsw_selected",
+                 "live_reason", "reason_card", "team_run")
+
+    def __init__(self, cid=""):
+        self.cid = cid
+        self.worker = None
+        self.running = False
+        self.live_text = ""
+        self.pending_tool = []
+        self.live_card = None
+        self.last_model_label = ""
+        self.dsw_selected = False
+        # ★ v9.18.0（需求 17）：正在实时滚动的思维链正文，以及那张「◈ 思考中」
+        #   卡片的引用。和 live_text / live_card 一样，**每个对话各一份** ——
+        #   切到别的对话时思考不会被清掉，切回来接着看。
+        self.live_reason = ""
+        self.reason_card = None
+        # ★ v9.18.0（需求 13）：这一轮如果是团队在干活，这里放那个 TeamRun。
+        #   放**每个对话自己**这份里，于是「A 对话的团队在跑、B 对话照常聊天」
+        #   互不干扰，`_interrupt()` 也能精确停到当前对话那支队伍。
+        self.team_run = None
+
+
 class MainWindow(QMainWindow):
     # 后台任务（定时 / 子代理）跨线程回报
     sched_done = pyqtSignal(dict)
@@ -111,6 +197,116 @@ class MainWindow(QMainWindow):
     _bg_changed = pyqtSignal(str)          # 传任务号（只用于区分，界面整体刷新）
     _team_changed = pyqtSignal(str)
     _bg_notice = pyqtSignal(str)           # 后台 AI/团队完成后的提示
+    # ★ v9.18.0（需求 13）：对话内团队的过程事件（后台线程 -> 界面）。
+    #   `TeamRun._emit` 是在**成员线程**里被调用的（taskman.submit(..., nested=True)
+    #   的线程，或 TeamJob 线程）—— 直接摸控件就是随机崩，必须过一道信号。
+    #   payload 是 dict，所以第二个参数用 `object`（pyqtSignal 不支持原生 dict）。
+    _team_evt = pyqtSignal(str, object)
+
+    # ---------- ★ v9.18.0：把"运行态"按对话分派（需求 7）----------
+    # 下面这些名字以前是 MainWindow 的普通实例属性（全局只有一份）。现在改成
+    # property，读写都会落到"**当前对话**的那一份 ConvRun"上 —— 于是全文件里
+    # 几百处 `self.running` / `self.live_text` / `self.worker` 一行都不用改，
+    # 就自动变成了"每个对话各自独立"。
+    def _conv_cid(self):
+        try:
+            return (self.conv or {}).get("id") or ""
+        except Exception:
+            return ""
+
+    def _run(self, cid=None):
+        """取（必要时新建）某个对话的运行时状态。cid 缺省 = 当前对话。"""
+        try:
+            cid = self._conv_cid() if cid is None else cid
+            runs = self.__dict__.setdefault("_runs", {})
+            r = runs.get(cid)
+            if r is None:
+                r = ConvRun(cid)
+                runs[cid] = r
+            return r
+        except Exception:                       # 极端兜底：绝不因为状态机崩掉界面
+            if not hasattr(self, "_fallback_run"):
+                self._fallback_run = ConvRun("")
+            return self._fallback_run
+
+    def _is_current(self, cid):
+        """这个回调是不是来自"当前正显示的那个对话"（不是就别去动界面）。"""
+        return (cid or "") == self._conv_cid()
+
+    def _any_running(self):
+        return any(r.running for r in self._runs.values())
+
+    @property
+    def running(self):
+        return self._run().running
+
+    @running.setter
+    def running(self, value):
+        self._run().running = bool(value)
+
+    @property
+    def live_text(self):
+        return self._run().live_text
+
+    @live_text.setter
+    def live_text(self, value):
+        self._run().live_text = value or ""
+
+    @property
+    def pending_tool(self):
+        return self._run().pending_tool
+
+    @pending_tool.setter
+    def pending_tool(self, value):
+        self._run().pending_tool = list(value or [])
+
+    @property
+    def worker(self):
+        return self._run().worker
+
+    @worker.setter
+    def worker(self, value):
+        self._run().worker = value
+
+    @property
+    def _live_card(self):
+        return self._run().live_card
+
+    @_live_card.setter
+    def _live_card(self, value):
+        self._run().live_card = value
+
+    @property
+    def live_reason(self):
+        return self._run().live_reason
+
+    @live_reason.setter
+    def live_reason(self, value):
+        self._run().live_reason = value or ""
+
+    @property
+    def _reason_card(self):
+        return self._run().reason_card
+
+    @_reason_card.setter
+    def _reason_card(self, value):
+        self._run().reason_card = value
+
+    @property
+    def _last_model_label(self):
+        return self._run().last_model_label
+
+    @_last_model_label.setter
+    def _last_model_label(self, value):
+        self._run().last_model_label = value or ""
+
+    @property
+    def _dsw_selected(self):
+        return self._run().dsw_selected
+
+    @_dsw_selected.setter
+    def _dsw_selected(self, value):
+        self._run().dsw_selected = bool(value)
 
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
@@ -151,7 +347,7 @@ class MainWindow(QMainWindow):
         # ---- 并行任务 + 团队（v9.16.0）----
         # 用户要的是"跑慢命令不阻塞模型继续思考 / 多条链路同时执行 / 一支小队独立跑"。
         # 这里建两个管理器，并把它们的变更接到 Qt 信号上 ——
-        # ⚠️ 回调是在**后台线程**里触发的，绝不能直接去摸控件，必须转成信号
+        # ⚠ 回调是在**后台线程**里触发的，绝不能直接去摸控件，必须转成信号
         #    （队列连接）再在 UI 线程刷新，否则就是随机崩。
         self.taskman = _taskman_mod.TaskManager(
             self.workspace.path,
@@ -162,6 +358,10 @@ class MainWindow(QMainWindow):
         self._bg_changed.connect(self._refresh_bg_pages)
         self._team_changed.connect(self._refresh_team_pages)
         self._bg_notice.connect(self._on_bg_notice)
+        # ★ v9.18.0（需求 13）：团队过程事件（后台线程）-> UI 线程
+        self._team_evt.connect(self._on_team_evt)
+        # 同时起的团队可能不止一支（每个对话一支）；持有引用防 QThread 被 GC
+        self._team_jobs = {}
         self.mcp = mcp_client.MCPManager(self.workspace.path)
         self.speaker = tts_mod.Speaker()
         self.speaker.engine = self.settings.get("tts_engine", "sapi")
@@ -179,23 +379,23 @@ class MainWindow(QMainWindow):
         self._wrapup_busy = False    # 自动记忆（模型提炼）是否正在跑，防叠
         self.auto_mem_recent = []    # 界面显示：最近自动写入的记忆
         self.conv = None
-        self.worker = None
+        # ★ v9.18.0（需求 7）：每个对话一份运行态。下面这些"运行态"名字都通过
+        #   property 路由到当前对话那一份（见类顶部的 property 块），全文件其它
+        #   地方照旧写 `self.running` 就行。
+        self._runs = {}
         self.title_worker = None
-        self.running = False
-        self.live_text = ""
-        self.pending_tool = []
         self._cards = []
-        self._live_card = None
-        self._last_model_label = ""
-        self._dsw_selected = False      # 本轮是否使用「DeepSeek 网页版」（状态行用）
+        self._groups = []               # 过程折叠组 [(group, key)]
         self._pending_update = None
         # 折叠卡片的用户手动展开/收起，用消息对象身份 (id(msg), 角色) 记住，重建时恢复
         self._card_collapsed = {}
         # 重建后要恢复的滚动位置：(是否贴底, 旧值)
         self._pending_scroll = (True, 0)
         # 助理：钉钉消息 -> AI 处理 -> 结果发回钉钉
+        # ★ v9.18.0（需求 8）：配置文件跟其它内部数据一起收进 `.awb/`，
+        #   工作区根目录只留产物（见 workspace._migrate_layout）。
         self.assistant = assistant_mod.AssistantService(
-            self.ding, os.path.join(self.workspace.path, "assistant.json"))
+            self.ding, self.workspace.assistant_file)
         self._asst_queue = []       # 待处理的消息
         self._asst_worker = None    # 正在处理消息的 worker
         self._asst_cur = None       # 正在处理的那条消息
@@ -656,9 +856,61 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ---------- 全局左栏（v9.18.0 需求 10）----------
+        # 用户原话：「去掉左侧菜单栏，统一在对话列表上方弄出几行这样的选项」。
+        # 所以原来那条 76px 的竖直图标栏没了 —— 现在整个左栏是一块**常驻面板**：
+        #   上：几行导航格子（对话 / 助理 / 技能 / …）
+        #   下：对话列表 + 新建 / 删除
+        # 之所以做成"常驻"而不是继续塞在对话页里：切到别的页面时导航必须还在，
+        # 否则回不了对话页。
+        self.side = QWidget()
+        self.side.setObjectName("SidePanel")
+        self.side.setFixedWidth(226)
+        sv = QVBoxLayout(self.side)
+        sv.setContentsMargins(10, 12, 8, 12)
+        sv.setSpacing(8)
+
         self.nav = NavRail()
         self.nav.changed.connect(self._open_page)
-        root.addWidget(self.nav)
+        sv.addWidget(self.nav)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{themes.tokens()['nav_border']};")
+        sv.addWidget(sep)
+
+        # 对话列表整块单独包一层：顶栏「☰ 列表」按钮收放的是**这一块**，
+        # 导航格子不受影响（否则收起列表后就没法切页了）。
+        self.conv_block = QWidget()
+        cv = QVBoxLayout(self.conv_block)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(6)
+        side_lbl = QLabel("对话列表")
+        side_lbl.setObjectName("SideTitle")
+        cv.addWidget(side_lbl)
+        self.conv_list = QListWidget()
+        self.conv_list.itemClicked.connect(self._on_conv_selected)
+        cv.addWidget(self.conv_list, 1)
+        self.new_btn = QPushButton("＋ 新建对话")
+        self.new_btn.setFixedHeight(32)
+        self.new_btn.clicked.connect(self._new_conversation)
+        self.del_btn = QPushButton("删除当前")
+        self.del_btn.setObjectName("cardBtn")
+        self.del_btn.setFixedHeight(28)
+        self.del_btn.clicked.connect(self._delete_conversation)
+        cv.addWidget(self.new_btn)
+        cv.addWidget(self.del_btn)
+        sv.addWidget(self.conv_block, 1)
+
+        # 侧栏最底部：老的「工具调用轨迹」页入口（需求 10 把它从导航里拿掉了，
+        # 但页面还在栈里，留一行小字进去，功能不丢）。
+        self.trace_link = QPushButton("▦ 工具调用记录")
+        self.trace_link.setObjectName("SideLink")
+        self.trace_link.setToolTip("查看每一次工具调用的输入 / 输出 / 耗时")
+        self.trace_link.clicked.connect(lambda: self.nav.select("tools"))
+        sv.addWidget(self.trace_link)
+
+        root.addWidget(self.side)
 
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
@@ -750,6 +1002,17 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.page_about)
         self.page_about.check_update.connect(lambda: self._do_update_check(False))
 
+        # ★ v9.18.0（需求 2）：内嵌浏览器页。
+        #   ⚠ 顺序要求：`PAGES` 末尾也要追加 ("browser", ...) —— `_open_page` 是拿
+        #     PAGES 的下标当 stack 下标的，两边顺序必须严格一一对应。
+        #   BrowserPage 是**懒加载**的：这里只建个空壳，Chromium 内核等这一页第一次
+        #   被打开时才实例化（否则每个用户一启动就白吃一百多 MB 内存）。
+        #   信号连在 BrowserPage.fetched 上（它转发内部 BrowserPane 的回执），
+        #   所以不用担心"连的时候 pane 还没建"。
+        self.page_browser = BrowserPage()
+        self.stack.addWidget(self.page_browser)
+        self.page_browser.fetched.connect(self._on_browser_fetched)
+
         self.statusBar().showMessage("就绪")
 
     # ================= 对话页 =================
@@ -768,7 +1031,7 @@ class MainWindow(QMainWindow):
         tb = QHBoxLayout(top)
         tb.setContentsMargins(12, 6, 12, 6)
         tb.setSpacing(8)
-        self.page_title = QLabel("💬 对话")
+        self.page_title = QLabel("▤ 对话")
         self.page_title.setObjectName("PageTitle")
         tb.addWidget(self.page_title)
         tb.addStretch(1)
@@ -796,31 +1059,9 @@ class MainWindow(QMainWindow):
             _c.setParent(page)
             _c.setVisible(False)
 
-        # ---------- 主体：左列表 + 右聊天 ----------
+        # ---------- 主体：只剩聊天区（左侧列表已上移到全局侧栏，见需求 10）----------
         body = QHBoxLayout()
         body.setSpacing(10)
-
-        self.left_panel = QWidget()
-        self.left_panel.setFixedWidth(196)
-        lv = QVBoxLayout(self.left_panel)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(7)
-        lbl = QLabel("对话列表")
-        lbl.setStyleSheet(f"color:{t['text']};font-size:13px;font-weight:bold;")
-        lv.addWidget(lbl)
-        self.conv_list = QListWidget()
-        self.conv_list.itemClicked.connect(self._on_conv_selected)
-        lv.addWidget(self.conv_list, 1)
-        self.new_btn = QPushButton("＋ 新建对话")
-        self.new_btn.setFixedHeight(32)
-        self.new_btn.clicked.connect(self._new_conversation)
-        self.del_btn = QPushButton("删除当前")
-        self.del_btn.setObjectName("cardBtn")
-        self.del_btn.setFixedHeight(28)
-        self.del_btn.clicked.connect(self._delete_conversation)
-        lv.addWidget(self.new_btn)
-        lv.addWidget(self.del_btn)
-        body.addWidget(self.left_panel, 0)
 
         right = QVBoxLayout()
         right.setSpacing(8)
@@ -831,8 +1072,9 @@ class MainWindow(QMainWindow):
             f"background:{t['chat_bg']};border-radius:{RADIUS_CARD}px;")
         self.chat_container = QWidget()
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setContentsMargins(12, 12, 12, 12)
-        self.chat_layout.setSpacing(10)
+        self.chat_layout.setContentsMargins(12, 10, 12, 12)
+        # ★ v9.18.0（需求 9）：行距收紧（10 -> 6），消息之间更紧凑
+        self.chat_layout.setSpacing(6)
         self.chat_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.chat_scroll.setWidget(self.chat_container)
         right.addWidget(self.chat_scroll, 1)
@@ -887,7 +1129,7 @@ class MainWindow(QMainWindow):
         self.model_combo.setToolTip("选择本次对话使用的模型")
         self.model_combo.currentIndexChanged.connect(self._on_model_change)
 
-        self.mic_btn = QPushButton("🎙")
+        self.mic_btn = QPushButton("◍")
         self.mic_btn.setObjectName("InputIcon")
         self.mic_btn.setCheckable(True)
         self.mic_btn.setFixedSize(32, 32)
@@ -926,6 +1168,19 @@ class MainWindow(QMainWindow):
         # 正在生成回复 / 正在联网搜索 / 正在运行验证。
         self.state_line = StatusLine()
         right.addWidget(self.state_line)
+        # ★★ v9.18.0（需求 13）：团队**搬进对话**。
+        #   用户原话：「你团队的功能根本就做的不对，这个功能是直接放到对话中的，
+        #   对话时可以选择使用团队……」→ 在状态行与输入卡片之间夹一条紧凑的
+        #   团队条：左边「⬡ 团队：不使用 ▾」选队伍，中间是成员名片，右边是阶段提示。
+        #   侧栏那个「团队」格子同时在 pages.NAV_CHIPS 里撤掉（回看历史运行的入口
+        #   挪到本控件的下拉菜单最底部）。
+        #   ⚠ 这里**绝不**能提前调 `setVisible(True)` —— 控件此刻还没有父窗口，
+        #     那等价于 show()，会当场变成一扇真实顶层窗口（v9.17.0 那批
+        #     "弹一堆小窗口"就是这个机理）。加进布局即可，由父窗口统一显示。
+        self.team_bar = TeamBar()
+        self.team_bar.team_changed.connect(self._on_team_choice)
+        self.team_bar.open_page.connect(self._open_page)
+        right.addWidget(self.team_bar)
         right.addWidget(self.input_card)
 
         body.addLayout(right, 1)
@@ -936,6 +1191,9 @@ class MainWindow(QMainWindow):
         self._render_timer = QTimer()
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._update_live)
+        # 流式刷新节拍（毫秒）。★ v9.18.0（需求 6）：不再是写死的 80ms，
+        # 由 `_tune_live_interval` 按上一次渲染的真实耗时自适应升降。
+        self._live_interval = 110
         return page
 
     def _style_input_area(self):
@@ -988,8 +1246,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"界面缩放：{self.settings['font_scale']}%", 4000)
 
     def _toggle_conv_list(self):
-        show = self.list_btn.isChecked()
-        self.left_panel.setVisible(show)
+        """顶栏「☰ 列表」：只收放侧栏里的**对话列表**那一块。
+
+        v9.18.0（需求 10）：导航格子不能跟着一起收 —— 否则在别的页面上
+        把列表收起后就再也切不回对话页了。
+        """
+        self.conv_block.setVisible(self.list_btn.isChecked())
 
     def _update_page_title(self):
         """顶栏只显示当前会话标题（极简）。"""
@@ -998,7 +1260,7 @@ class MainWindow(QMainWindow):
         if len(title) > 24:
             title = title[:24] + "…"
         try:
-            self.page_title.setText("💬 " + title)
+            self.page_title.setText("▤ " + title)
         except Exception:
             pass
 
@@ -1008,6 +1270,12 @@ class MainWindow(QMainWindow):
         keys = [k for k, _i, _n in PAGES]
         idx = keys.index(key) if key in keys else 0
         self.stack.setCurrentIndex(idx)
+        # ★ v9.18.0（需求 10）：代码里直接翻页（托盘菜单、向导跳转等）时，
+        #   侧栏高亮也要跟着走，否则会出现"页面是设置、高亮还停在对话"的错位。
+        try:
+            self.nav.set_current(key)
+        except Exception:
+            pass
         if key == "assistant":
             self.page_assistant.load_cfg(self.assistant.cfg)
         if key == "skills":
@@ -1035,6 +1303,45 @@ class MainWindow(QMainWindow):
         elif key == "chat":
             self.input.setFocus()
             self._scroll_to_bottom(True)
+        elif key == "browser":
+            # 打开浏览器页：先把内核拉起来（懒加载），再把光标放进地址栏，省一次点击
+            try:
+                pane = self.page_browser.ensure_pane()
+                if pane is not None:
+                    pane.addr.setFocus()
+            except Exception:
+                pass
+
+    def _on_browser_fetched(self, res):
+        """内嵌浏览器「交给 AI 分析当前页」的回执（v9.18.0 需求 2）。
+
+        做法刻意保守：**不直接替用户发消息**，而是把「渲染后的正文 + 抓到的数据接口」
+        整理成一段现成的话填进输入框，用户看一眼按 Enter 就行。
+        这样既省事，又不会让程序自作主张烧一次模型额度。
+        """
+        res = res or {}
+        url = res.get("final_url") or res.get("url") or ""
+        body = str(res.get("text") or "").strip()
+        xhr = res.get("xhr") or []
+        lines = [f"请分析这个页面：{url}", ""]
+        if xhr:
+            lines.append(f"页面发出的数据接口（{len(xhr)} 个，前面这些最像真接口）：")
+            for it in xhr[:10]:
+                lines.append(f"- {it.get('method') or 'GET'} {it.get('url') or ''}")
+            lines.append("")
+        if body:
+            lines.append("页面正文（已截断）：")
+            lines.append(body[:2500])
+        try:
+            self._open_page("chat")
+            self.input.setPlainText("\n".join(lines)[:6000])
+            self.input.setFocus()
+            n = len(res.get("requests") or [])
+            self.statusBar().showMessage(
+                f"已把当前页内容（{n} 个请求 / {len(xhr)} 个疑似接口）填到输入框，"
+                "按 Enter 交给 AI", 8000)
+        except Exception:
+            pass
 
     # ================= 工作区 =================
     def _make_runner(self):
@@ -1058,6 +1365,12 @@ class MainWindow(QMainWindow):
         # ★ v9.17.0：把"当前对话的记忆文件"告诉工具层（remember/recall 用它决定
         #   记到本对话还是主记忆）。用回调而不是一次性取值，切换对话后自动跟随。
         r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
+        # ★ v9.18.0 行为修复（根因 D）：产物目录同样改成回调。
+        #   files_dir 原来只在构造时取一次（那时还没选定对话 → 落到
+        #   `chats/00_历史文件/files`），切对话后永不更新。
+        #   现在每次用都从 workspace 实时取 → 切到哪个对话，产物就写进哪个
+        #   对话自己的 `chats/<NN_标题>/files`（需求 8）。
+        r.files_dir_cb = lambda: self.workspace.files_dir
         return r
 
     # ================= 工作总结 + 自动记忆（每轮结束都会跑） =================
@@ -1111,13 +1424,13 @@ class MainWindow(QMainWindow):
             brief = "；".join(t for _c, t in added[:3])
             if ui:
                 self.auto_mem_recent = (added + self.auto_mem_recent)[:50]
-                self.statusBar().showMessage(f"🧠 已自动记入长期记忆：{brief}", 9000)
+                self.statusBar().showMessage(f"◈ 已自动记入长期记忆：{brief}", 9000)
                 try:
                     self.page_memory.refresh()
                 except Exception:
                     pass
             else:
-                self.wrapup_notice.emit(f"🧠 已自动记入长期记忆：{brief}")
+                self.wrapup_notice.emit(f"◈ 已自动记入长期记忆：{brief}")
 
         # 3) 语义层：让便宜模型再提炼「结论 / 待办」等（后台线程，不阻塞界面）
         if (tools or files) and not self._wrapup_busy:
@@ -1147,7 +1460,7 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                     brief = "；".join(t for _c, t in new[:3])
-                    self.wrapup_notice.emit(f"🧠 记忆提炼：{brief}")
+                    self.wrapup_notice.emit(f"◈ 记忆提炼：{brief}")
             except Exception:
                 pass
             finally:
@@ -1202,7 +1515,7 @@ class MainWindow(QMainWindow):
     def _on_bg_changed(self, task, light=False):
         """后台线程回调：转成 Qt 信号（队列连接），回到 UI 线程再刷新。
 
-        ⚠️ 这里必须节流：打包这类任务的日志每秒可能几百行，
+        ⚠ 这里必须节流：打包这类任务的日志每秒可能几百行，
            每行都刷一次表格会把 UI 线程淹掉（表现就是"界面卡了"）。
            状态变化（light=False）不节流 —— 那是用户最需要马上看到的。
         """
@@ -1229,7 +1542,7 @@ class MainWindow(QMainWindow):
                 self.page_bg.reload()
             n = self.taskman.running_count()
             if n:
-                self.statusBar().showMessage(f"⚡ 后台有 {n} 个任务在跑")
+                self.statusBar().showMessage(f"⟳ 后台有 {n} 个任务在跑")
         except Exception:
             pass
 
@@ -1290,16 +1603,25 @@ class MainWindow(QMainWindow):
             pass
         return allow
 
-    def _bg_agent_run(self, task_text, title="", max_steps=8):
+    def _bg_agent_run(self, task_text, title="", max_steps=8, work_dir=None):
         """在**当前线程**（后台任务线程）里跑一条独立 AI 链路，返回 {"text","files"}。
 
         为什么要自己建 client：`self.bg_client` 是共享实例，多个后台 AI 同时用它
         会互相抢状态（模型选择、取消标志、流式回调）。**每条链路一个客户端**才干净。
+
+        `work_dir`：v9.18.0（需求 13）新加。团队成员的产物必须落在 TeamRun 指定的
+        目录里（`team/<id>/<member>_files`），团队总监汇总阶段才登记得到这些文件；
+        不传则沿用原来的独立沙箱 `.awb/bgagent/<tag>/files`。
         """
         import uuid as _uuid
         tag = time.strftime("%m%d-%H%M") + "-" + _uuid.uuid4().hex[:4]
-        base = os.path.join(self.workspace.path, "bgagent", tag)
-        files_dir = os.path.join(base, "files")
+        if work_dir:
+            base = os.path.abspath(str(work_dir))
+            files_dir = base
+        else:
+            # ★ v9.18.0（需求 8）：后台 AI 的工作目录也收进 `.awb/`
+            base = os.path.join(self.workspace.internal("bgagent"), tag)
+            files_dir = os.path.join(base, "files")
         os.makedirs(files_dir, exist_ok=True)
 
         cli = llm_client.LLMClient()
@@ -1326,7 +1648,7 @@ class MainWindow(QMainWindow):
             "- 你在**独立线程**里跑，用户不会实时看到你的每一步，所以最后必须"
             "用一段清楚的中文说明你做了什么、文件在哪。\n"
             "- 你的工作目录是独立沙箱，写文件用相对路径即可。\n"
-            "- ⚠️ 你**不能执行需要用户确认的危险操作**（run_command / 删除文件）："
+            "- ⚠ 你**不能执行需要用户确认的危险操作**（run_command / 删除文件）："
             "这类调用会被直接拒绝。要跑代码请用 run_python。\n"
             "- 不要编造结果；没做到就如实说没做到。"
         )
@@ -1376,11 +1698,33 @@ class MainWindow(QMainWindow):
                 "tools": sorted(tools_used)}
 
     # ---------- 团队 ----------
-    def _team_start(self, goal, roles=None, max_steps=6):
+    def _team_member_run(self, member_id, prompt, files_dir, max_steps):
+        """`TeamRun` 的**成员执行器**（v9.18.0 需求 13 接线）。
+
+        为什么必须有这一层适配：`TeamRun._run_member` 是按
+            agent_fn(member_id, prompt, files_dir, max_steps) -> {"text","files"}
+        去调的（见 `app/team.py:271`），而 `_bg_agent_run(task_text, title="", max_steps=8)`
+        是"一条独立 AI 链路"的入口、自己开沙箱目录 —— 两个签名**位置参数含义不同**。
+
+        ⚠ 直接传 `self._bg_agent_run` 的后果（老代码就是这么写的，实为死路）：
+          `files_dir` 会落到 `title` 上，而 `max_steps` 会收到一个**路径字符串**，
+          紧接着 `int(max_steps or 8)` 抛 ValueError —— 整支团队第一步就崩。
+          所以这里显式把位置参数重新绑好，并把团队给的目录当成工作目录。
+        """
+        res = self._bg_agent_run(str(prompt or ""),
+                                 title=f"团队成员 {member_id}",
+                                 max_steps=int(max_steps or 8) or 8,
+                                 work_dir=files_dir)
+        if isinstance(res, dict):
+            return res
+        return {"text": str(res or ""), "files": []}
+
+    def _team_start(self, goal, roles=None, max_steps=6, team_id=None):
         """起一支团队：立刻返回 TeamRun，真正的执行在后台任务里。"""
-        run = self.teamman.create(goal, self._bg_agent_run,
+        run = self.teamman.create(goal, self._team_member_run,
                                   taskman=self.taskman,
-                                  roles=roles, max_steps=max_steps)
+                                  roles=roles, max_steps=max_steps,
+                                  team_id=team_id)
         holder = {}
 
         def _fn(task=None):
@@ -1405,8 +1749,10 @@ class MainWindow(QMainWindow):
         return run
 
     # 供工具层调用（同名不同用途，保持一处实现）
-    def _team_start_sync(self, goal, roles=None, max_steps=6):
-        return self._team_start(goal, roles, max_steps)
+    # agent 侧调用签名是 team_cb(goal, roles, max_steps)（见 app/agent.py:2904），
+    # 所以 team_id 必须留成带默认值的关键字参数，别插到中间去。
+    def _team_start_sync(self, goal, roles=None, max_steps=6, team_id=None):
+        return self._team_start(goal, roles, max_steps, team_id=team_id)
 
     def _team_cancel(self, rid):
         run = self.teamman.get(rid)
@@ -1414,6 +1760,158 @@ class MainWindow(QMainWindow):
             run.cancel()
             self.page_team.reload()
             self.statusBar().showMessage(f"已请求停止团队 {rid}", 5000)
+
+    # ---------- 对话内团队（v9.18.0 需求 13）----------
+    def _on_team_choice(self, team_id):
+        """用户在对话里换了一支队伍：记在**这个对话**上，不是全局设置。
+
+        记在每个对话里，才符合"对话时可以选择使用团队" —— 一个对话用软件团队、
+        另一个对话不用团队，互不干扰（和需求 7 的"每个对话独立"是一套逻辑）。
+        """
+        tid = str(team_id or "")
+        if self.conv is not None:
+            self.conv["team_id"] = tid
+            try:
+                self.workspace.save_conversation(self.conv)
+            except Exception:
+                pass
+        if tid:
+            t = team_presets.get_preset(tid) or {}
+            who = "、".join(m["name"] for m in (t.get("members") or []))
+            self._append_system_note(
+                f"⬡ 已把本对话交给团队「{t.get('name', tid)}」。\n"
+                f"成员：{who}\n发出消息后由这支队伍协作完成（可直接说需求）。")
+        else:
+            self._append_system_note("⬡ 本对话已切回普通模式（不再使用团队）。")
+
+    def _sync_team_bar(self):
+        """把**当前对话**记着的团队选择回填到团队条（切对话 / 新建对话时调）。
+
+        `set_team` 对非法或空的 id 会自动回落成「不使用团队」，所以这里不用判空。
+        """
+        bar = getattr(self, "team_bar", None)
+        if bar is None:
+            return
+        try:
+            bar.set_team(str((self.conv or {}).get("team_id") or ""))
+            bar.reset_transient()
+        except Exception:
+            pass
+
+    def _on_team_evt(self, kind, payload):
+        """团队过程事件 —— **已经在 UI 线程**（经 `_team_evt` 信号转过来）。
+
+        两件事：① 团队条上的成员名片亮灯/熄灯；② 关键节点同步到状态行与对话流，
+        免得用户只盯着输入框上方那一行小字。
+        """
+        payload = payload or {}
+        try:
+            self.team_bar.apply_event(kind, payload)
+        except Exception:
+            pass
+        if kind == "phase":
+            self._on_phase("team", payload.get("label") or "")
+        elif kind == "dispatch":
+            n = len(payload.get("tasks") or [])
+            self._append_system_note(
+                f"⬡ 项目总监已把需求拆成 {n} 项派下去，开始并行执行。")
+        elif kind == "member_start":
+            self._on_phase("team", f"{payload.get('name', '')} 正在{payload.get('note') or '工作'}")
+        elif kind == "member_done":
+            mark = (_icons_mod.ic("ok") if payload.get("status") == "done"
+                    else _icons_mod.ic("fail"))
+            self._append_system_note(
+                f"{mark} {payload.get('name', '成员')} · {payload.get('title', '')}"
+                f"（{payload.get('status')}）")
+
+    def _send_team(self, text, team_id, cid, note=""):
+        """把这一轮交给预置团队去做（v9.18.0 需求 13）。
+
+        与普通一轮的唯一差别是「谁来干活」：这里起一支 TeamRun 丢进后台线程，
+        过程事件接到对话内的团队条上，跑完把总监的汇总当成本轮的 assistant 回复。
+        （用户消息在 `_send` 里已经入会话并落盘，所以对话流里顺序是对的。）
+        """
+        run = self._run(cid)
+        run.live_text = ""
+        run.pending_tool = []
+        run.live_reason = ""
+        run.reason_card = None
+        run.running = True
+
+        t = team_presets.get_preset(team_id) or {}
+        try:
+            self.team_bar.reset_transient()
+            self.team_bar.set_phase(f"{t.get('emoji', '')} 队伍已就位，正在开会…")
+        except Exception:
+            pass
+        if self._is_current(cid):
+            self._set_stop_mode(True)
+            self._open_page("chat")
+            self.state_line.set_phase("team", "")
+            self._render(stick=True)
+        self._append_system_note(
+            f"⬡ 本轮交给团队「{t.get('name', team_id)}」执行"
+            f"（成员：{'、'.join(m['name'] for m in (t.get('members') or []))}）。")
+
+        # ⚠ TeamRun._emit 是在成员线程里调的：**只能**发 Qt 信号，绝不能摸控件。
+        def _on_event(kind, payload):
+            self._team_evt.emit(str(kind), payload or {})
+
+        trun = self.teamman.create(
+            text, self._team_member_run, taskman=self.taskman,
+            max_steps=int(self.settings.get("team_max_steps", 6) or 6),
+            team_id=team_id, on_event=_on_event)
+        run.team_run = trun
+
+        job = TeamJob(trun, cid)
+        job.done_one.connect(self._on_team_finished)
+        self._team_jobs[cid] = job        # 持引用，否则 QThread 被 GC 会崩
+        job.start()
+
+    def _on_team_finished(self, cid, trun):
+        """团队跑完：把总监汇总写成**这一轮**的 assistant 回复（v9.18.0 需求 13）。"""
+        run = self._run(cid)
+        run.running = False
+        run.team_run = None
+        self._team_jobs.pop(cid, None)
+
+        status = str(getattr(trun, "status", "") or "")
+        rep = str(getattr(trun, "report", "") or "").strip()
+        if not rep:
+            err = str(getattr(trun, "error", "") or "")
+            if status == "cancelled":
+                rep = "（团队已按你的操作取消，没有产出汇总。）"
+            else:
+                # 绝不能静默收场：用户点一次"发送"什么也没看到，正是要消灭的体验。
+                rep = ("团队这一轮没能给出汇总文字"
+                       + (f"（{err}）" if err else "（成员产出可在「团队」页回看）"))
+        # 1) 写进对话记录。可能用户已经切走了，那就单独读写那个对话。
+        conv = self.conv if self._is_current(cid) else None
+        if conv is None:
+            try:
+                conv = self.workspace.load_conversation(cid)
+            except Exception:
+                conv = None
+        if conv is not None:
+            conv.setdefault("messages", []).append(
+                {"role": "assistant", "content": rep})
+            try:
+                self.workspace.save_conversation(conv)
+            except Exception:
+                pass
+        # 2) 界面收尾
+        if self._is_current(cid):
+            try:
+                self.team_bar.set_phase(
+                    {"done": "✓ 团队已完成", "failed": "✕ 团队执行失败",
+                     "cancelled": "⊘ 团队已取消"}.get(status, "团队已结束"))
+            except Exception:
+                pass
+            self._render_sig = None          # 指纹失效，保证这轮答复一定渲染出来
+            self._set_stop_mode(False)
+            self.state_line.set_phase("idle", "")
+            self._render(stick=True)
+        self._bg_notice.emit(f"团队 {getattr(trun, 'id', '')} 已结束（{status}）")
 
     def _plain_runner(self, allow_subagent=True):
         """给后台线程用的 AgentRunner：只挂不碰界面的回调。"""
@@ -1432,6 +1930,7 @@ class MainWindow(QMainWindow):
             team_cb=self._team_start_sync, bg_agent_cb=self._bg_agent_run,
             subagent_cb=(_sub if allow_subagent else None))
         r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
+        r.files_dir_cb = lambda: self.workspace.files_dir   # ★ 根因 D：同上，实时跟随对话
         return r
 
     def _agent_run_once(self, prompt, max_iter=8, quiet=False,
@@ -1532,7 +2031,7 @@ class MainWindow(QMainWindow):
         tail = "、".join(used[-4:])
         final = (last_text or "（达到步数上限）") + (f"\n（执行过：{tail}）" if tail else "")
         if want_write and not write_done:
-            final += ("\n\n> ⚠️ 这次要求写入/创建文件，但没有成功写出任何文件，"
+            final += ("\n\n> ⚠ 这次要求写入/创建文件，但没有成功写出任何文件，"
                       "请以这条提醒为准。")
         if wrapup_source:
             self._bg_wrapup(wrapup_source, prompt, final, used, runner)
@@ -1589,7 +2088,7 @@ class MainWindow(QMainWindow):
             uniq = list(dict.fromkeys(tools))
             res = f"{res}\n（执行过：{'、'.join(uniq)}）"
         elif agent_mod.is_meta_talk(res):
-            res = ("⚠️ 这次模型没有真正动手（只回了客套话），"
+            res = ("⚠ 这次模型没有真正动手（只回了客套话），"
                    "任务内容可能描述得不够具体。下次触发会再试一次。\n" + str(res))
         if task.get("notify_dingtalk") and self.ding.configured():
             try:
@@ -1630,7 +2129,7 @@ class MainWindow(QMainWindow):
         self.page_tasks.reload()
         self.statusBar().showMessage("定时任务执行完成", 4000)
         self._append_system_note(
-            f"⏰ 定时任务手动执行完成：\n{result[:1500]}")
+            f"◷ 定时任务手动执行完成：\n{result[:1500]}")
 
     def _on_sched_done(self, payload):
         """调度器到点自动跑完后的界面回报。"""
@@ -1638,7 +2137,7 @@ class MainWindow(QMainWindow):
         res = payload.get("result") or ""
         self.page_tasks.reload()
         self._append_system_note(
-            f"⏰ 定时任务「{t.get('name')}」已自动执行：\n{res[:1500]}")
+            f"◷ 定时任务「{t.get('name')}」已自动执行：\n{res[:1500]}")
 
     def _append_system_note(self, text):
         """把后台发生的事写进当前对话（用户看得见）。"""
@@ -1746,10 +2245,17 @@ class MainWindow(QMainWindow):
 
     def _load_conversations(self):
         self.conv_list.clear()
+        cur = self._conv_cid()
         for c in self.workspace.list_conversations():
-            self.conv_list.addItem(c["title"])
-            self.conv_list.item(self.conv_list.count() - 1).setData(
-                Qt.ItemDataRole.UserRole, c["id"])
+            cid = c["id"]
+            # ★ v9.18.0（需求 7）：哪些对话"正在跑"一眼可见（互不影响，可同时跑）
+            running = bool(self._runs.get(cid) and self._runs[cid].running)
+            title = c["title"] + ("　● 运行中" if running else "")
+            self.conv_list.addItem(title)
+            item = self.conv_list.item(self.conv_list.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            if cid == cur:
+                item.setSelected(True)
 
     def _new_conversation(self, silent=False):
         self.conv = self.workspace.new_conversation()
@@ -1759,10 +2265,11 @@ class MainWindow(QMainWindow):
             self.workspace.set_current(self.conv.get("id"))
         except Exception:
             pass
-        self.live_text = ""
-        self.pending_tool = []
         self._card_collapsed = {}      # 换会话：折叠记录随之清空
+        self._render_sig = None        # ★ 换对话必须让渲染指纹失效，否则可能被短路
+        self._sync_team_bar()          # ★ v9.18.0（需求 13）：新对话 = 默认不使用团队
         self._render()
+        self._refresh_run_ui()
         self._update_page_title()
         if not silent:
             self._load_conversations()
@@ -1779,10 +2286,18 @@ class MainWindow(QMainWindow):
                 self.workspace.set_current(conv.get("id"))
             except Exception:
                 pass
-            self.live_text = ""
-            self.pending_tool = []
-            self._card_collapsed = {}  # 换会话：折叠记录随之清空
+            # ★★ v9.18.0（需求 7）：**绝对不能**在这里把 live_text / pending_tool 清掉！
+            #   那些是"每个对话自己"的运行态（存在 ConvRun 里）。老写法在这里
+            #   无脑清空 —— 于是从 A 对话切到 B、再切回 A，A 本轮已经产出但还没
+            #   写进记录的过程/正文就永远丢了（用户报的"本轮之前的输出内容也可能会消失"）。
+            #   现在什么都不清：切回来原样恢复；界面控件按"这个对话当前是不是在跑"重设。
+            self._card_collapsed = {}  # 折叠记录是纯界面态，重建时按当前内容重算即可
+            self._render_sig = None    # ★ 换对话：渲染指纹失效（防跨对话误短路）
+            # ★ v9.18.0（需求 13）：团队选择是**每个对话自己的**（存在 conv["team_id"]），
+            #   切过来要把团队条同步成这个对话记的那一支，否则会串台。
+            self._sync_team_bar()
             self._render()
+            self._refresh_run_ui()
             self._update_page_title()
 
     def _delete_conversation(self):
@@ -1948,7 +2463,7 @@ class MainWindow(QMainWindow):
             items = self.ding.self_test()
             lines = [f"钉钉接口自检（{sum(1 for _n, ok, _m in items if ok)}/{len(items)} 可用）："]
             for n, ok, m in items:
-                lines.append(("✅ " if ok else "❌ ") + n + "\n    " + str(m))
+                lines.append(("✓ " if ok else "✕ ") + n + "\n    " + str(m))
             return "\n".join(lines)
 
         if act in ("contacts", "通讯录", "members", "找联系人", "查联系人"):
@@ -2127,7 +2642,7 @@ class MainWindow(QMainWindow):
         self.ding.update(cfg)
         ok, msg = self.ding.test()
         self.page_integrations.set_dingtalk_status(
-            ("✅ " if ok else "❌ ") + msg)
+            ("✓ " if ok else "✕ ") + msg)
         self.statusBar().showMessage(("钉钉：" + msg)[:120], 8000)
 
     # ---------- 接口调试台：自检 / 通讯录 / 扫码登录 / 发群 ----------
@@ -2249,7 +2764,7 @@ class MainWindow(QMainWindow):
             pi.show_probe_text(msg)
             return
         if not ok:
-            pi.set_dingtalk_status("❌ " + msg)
+            pi.set_dingtalk_status("✕ " + msg)
             pi.show_probe_text("扫码授权登录失败：\n" + msg +
                                "\n\n常见原因：\n"
                                "1) 钉钉开发者后台 → 应用 → 「登录与分享」里没有把\n"
@@ -2263,14 +2778,14 @@ class MainWindow(QMainWindow):
         # 用户级 token 单独存，便于后续调用需要用户身份的接口（待办/日历等）
         d["login_user_token"] = info.get("token", "")
         self.workspace.save_settings(self.settings)
-        lines = ["✅ 扫码授权登录成功",
+        lines = ["✓ 扫码授权登录成功",
                  f"昵称：{info.get('nick') or '（未返回）'}",
                  f"unionId：{info.get('unionId') or '（未返回）'}",
                  f"手机号：{info.get('mobile') or '（未返回）'}",
                  "",
                  "已保存用户身份。这条通道拿到的是「用户级 token」，"
                  "可以继续用来调用需要用户身份的钉钉接口。"]
-        pi.set_dingtalk_status(f"✅ 已授权登录：{info.get('nick') or info.get('unionId')}")
+        pi.set_dingtalk_status(f"✓ 已授权登录：{info.get('nick') or info.get('unionId')}")
         pi.show_probe_text("\n".join(lines))
 
     def _dingtalk_group_send(self, cfg, text):
@@ -2281,9 +2796,9 @@ class MainWindow(QMainWindow):
             return
         try:
             r = self.ding.send_group(text)
-            pi.set_dingtalk_status(f"✅ 已发到群（{r.get('target')}）")
+            pi.set_dingtalk_status(f"✓ 已发到群（{r.get('target')}）")
         except Exception as e:
-            pi.set_dingtalk_status(f"❌ 发群失败：{e}")
+            pi.set_dingtalk_status(f"✕ 发群失败：{e}")
 
     # ---------------- dws 工作台 CLI（个人授权，能读会话列表/消息） ----------------
     def _dingtalk_dws_login(self, device):
@@ -2316,7 +2831,7 @@ class MainWindow(QMainWindow):
                 st2 = self.ding.dws_auth_status()
                 if st2.get("authenticated"):
                     self._dingtalk_dws_log.emit(
-                        f"✅ 登录成功：{st2.get('user_name')} @ {st2.get('corp_name')}")
+                        f"✓ 登录成功：{st2.get('user_name')} @ {st2.get('corp_name')}")
                 else:
                     self._dingtalk_dws_log.emit("登录未完成 / 已超时，可重试。")
             except Exception as e:
@@ -2367,13 +2882,13 @@ class MainWindow(QMainWindow):
         def worker():
             try:
                 self.ding.dws_send_group(target, content)
-                self._dingtalk_dws_log.emit(f"✅ 已发到会话「{target}」")
+                self._dingtalk_dws_log.emit(f"✓ 已发到会话「{target}」")
             except Exception:
                 try:
                     self.ding.dws_dm(target, content)
-                    self._dingtalk_dws_log.emit(f"✅ 已作为单聊发给「{target}」")
+                    self._dingtalk_dws_log.emit(f"✓ 已作为单聊发给「{target}」")
                 except Exception as e2:
-                    self._dingtalk_dws_log.emit(f"❌ 发送失败：{e2}")
+                    self._dingtalk_dws_log.emit(f"✕ 发送失败：{e2}")
         threading.Thread(target=worker, daemon=True).start()
 
     def _toggle_dingtalk_stream(self, cfg, enable):
@@ -2381,7 +2896,7 @@ class MainWindow(QMainWindow):
         if enable:
             ok, msg = self.ding.start_stream(self._dingtalk_on_message,
                                             on_log=self._dingtalk_log)
-            self.page_integrations.set_dingtalk_status(("✅ " if ok else "❌ ") + msg)
+            self.page_integrations.set_dingtalk_status(("✓ " if ok else "✕ ") + msg)
             if ok:
                 # 连接是异步的：别只等 2.5 秒就下结论（以前会一直显示"连接中…"，
                 # 用户看起来就像"连不上"）。这里持续刷新 12 次 × 2 秒，
@@ -2397,18 +2912,18 @@ class MainWindow(QMainWindow):
                     tail = (self._dt_last_log or "").strip()
                     if live:
                         self.page_integrations.set_dingtalk_status(
-                            "✅ Stream 已连接，正在接收机器人消息")
+                            "✓ Stream 已连接，正在接收机器人消息")
                         self._dt_tick = None
                         return
                     if d["n"] >= 12:
                         self.page_integrations.set_dingtalk_status(
-                            "❌ Stream 连不上（已等 24 秒）。\n"
+                            "✕ Stream 连不上（已等 24 秒）。\n"
                             "看下面日志最后一行；常见原因是应用没开机器人的 Stream 模式。"
                             + (("\n最后一条日志：" + tail) if tail else ""))
                         self._dt_tick = None
                         return
                     self.page_integrations.set_dingtalk_status(
-                        f"⏳ Stream 连接中…（{d['n'] * 2}s）"
+                        f"◕ Stream 连接中…（{d['n'] * 2}s）"
                         + ((" · " + tail) if tail else ""))
                     QTimer.singleShot(2000, tick)
 
@@ -2492,7 +3007,7 @@ class MainWindow(QMainWindow):
             return
         self.reminders = [r for r in self.reminders if r["ts"] > now]
         for r in fired:
-            msg = f"⏰ 提醒：{r['text']}"
+            msg = f"◷ 提醒：{r['text']}"
             self._notify("AI 工作台提醒", r["text"])
             if r["dingtalk"] and self.ding.configured():
                 try:
@@ -2542,7 +3057,7 @@ class MainWindow(QMainWindow):
         self.assistant.mark_processed(mid)
         who = msg.get("conv") or msg.get("sender") or "钉钉"
         self.statusBar().showMessage(
-            f"🤝 助理收到消息（{who}）：{str(msg.get('text'))[:40]}", 8000)
+            f"⚑ 助理收到消息（{who}）：{str(msg.get('text'))[:40]}", 8000)
         if self.assistant.cfg.get("auto_reply"):
             self._asst_queue.append(mid)
             self._asst_pump()
@@ -2568,8 +3083,9 @@ class MainWindow(QMainWindow):
         if self._asst_worker is not None and self._asst_worker.isRunning():
             return
         # 前台正在对话时先等等，别两边同时用同一个 runner
+        # ★ v9.18.0：现在是"**任意一个**对话在跑"就让路（多个对话可能同时跑）。
         try:
-            if self.worker is not None and self.worker.isRunning():
+            if self._any_running():
                 QTimer.singleShot(3000, self._asst_pump)
                 return
         except Exception:
@@ -2646,21 +3162,21 @@ class MainWindow(QMainWindow):
             try:
                 if cid:
                     self.ding.dws_send_to_cid(cid, text)
-                    self._asst_log_ui(f"✅ 已把结果发回钉钉（{msg.get('conv') or '会话'}）")
+                    self._asst_log_ui(f"✓ 已把结果发回钉钉（{msg.get('conv') or '会话'}）")
                 else:
                     self.ding.dws_dm(target_name, text)
-                    self._asst_log_ui("✅ 已把结果作为单聊发给本人")
+                    self._asst_log_ui("✓ 已把结果作为单聊发给本人")
             except Exception as e:
-                self._asst_log_ui(f"❌ 结果发回钉钉失败：{e}")
+                self._asst_log_ui(f"✕ 结果发回钉钉失败：{e}")
             for p in files[:5]:
                 try:
                     if cid:
                         self.ding.dws_send_file(cid, p)
                     else:
                         self.ding.dws_send_file(target_name, p)
-                    self._asst_log_ui(f"📎 已把文件发到钉钉：{os.path.basename(p)}")
+                    self._asst_log_ui(f"⊞ 已把文件发到钉钉：{os.path.basename(p)}")
                 except Exception as e:
-                    self._asst_log_ui(f"❌ 文件发送失败（{os.path.basename(p)}）：{e}")
+                    self._asst_log_ui(f"✕ 文件发送失败（{os.path.basename(p)}）：{e}")
         threading.Thread(target=worker, daemon=True).start()
 
     def _asst_log_ui(self, line):
@@ -2715,7 +3231,7 @@ class MainWindow(QMainWindow):
             for p in real_files[:5]:
                 try:
                     self.ding.dws_send_file(target, p)
-                    self._asst_log_ui(f"📎 自动补发文件到钉钉：{os.path.basename(p)}")
+                    self._asst_log_ui(f"⊞ 自动补发文件到钉钉：{os.path.basename(p)}")
                     sent_any = True
                 except Exception as e:
                     self._asst_log_ui(f"自动补发文件失败：{e}")
@@ -2728,13 +3244,13 @@ class MainWindow(QMainWindow):
                         self.ding.dws_send_to_cid(self_cid, txt)
                     else:
                         self.ding.dws_dm(target_name, txt)
-                    self._asst_log_ui("📨 自动补发结论到钉钉")
+                    self._asst_log_ui("✉ 自动补发结论到钉钉")
                     sent_any = True
                 except Exception as e:
                     self._asst_log_ui(f"自动补发结论失败：{e}")
             if sent_any:
                 self.wrapup_notice.emit(
-                    "📨 已自动补发到钉钉（你要求发钉钉、模型没发，程序兜底补发）")
+                    "✉ 已自动补发到钉钉（你要求发钉钉、模型没发，程序兜底补发）")
         threading.Thread(target=worker, daemon=True).start()
 
     def _ding_self_cid(self):
@@ -3068,7 +3584,7 @@ class MainWindow(QMainWindow):
             hv = QHBoxLayout(chip)
             hv.setContentsMargins(8, 4, 4, 4)
             hv.setSpacing(6)
-            icon = "🖼" if docread.is_image(a["path"]) else "📄"
+            icon = "▨" if docread.is_image(a["path"]) else "▭"
             lb = QLabel(f"{icon} {a['name']}　{a['chars']} 字")
             lb.setStyleSheet(f"color:{t['text']};font-size:12px;")
             hv.addWidget(lb)
@@ -3105,7 +3621,7 @@ class MainWindow(QMainWindow):
     def _attachment_note(self):
         if not self.attachments:
             return ""
-        return "📎 已附：" + "、".join(a["name"] for a in self.attachments)
+        return ATTACH_MARK + "、".join(a["name"] for a in self.attachments)
 
     # ================= 发送 / Agent 循环 =================
     @staticmethod
@@ -3194,7 +3710,7 @@ class MainWindow(QMainWindow):
             parts.append(
                 "# 工作总结（每次干完活都要留痕）\n"
                 "系统会在每轮对话结束后**自动**写一条工作总结到 "
-                f"`{self.workspace.path}\\worklog\\` 下（不需要你操心）；\n"
+                f"`{self.workspace.worklog_dir}` 下（不需要你操心）；\n"
                 "但当你完成一件**多步的大任务**时，请额外主动调用 "
                 "`write_worklog` 记一条更详细的（参数：request 做了什么、"
                 "summary 结论、files 产出文件路径、ok 是否成功）。\n"
@@ -3216,23 +3732,30 @@ class MainWindow(QMainWindow):
             pass
         return "\n\n".join(p for p in parts if p)
 
-    def _on_plan_changed(self, plan):
+    def _on_plan_changed(self, plan, cid=None):
         # 计划面板显隐/变高会改变聊天区可视高度，Qt 会把滚动位置重置到顶部
         # （用户反馈："一弹出来对话就自动蹦到最顶端"）。这里先记住位置再还原。
-        sb = self.chat_scroll.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 40
-        old = sb.value()
-        self.plan_panel.set_plan(plan)
-        if at_bottom:
-            sb.setValue(sb.maximum())
-        else:
-            sb.setValue(min(old, max(sb.maximum(), 0)))
-        if self.conv is not None:
-            self.conv["plan"] = plan
-            try:
-                self.workspace.save_conversation(self.conv)
-            except Exception:
-                pass
+        # ★ v9.18.0：计划写回**它自己的**那个对话；只有当前显示它时才动界面。
+        cid = self._conv_cid() if cid is None else cid
+        if self._is_current(cid):
+            sb = self.chat_scroll.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 40
+            old = sb.value()
+            self.plan_panel.set_plan(plan)
+            if at_bottom:
+                sb.setValue(sb.maximum())
+            else:
+                sb.setValue(min(old, max(sb.maximum(), 0)))
+        try:
+            target = self.conv if self._is_current(cid) else \
+                self.workspace.load_conversation(cid)
+            if target is not None:
+                target["plan"] = plan
+                self.workspace.save_conversation(target)
+                if self._is_current(cid):
+                    self.conv = target
+        except Exception:
+            pass
 
     def _on_model_change(self):
         data = self.model_combo.currentData()
@@ -3246,7 +3769,10 @@ class MainWindow(QMainWindow):
             self._dsw_auto_ensure("切换到 DeepSeek 网页版")
 
     def _send(self):
-        if self.running:
+        # ★ v9.18.0（需求 7）：只拦"**这个对话**自己"在跑，别的对话在跑不影响它。
+        cid = self._conv_cid()
+        run = self._run(cid)
+        if run.running:
             return
         text = self.input.toPlainText().strip()
         att_text = self._pending_attachment_text()
@@ -3275,8 +3801,21 @@ class MainWindow(QMainWindow):
         self.workspace.save_conversation(self.conv)
         self._load_conversations()
 
-        self.live_text = ""
-        self.pending_tool = []
+        run.live_text = ""
+        run.pending_tool = []
+        # ★ v9.18.0（需求 17）：新一轮开始，上一轮残留的思考区清掉
+        run.live_reason = ""
+        run.reason_card = None
+        # ★★ v9.18.0（需求 13）：这个对话选了团队 -> 本轮**交给团队去做**，
+        #   不再走单人链路。放在这里（用户消息已入会话并落盘、运行态已清空之后）
+        #   是为了让对话流里的顺序天然正确：先看到自己的消息，再看到团队的过程与汇总。
+        try:
+            _tid = self.team_bar.selected_team_id()
+        except Exception:
+            _tid = ""
+        if _tid:
+            self._send_team(text, _tid, cid, note)
+            return
         api_messages = ([{"role": "system", "content": self._build_system_prompt()}]
                         + self._api_messages(self.conv["messages"]))
         self.worker = ChatWorker(
@@ -3291,27 +3830,35 @@ class MainWindow(QMainWindow):
             max_iter=28,
             plan=self.conv.get("plan"),
         )
-        self.worker.token.connect(self._on_token)
-        self.worker.tool_start.connect(self._on_tool_start)
-        self.worker.tool_result.connect(self._on_tool_result)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.error.connect(self._on_error)
-        self.worker.confirm_requested.connect(self._on_confirm)
+        # ★ 所有回调都带上 cid：回调回来时"当前对话"可能已经被用户切走了，
+        #   必须按 cid 把结果写回它**自己的**那一份运行态（而不是当前显示的这个）。
+        self.worker.token.connect(lambda d, c=cid: self._on_token(d, c))
+        # ★ v9.18.0（需求 17）：思维链增量 —— 边想边显示，别让用户对着转圈干等
+        self.worker.reason.connect(lambda d, c=cid: self._on_reason(d, c))
+        self.worker.tool_start.connect(lambda s, c=cid: self._on_tool_start(s, c))
+        self.worker.tool_result.connect(lambda r, c=cid: self._on_tool_result(r, c))
+        self.worker.finished.connect(lambda m, c=cid: self._on_finished(m, c))
+        self.worker.error.connect(lambda m, c=cid: self._on_error(m, c))
+        self.worker.confirm_requested.connect(
+            lambda cmd, c=cid: self._on_confirm(cmd, c))
         # ★ v9.17.0：AI 主动提问（用户要求"有什么不懂的一定不要猜"）
-        self.worker.ask_requested.connect(self._on_ask_user)
+        self.worker.ask_requested.connect(
+            lambda q, o, h, m, c=cid: self._on_ask_user(q, o, h, m, c))
         self.worker.ask_enabled = True      # 有界面在听 → 提问才会真的弹框
-        self.worker.plan_changed.connect(self._on_plan_changed)
-        self.worker.notice.connect(self._on_notice)
-        self.worker.wrapup.connect(self._on_wrapup)
-        self.worker.phase.connect(self._on_phase)
-        self.running = True
+        self.worker.plan_changed.connect(lambda p, c=cid: self._on_plan_changed(p, c))
+        self.worker.notice.connect(lambda t, c=cid: self._on_notice(t, c))
+        self.worker.wrapup.connect(lambda p, c=cid: self._on_wrapup(p))
+        self.worker.phase.connect(lambda k, d, c=cid: self._on_phase(k, d, c))
+        run.running = True
         # 生成中：右下角按钮变成红色方形「停止」，点一下就能打断模型
-        self._set_stop_mode(True)
-        # 选中网页版时，状态行显示"正在等待 DeepSeek 网页输出"；否则沿用旧的"调用模型"
-        self.state_line.set_phase("web" if self._dsw_selected else "model", "")
-        self._open_page("chat")
-        # 发新消息必须强制贴底
-        self._render(stick=True)
+        if self._is_current(cid):
+            self._set_stop_mode(True)
+            # 选中网页版时，状态行显示"正在等待 DeepSeek 网页输出"；否则旧的"调用模型"
+            self.state_line.set_phase(
+                "web" if run.dsw_selected else "model", "")
+            self._open_page("chat")
+            # 发新消息必须强制贴底
+            self._render(stick=True)
         self.worker.start()
 
     def _on_send_clicked(self):
@@ -3321,19 +3868,37 @@ class MainWindow(QMainWindow):
         else:
             self._send()
 
-    def _interrupt(self):
-        """打断当前生成。"""
-        w = self.worker
-        if w is None or not self.running:
+    def _interrupt(self, cid=None):
+        """打断**当前对话**的生成（别的对话在跑不受影响）。"""
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+        # ★ v9.18.0（需求 13）：这一轮若是团队在干活，得取消 TeamRun ——
+        #   它没有 worker，`run.worker` 是 None，老逻辑会直接 return，
+        #   于是"点了停止没反应、队伍继续跑"。`TeamRun.cancel()` 会置取消事件
+        #   并连带取消所有还在跑的成员子任务，各阶段循环每步都会检查它。
+        if run.team_run is not None:
+            try:
+                run.team_run.cancel()
+            except Exception:
+                pass
+            if self._is_current(cid):
+                self.state_line.set_phase("stop", "正在收尾")
+                self.send_btn.setEnabled(False)
+                self.send_btn.setText("…")
+                self.statusBar().showMessage("已停止团队，正在收尾…", 4000)
+            return
+        w = run.worker
+        if w is None or not run.running:
             return
         try:
             w.abort()
         except Exception:
             pass
-        self.state_line.set_phase("stop", "正在收尾")
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("…")
-        self.statusBar().showMessage("已停止本轮生成，正在收尾…", 4000)
+        if self._is_current(cid):
+            self.state_line.set_phase("stop", "正在收尾")
+            self.send_btn.setEnabled(False)
+            self.send_btn.setText("…")
+            self.statusBar().showMessage("已停止本轮生成，正在收尾…", 4000)
 
     def _set_stop_mode(self, stop):
         """切换右下角按钮的形态：生成中=红色方形停止键，空闲=蓝色圆形发送键。"""
@@ -3354,8 +3919,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_phase(self, kind, detail):
-        """模型阶段变化 -> 状态行。"""
+    def _on_phase(self, kind, detail, cid=None):
+        """模型阶段变化 -> 状态行（只关心当前显示的这个对话）。"""
+        if cid is not None and not self._is_current(cid):
+            return
         try:
             if kind == "tool":
                 detail = tool_verb(detail)
@@ -3363,77 +3930,216 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_notice(self, text):
+    def _on_notice(self, text, cid=None):
+        if cid is not None and not self._is_current(cid):
+            return
         self.statusBar().showMessage(text[:160], 12000)
 
-    def _on_token(self, delta):
-        self.live_text += delta
+    def _on_token(self, delta, cid=None):
+        """流式增量：写进**它自己**那个对话的运行态；只有它是当前显示时才刷界面。"""
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+
+        # ★★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
+        #   收到后台发来的"作废重来"标记：后台换了端点/模型重试，或者 DeepSeek 网页
+        #   把整段答案**重写**了。客户端只会往后拼、不会撤回，所以必须在这里把自己
+        #   攒的那半截清空 —— 否则界面上会「半截残留 + 完整新文本」叠一起 = 内容重复。
+        if config.is_stream_reset(delta):
+            run.live_text = ""
+            run.live_card = None
+            # 作废 = 这一版全不算数：正在滚的思维链也一起清掉，
+            # 否则重试后新推理会叠在旧推理后面（就是那条"内容重复"的老毛病）。
+            run.live_reason = ""
+            run.reason_card = None
+            if self._is_current(cid):
+                self._render_sig = None          # 指纹失效，防止被渲染短路挡掉
+                self._render()
+            return
+
+        run.live_text += delta
+        if not self._is_current(cid):
+            return          # 用户已经切到别的对话了 —— 收着，别去动界面
         if not self._render_timer.isActive():
-            self._render_timer.start(80)
+            self._render_timer.start(self._live_interval)
+
+    def _on_reason(self, delta, cid=None):
+        """思维链增量（v9.18.0，需求 17）—— 边想边显示。
+
+        用户原话：「模型思考慢是不是因为我只看见了他思考后的结果，中间思考过程
+        没呈现给我？这个也可以加进来」。确实：带思维链的模型在正式回答前会先
+        流式吐一大段 `reasoning_content`，老实现只是悄悄收着，用户对着转圈干等。
+
+        机制和正文 token 完全一致：写进 **cid 那个对话** 的运行态，只有它当前
+        可见时才刷界面；节流复用同一个 `_render_timer`（思考比正文还费串口，
+        不额外开一个定时器）。
+        """
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+        if not delta:
+            return
+        run.live_reason += delta
+        if not self._is_current(cid):
+            return
+        if not self._render_timer.isActive():
+            self._render_timer.start(self._live_interval)
 
     def _update_live(self):
-        # ⚠️ 流式刷新时**不能强制贴底**：否则用户往上翻看历史时，会被
+        # ⚠ 流式刷新时**不能强制贴底**：否则用户往上翻看历史时，会被
         #    每 80ms 一次的强制滚动拽回底部（用户 2026-09-30 反馈
         #    「AI 生成的时候我没办法往上翻」）。
         #    改成"只在自己本来就贴着底时才跟随" —— 用户主动上滑后就不再打扰，
         #    等他滚回底部，_scroll_to_bottom 的贴底判断会自动恢复跟随。
-        if self._live_card is None:
+        live_shown = strip_tool_markup(self.live_text) if self.live_text else ""
+        reason_shown = (self.live_reason or "").strip()
+        touched = self._update_live_cards(live_shown, reason_shown)
+        if touched is None:
+            # 该有的卡片还没造出来（例如第一句思考刚到）→ 走一次全量渲染建卡
             self._render_full()
-        else:
-            shown = strip_tool_markup(self.live_text)
-            prose, blocks = markdown_render.render_with_blocks(shown)
-            self._live_card.set_content(prose, blocks)
+            return
+        if touched:
             # 卡片高度刚变，滚动条最大值要等布局刷新后再取 -> 延后一帧再跟随
             QTimer.singleShot(0, lambda: self._scroll_to_bottom(False))
 
-    def _on_tool_start(self, desc):
+    def _update_live_cards(self, live_shown, reason_shown):
+        """流式期间**原地**刷新「正文卡」和「思考卡」（需求 6 + 需求 17 共用）。
+
+        返回：list = 这次真的变了的卡片（调用方据此只 refit 这几张）；
+              None = 情况不匹配（卡片还不存在 / 已经不该存在了），调用方应全量渲染。
+        """
+        # 正文在长但正文卡还没造出来（或反过来：卡还在、正文已经清空）→ 交给全量渲染
+        if bool(live_shown) != (self._live_card is not None):
+            return None
+        # 思考同理
+        if bool(reason_shown) != (self._reason_card is not None):
+            return None
+        touched = []
+        if live_shown:
+            # ★ v9.18.0（需求 6「模型响应较慢」）：内容一个字都没变就直接不做 ——
+            #   流式里常有整段都是工具调用标记的增量，strip 掉之后正文没长，
+            #   老代码照样重新渲染一遍（Pygments 高亮是纯 CPU 硬活）。
+            if getattr(self._live_card, "_raw", None) != live_shown:
+                t0 = time.perf_counter()
+                prose, blocks = markdown_render.render_with_blocks(live_shown)
+                self._live_card.set_content(prose, blocks)
+                self._tune_live_interval(time.perf_counter() - t0)
+                touched.append(self._live_card)
+        if reason_shown:
+            if self._reason_card.set_text(reason_shown):
+                touched.append(self._reason_card)
+        return touched
+
+    def _tune_live_interval(self, cost_seconds):
+        """按上一次渲染的真实耗时，自适应调整流式刷新节拍（需求 6）。
+
+        为什么不能写死 80ms：短回复时 80ms 很流畅，但正文里带一个几百行的代码块时，
+        读一次 Pygments 高亮可能就要 50~150ms —— 还按 80ms 排，UI 线程会被排满，
+        用户体感就是"整个界面卡住、字一个个往外蹦"。
+        节拍跟着耗时走：便宜就快（110ms），贵就主动降到最多 400ms，
+        宁可少刷几帧也不让界面失去响应。
+        """
+        if cost_seconds < 0.03:
+            self._live_interval = 110
+        else:
+            self._live_interval = max(110, min(400, int(cost_seconds * 1000 * 3)))
+
+    def _on_tool_start(self, desc, cid=None):
+        if cid is not None and not self._is_current(cid):
+            return
         self.statusBar().showMessage("正在执行工具：" + desc[:130])
 
-    def _on_tool_result(self, result):
+    def _on_tool_result(self, result, cid=None):
         # 工具前的「中间话」不再丢弃：先作为折叠的「深度思考」块留在本轮记录里
         # （整轮结束后 chat_worker 也会把它作为 role="thinking" 交回来，pending 只是
         #   本轮的即时展示，_on_finished 会清空 pending，不会重复落进对话记录。）
-        _think = strip_tool_markup(self.live_text).strip() if self.live_text else ""
+        # ★ v9.18.0：一律写进 **cid 那个对话** 的运行态，界面只在它当前可见时刷新。
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+        _think = strip_tool_markup(run.live_text).strip() if run.live_text else ""
         if _think:
-            self.pending_tool.append({"role": "thinking", "content": _think})
-        self.live_text = ""
-        self._live_card = None
-        self.pending_tool.append({"role": "tool", "content": result})
+            run.pending_tool.append({"role": "thinking", "content": _think})
+        run.live_text = ""
+        run.live_card = None
+        run.pending_tool.append({"role": "tool", "content": result})
+        if not self._is_current(cid):
+            return
         self.statusBar().clearMessage()
         self._refresh_chips()
         # 工具结果到达也不强制贴底：用户可能正往上翻（同上）。
         self._render()
 
-    def _on_finished(self, new_messages):
+    def _on_finished(self, new_messages, cid=None):
+        """一轮跑完：结果写回**它自己的**对话（哪怕用户已经切走了）。"""
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
         msgs = [dict(m) for m in (new_messages or [])]
         try:
             label = self.client.last_used_label()
         except Exception:
             label = ""
         if label:
-            self._last_model_label = label
+            run.last_model_label = label
             for i in range(len(msgs) - 1, -1, -1):
                 if msgs[i].get("role") == "assistant":
                     msgs[i]["_model"] = label
                     break
-        self.conv.setdefault("messages", []).extend(msgs)
-        self.workspace.save_conversation(self.conv)
-        self.live_text = ""
-        self.pending_tool = []
-        self._finish_run()
-        self._maybe_rename()
-        if self.settings.get("tts_enabled"):
-            last_ai = next((m["content"] for m in reversed(msgs)
-                            if m.get("role") == "assistant"), "")
-            if last_ai:
-                self.speaker.speak(last_ai)
+        # ★ v9.18.0：写回 cid 对应的那个对话，而不是"当前显示的这个" ——
+        #   老写法在这里用 self.conv，用户中途切走就会把 A 的回复塞进 B 里。
+        target = self.conv if self._is_current(cid) else None
+        if target is None:
+            try:
+                target = self.workspace.load_conversation(cid)
+            except Exception:
+                target = None
+        if target is not None:
+            target.setdefault("messages", []).extend(msgs)
+            try:
+                self.workspace.save_conversation(target)
+            except Exception:
+                pass
+            if self._is_current(cid):
+                self.conv = target
+        run.live_text = ""
+        run.pending_tool = []
+        run.live_card = None
+        # ★ v9.18.0（需求 17）：整轮结束 —— 实时思考区撤掉。
+        #   这一轮的思维链已经由 chat_worker 折成一条 role="thinking" 落进
+        #   msgs（上面刚写回对话），所以不会丢，只是从"实时滚动"变成
+        #   历史里的「深度思考」块（需求 9：过程消息默认折进过程组）。
+        run.live_reason = ""
+        run.reason_card = None
+        self._finish_run(cid)
+        if self._is_current(cid):
+            self._maybe_rename()
+            if self.settings.get("tts_enabled"):
+                last_ai = next((m["content"] for m in reversed(msgs)
+                                if m.get("role") == "assistant"), "")
+                if last_ai:
+                    self.speaker.speak(last_ai)
 
-    def _on_error(self, msg):
-        self.pending_tool.append({"role": "tool", "content": "出错了：" + str(msg)})
-        self._finish_run()
+    def _on_error(self, msg, cid=None):
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+        # ★ v9.18.0（需求 4）：出错时也要把流式那半截正文清掉 ——
+        #   `_render_full` 只要看到 live_text 非空就会把它再画成一张卡片，
+        #   不清的话就会和上一轮已经落盘的内容叠成"看起来重复"。
+        run.live_text = ""
+        run.live_card = None
+        run.live_reason = ""
+        run.reason_card = None
+        run.pending_tool.append({"role": "tool", "content": "出错了：" + str(msg)})
+        self._finish_run(cid)
 
-    def _finish_run(self):
-        self.running = False
+    def _finish_run(self, cid=None):
+        cid = self._conv_cid() if cid is None else cid
+        run = self._run(cid)
+        run.running = False
+        if not self._is_current(cid):
+            # 别的对话跑完了：只更新列表上的标记，别去打扰当前这个界面
+            try:
+                self._load_conversations()
+            except Exception:
+                pass
+            return
         self._set_stop_mode(False)          # 按钮恢复成圆形发送键
         self.send_btn.setEnabled(bool(self.input.toPlainText().strip())
                                  or bool(self.attachments))
@@ -3447,14 +4153,38 @@ class MainWindow(QMainWindow):
         # 收尾渲染同样不强制贴底：用户若正在上翻看历史，不该被拽走。
         self._render()
 
+    def _refresh_run_ui(self):
+        """切换对话后：把界面控件（停止键 / 状态行 / 输入框）同步成**这个对话**的样子。"""
+        try:
+            run = self._run()
+            if run.running:
+                self._set_stop_mode(True)
+                # ★ v9.18.0（需求 13）：团队在跑时状态行要说"团队协作中"，
+                #   而不是笼统的"正在调用模型"（团队里其实是好几个模型在轮流跑）。
+                if run.team_run is not None:
+                    self.state_line.set_phase("team", "")
+                else:
+                    self.state_line.set_phase(
+                        "web" if run.dsw_selected else "model", "")
+            else:
+                self._set_stop_mode(False)
+                self.state_line.set_phase("idle", "")
+                self.send_btn.setEnabled(bool(self.input.toPlainText().strip())
+                                         or bool(self.attachments))
+        except Exception:
+            pass
+
     # ---------- ★ v9.17.0 AI 主动提问 ----------
-    def _on_ask_user(self, question, options, header, multi):
+    def _on_ask_user(self, question, options, header, multi, cid=None):
         """AI 通过 `ask_user` 提问 → 弹一张卡片，把答案回传给正在等的工具线程。
 
         工具在 worker 线程里阻塞等待（见 `ChatWorker._ask_cb_impl`），这里在 UI
         线程开一个模态对话框；用户答完 / 跳过之后唤醒它。
         **点跳过或直接关掉 = 没回答**，工具会退化成"按最合理的假设继续并在结论里
         注明"，所以不会把整轮对话卡死。
+
+        ★ v9.18.0：答案回传给 **cid 那个对话的 worker**（不能拿 `self.worker`，
+        用户可能已经切到别的对话了）。
         """
         ans = ""
         try:
@@ -3468,22 +4198,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
-            self.worker.ask_answer(ans)
+            self._run(cid).worker.ask_answer(ans)
         except Exception:
             pass
 
-    def _on_confirm(self, cmd):
+    def _on_confirm(self, cmd, cid=None):
+        # ★ v9.18.0：一律回给 **cid 那个对话的 worker**（用户可能已经切走）。
+        w = self._run(cid).worker
         # ① 设置里关掉了确认 -> 直接放行（危险命令在 agent 层已被拦截）
         if not self.settings.get("confirm_commands", True):
-            self.worker.confirm(True)
+            w.confirm(True)
             return
         # ② 只读命令不问：查版本、列目录、看状态这类，每问一次都是打扰
         if _is_readonly_command(cmd):
-            self.worker.confirm(True)
+            w.confirm(True)
             return
         # ③ 本次会话已经点过"全部允许"
         if getattr(self, "_confirm_all_session", False):
-            self.worker.confirm(True)
+            w.confirm(True)
             return
 
         box = QMessageBox(self)
@@ -3504,7 +4236,7 @@ class MainWindow(QMainWindow):
         clicked = box.clickedButton()
         if clicked is allb:
             self._confirm_all_session = True
-        self.worker.confirm(clicked in (yes, allb))
+        w.confirm(clicked in (yes, allb))
 
     # ================= 消息级操作 =================
     def _regenerate(self):
@@ -3528,9 +4260,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _visible_user_text(msg):
-        """去掉「📎 已附：…」这行，只留用户真正打的字。"""
+        """去掉「附件的标注行」，只留用户真正打的字。"""
         c = str((msg or {}).get("content") or "")
-        lines = [ln for ln in c.split("\n") if not ln.startswith("📎 已附：")]
+        lines = [ln for ln in c.split("\n") if not ln.startswith(ATTACH_MARK)]
         return "\n".join(lines).strip()
 
     def _edit_message(self, index):
@@ -3604,6 +4336,7 @@ class MainWindow(QMainWindow):
         self._render_full(stick=stick)
 
     def _clear_chat(self):
+        self._groups = []
         while self.chat_layout.count():
             item = self.chat_layout.takeAt(0)
             w = item.widget()
@@ -3650,6 +4383,8 @@ class MainWindow(QMainWindow):
         for t in self.pending_tool:
             display.append(t)
         live_shown = strip_tool_markup(self.live_text) if self.live_text else ""
+        # ★ v9.18.0（需求 17）：正在实时滚动的思维链，和正文一样参与渲染指纹
+        reason_shown = (self.live_reason or "").strip() if self.running else ""
 
         # ★★ v9.17.0 渲染短路 + 流式增量 —— 修用户反馈的「一执行任务就很卡、
         #    弹一堆小窗口」。
@@ -3658,25 +4393,31 @@ class MainWindow(QMainWindow):
         #    在 setParent(None) 时还会闪成小窗口（见 _clear_chat）。
         #    现在两道拦截：
         #      ① 整块内容一模一样 → 直接什么都不做；
-        #      ② 只有流式正文在长、其余没变 → 只原地刷新最后那张 live 卡片。
+        #      ② 只有流式正文 / 实时思考在长、其余没变 → 只原地刷新那两张卡。
         base_sig = tuple((m.get("role"), m.get("content", "")) for m in display)
         sig = (base_sig, bool(self.running),
-               live_shown if self.running else "", str(plan))
+               live_shown if self.running else "", str(plan), reason_shown)
         prev = getattr(self, "_render_sig", None)
         if prev == sig:
             return
         if (prev is not None and prev[0] == base_sig and prev[1] == bool(self.running)
-                and prev[3] == str(plan) and self._live_card is not None
-                and self.running and live_shown and not self.pending_tool):
-            if self._live_card.update_live(live_shown):
+                and prev[3] == str(plan) and self.running
+                and not self.pending_tool):
+            touched = self._update_live_cards(live_shown, reason_shown)
+            if touched is not None:
                 self._render_sig = sig
                 self._pending_scroll = (at_bottom, old_value)
-                QTimer.singleShot(0, self._after_render)
+                if touched:
+                    # ★ 需求 6：这条路径只有这两张卡变了，refit 它们就够
+                    self._pending_refit = touched
+                    QTimer.singleShot(0, self._after_render)
                 return
 
         self._clear_chat()
         self._cards = []
+        self._groups = []
         self._live_card = None
+        self._reason_card = None
         try:
             self.plan_panel.set_plan(plan)
         except Exception:
@@ -3687,49 +4428,66 @@ class MainWindow(QMainWindow):
             self._render_sig = sig
             return
 
+        # ★ v9.18.0（需求 9）：相邻的**过程消息**（工具调用 / 普通思考）合并成
+        #   一个 ProcessGroup，默认隐藏，只留一行「⚙ 过程 · N 步」。
+        #   带结论的关键中间块（emphasis）仍然单独留在外面可见 —— 兼顾
+        #   "过程都藏起来"与"重点结论要留着"这两条要求。
+        group = None
+
         for i, m in enumerate(display):
             role = m.get("role")
             content = m.get("content", "") or ""
-            footer = ""
-            if role == "assistant" and m.get("_model"):
-                footer = "实际使用模型：" + m["_model"]
-            label = tool_label(content) if role == "tool" else None
-            # 文件写入卡片：从工具结果文本解析 +N / -N
-            stats = file_write_stats(content) if role == "tool" else None
-            # 中间过程分级：带结论 / 原因 / 建议 / 报错定位的那几句默认**展开**
-            # （左侧加一道强调竖线），"我来帮你看看"这种流水话才折叠。
-            # 用户原话："中间过程性的那些话并不是每一句都是要隐藏的，
-            #           那些重点的结论那种留着"。
-            emphasis = False
-            if role == "thinking":
-                emphasis = agent_mod.is_key_progress(content)
-            # 折叠状态跨重建保持：优先用用户手动设置过的值
+            emphasis = bool(role == "thinking" and agent_mod.is_key_progress(content))
+            in_group = bool(role == "tool") or bool(role == "thinking" and not emphasis)
+
+            if in_group:
+                if group is None:
+                    # ★ 折叠状态键用**消息身份**（id(m)）而不是下标 ——
+                    #   删掉/插入一条中间消息时下标会整体平移，用下标会让展开态
+                    #   "跑"到别的组上（老 MessageCard 也是这么做的，这里对齐）。
+                    gkey = ("grp", id(m), str(role))
+                    saved_g = self._card_collapsed.get(gkey)
+                    group = ProcessGroup(
+                        collapsed=True if saved_g is None else bool(saved_g))
+                    group.setContentsMargins(0, 2, 0, 0)
+                    group.collapsed_changed.connect(
+                        lambda collapsed, k=gkey:
+                            self._card_collapsed.__setitem__(k, bool(collapsed)))
+                    self.chat_layout.addWidget(group)
+                    self._cards.append(group)
+                    self._groups.append((group, gkey))
+                card = self._build_card(m, i, role, content,
+                                        emphasis=False, collapsed=False)
+                if card is not None:
+                    group.add_card(card)
+                    self._cards.append(card)
+                continue
+
+            # 正式消息：过程组在这里断开
+            group = None
             saved = self._card_collapsed.get(self._card_key(m, i, role))
-            if saved is None and role == "thinking":
-                saved = not emphasis          # 重点默认展开
-            card = MessageCard.from_text(role, content, footer_text=footer,
-                                        label=label, index=i,
-                                        stats=stats, collapsed=saved,
-                                        emphasis=emphasis)
-            # 分组留白：过程卡片贴紧，正式消息之间留出呼吸感
-            card.setContentsMargins(
-                0, 2 if role in ("tool", "thinking") else 8, 0, 0)
-            if role in ("assistant", "user", "tool"):
-                card.copy_requested.connect(lambda _=False, c=m: self._copy_msg(c))
-                card.delete_requested.connect(
-                    lambda _=False, k=i: self._delete_message(k))
-                card.speak_requested.connect(self._speak_message)
-            if role == "assistant":
-                card.regenerate_requested.connect(self._regenerate)
-            if role == "user":
-                card.edit_requested.connect(
-                    lambda _=False, k=i: self._edit_message(k))
-            if role in ("tool", "thinking"):
-                card.collapse_changed.connect(
-                    lambda collapsed, k=self._card_key(m, i, role):
-                        self._card_collapsed.__setitem__(k, collapsed))
-            self.chat_layout.addWidget(card)
-            self._cards.append(card)
+            card = self._build_card(m, i, role, content,
+                                    emphasis=emphasis, collapsed=saved)
+            if card is not None:
+                self.chat_layout.addWidget(card)
+                self._cards.append(card)
+
+        # ★ v9.18.0（需求 17）：正在实时滚动的思维链 —— 放在正文**之上**。
+        #   默认展开（用户要的就是"看见它在想什么"），高度封顶 300px，
+        #   免得一大段推理把下面的正式答复远远挤出屏幕。
+        if reason_shown:
+            _rkey = ("reason", "__live__")
+            _rsaved = self._card_collapsed.get(_rkey)
+            rc = ReasoningCard(
+                reason_shown,
+                collapsed=False if _rsaved is None else bool(_rsaved),
+                max_h=300)
+            rc.collapsed_changed.connect(
+                lambda collapsed, k=_rkey:
+                    self._card_collapsed.__setitem__(k, bool(collapsed)))
+            self.chat_layout.addWidget(rc)
+            self._cards.append(rc)
+            self._reason_card = rc
 
         if self.running and not self.live_text and not self.pending_tool:
             ind = ThinkingIndicator()
@@ -3746,8 +4504,40 @@ class MainWindow(QMainWindow):
         self.chat_layout.addStretch(1)
         # 此刻布局还没最终确定，直接读滚动条最大值不准 —— 延后一帧再恢复位置
         self._pending_scroll = (at_bottom, old_value)
+        # ★ 需求 6：全量重建过，所有卡片都要重新撑高（宽度这时才确定）
+        self._pending_refit = list(self._cards)
         self._render_sig = sig          # ★ 记住这次渲染的指纹（供上面的短路判断用）
         QTimer.singleShot(0, self._after_render)
+
+    def _build_card(self, m, i, role, content, emphasis=False, collapsed=None):
+        """按一条消息造一张卡片（并接好它的各种信号）。造不出来返回 None。"""
+        footer = ""
+        if role == "assistant" and m.get("_model"):
+            footer = "实际使用模型：" + m["_model"]
+        label = tool_label(content) if role == "tool" else None
+        stats = file_write_stats(content) if role == "tool" else None
+        card = MessageCard.from_text(role, content, footer_text=footer,
+                                     label=label, index=i,
+                                     stats=stats, collapsed=collapsed,
+                                     emphasis=emphasis)
+        # 分组留白：过程卡片贴紧，正式消息之间留出呼吸感
+        card.setContentsMargins(
+            0, 1 if role in ("tool", "thinking") else 7, 0, 0)
+        if role in ("assistant", "user", "tool"):
+            card.copy_requested.connect(lambda _=False, c=m: self._copy_msg(c))
+            card.delete_requested.connect(
+                lambda _=False, k=i: self._delete_message(k))
+            card.speak_requested.connect(self._speak_message)
+        if role == "assistant":
+            card.regenerate_requested.connect(self._regenerate)
+        if role == "user":
+            card.edit_requested.connect(
+                lambda _=False, k=i: self._edit_message(k))
+        if role in ("tool", "thinking"):
+            card.collapse_changed.connect(
+                lambda collapsed, k=self._card_key(m, i, role):
+                    self._card_collapsed.__setitem__(k, collapsed))
+        return card
 
     def _copy_msg(self, m):
         QGuiApplication.clipboard().setText(m.get("content") or "")
@@ -3758,15 +4548,24 @@ class MainWindow(QMainWindow):
 
         修的是用户反馈的「一弹出来 / 一发新消息就自动跳到最顶端」：
         重建卡片后先让布局重新计算高度，再贴底或还原旧位置。
+
+        ★ v9.18.0（需求 6「模型响应较慢」）：只 refit **这一次真的变过的**卡片。
+          · 全量重建 → 所有卡片（宽度这时才确定，必须都过一遍）；
+          · 流式增量 → 只有最后那张 live 卡片变了。
+          老代码不看场景、几十张卡片每次都全量 `refit()`，长对话里纯属白烧 CPU。
         """
         try:
             self.chat_layout.activate()
             self.chat_container.adjustSize()
         except Exception:
             pass
-        for c in self._cards:
+        targets = getattr(self, "_pending_refit", None)
+        if targets is None:
+            targets = self._cards
+        for c in targets:
             if hasattr(c, "refit"):
                 c.refit()
+        self._pending_refit = None
         self._restore_scroll()
 
     def _restore_scroll(self):

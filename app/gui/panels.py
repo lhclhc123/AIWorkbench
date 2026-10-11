@@ -230,7 +230,7 @@ class TraceDialog(QDialog):
         for r in recs:
             ts = time.strftime("%m-%d %H:%M:%S", time.localtime(r.get("t", 0)))
             ok = r.get("ok")
-            mark = "✅" if ok else "❌"
+            mark = "✓" if ok else "✕"
             name = r.get("name", "?")
             ms = r.get("ms", 0)
             args = r.get("args") or {}

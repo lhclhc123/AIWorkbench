@@ -15,9 +15,9 @@
   · 并发上限 `max_running`（默认 4），超出的进 queued 队列，避免把机器打满；
   · **协作式取消**：`cancel()` 置事件 + 杀子进程；任务函数要自己看 `task.cancelled`；
   · 变更通知走 `subscribe(cb)` 回调（UI 侧转成 Qt 信号，跨线程安全）；
-  · 状态/日志/产物持久化到 `workspace/bgtasks/<id>.json`，重启后仍能看到历史。
+  · 状态/日志/产物持久化到 `<工作区>/.awb/bgtasks/<id>.json`，重启后仍能看到历史。
 
-⚠️ 线程安全约定：
+⚠ 线程安全约定：
   · `Task` 的字段只在任务线程里改；读取方（UI/工具）请用 `task.snapshot()` 拿快照。
   · `TaskManager` 内部所有可变结构都用 `_lock` 保护。
 """
@@ -30,6 +30,7 @@ import time
 import uuid
 
 from . import winproc as _winproc
+from .workspace import internal_dir
 
 # 并发上限：超过就排队。4 条链路并行已经够用，再多只会互相抢 CPU/网络。
 MAX_RUNNING = 4
@@ -204,8 +205,9 @@ class TaskManager:
 
     def __init__(self, ws_path, max_running=MAX_RUNNING):
         self.ws_path = os.path.abspath(ws_path)
-        self.dir = os.path.join(self.ws_path, "bgtasks")
-        os.makedirs(self.dir, exist_ok=True)
+        # ★ v9.18.0：后台任务持久化属于机器内部数据，藏进 <工作区>/.awb/bgtasks/
+        #   （老工作区还没迁移时 internal_dir 会自动回退到根目录 bgtasks/）
+        self.dir = internal_dir(self.ws_path, "bgtasks")
         self.max_running = max(1, int(max_running))
         self._tasks = {}                 # id -> Task
         self._order = []                 # id 列表（新的在前）
@@ -241,7 +243,7 @@ class TaskManager:
         dedup_key 非空且已有同类任务在跑/排队 -> 直接返回那个（避免模型
         反复发同一条命令，把并发槽占满）。
 
-        ⚠️ `nested=True` 用于**团队里由父任务派生的子任务**：
+        ⚠ `nested=True` 用于**团队里由父任务派生的子任务**：
            父任务自己占着一个并发槽、又在 join 子任务。如果子任务还要排队等槽，
            就会出现「父等子、子等槽、槽被父占着」的**死锁**（max_running=2 时必现）。
            所以嵌套子任务直接起线程，不参与排队。
@@ -315,13 +317,13 @@ class TaskManager:
         except Exception as exc:                       # noqa: BLE001
             task.status = "failed"
             task.error = f"{type(exc).__name__}: {exc}"
-            task.log_line(f"❌ 出错：{task.error}")
+            task.log_line(f"✕ 出错：{task.error}")
         finally:
             task.ended = time.time()
             task.proc = None
             task.set_progress("")
             if task.status == "done":
-                task.log_line(f"✅ 完成，用时 {time.time() - t0:.1f}s")
+                task.log_line(f"✓ 完成，用时 {time.time() - t0:.1f}s")
             self._notify(task)
             with self._lock:
                 self._running = max(0, self._running - 1)
@@ -472,7 +474,7 @@ def make_command_fn(cmd, cwd=None, timeout=600, shell=True):
                 _winproc.kill_tree(task.proc)
             except Exception:
                 pass
-            task.log_line(f"⏱ 超过 {int(timeout)} 秒，已强制结束")
+            task.log_line(f"◷ 超过 {int(timeout)} 秒，已强制结束")
             return (f"[超时] 命令超过 {int(timeout)} 秒仍未结束，已终止。\n"
                     f"最后输出：\n" + "\n".join(lines[-40:]))
         except Exception as exc:                       # noqa: BLE001
@@ -521,7 +523,7 @@ def make_python_fn(code, cwd=None, timeout=600, extra_env=None):
                 _winproc.kill_tree(task.proc)
             except Exception:
                 pass
-            task.log_line(f"⏱ 超过 {int(timeout)} 秒，已强制结束")
+            task.log_line(f"◷ 超过 {int(timeout)} 秒，已强制结束")
             return (f"[超时] 脚本超过 {int(timeout)} 秒仍未结束，已终止。\n"
                     f"最后输出：\n" + "\n".join(lines[-40:]))
         except Exception as exc:                       # noqa: BLE001

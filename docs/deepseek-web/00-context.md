@@ -7,7 +7,7 @@
 
 ## 1. 需求
 
-用户（刘浩辰，初三学生，本机 AIWorkbench 的作者与唯一使用者）看到 GitHub 上的
+用户（本机 AIWorkbench 的作者与唯一使用者）看到 GitHub 上的
 `DSH-webtokens` 项目，希望**把 DeepSeek 网页版（免 API Key）作为模型接进自己的 AIWorkbench**。
 
 用户原话：

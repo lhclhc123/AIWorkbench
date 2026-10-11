@@ -21,7 +21,7 @@ import time
 import urllib.parse
 import urllib.request
 
-# ⚠️ 所有子进程一律走 winproc（它统一处理"不弹黑窗口"）。
+# ⚠ 所有子进程一律走 winproc（它统一处理"不弹黑窗口"）。
 # 这里曾经手写 creationflags=CREATE_NO_WINDOW —— 那恰好是**反的**：
 # 本程序是 windowed exe，靠 ensure_hidden_console() 挂一个隐藏控制台让整条
 # 进程链静默；再传 CREATE_NO_WINDOW 等于让子进程"不继承控制台"，
@@ -283,10 +283,10 @@ class OAuthCallbackServer:
                 if params.get("code"):
                     outer.code = params["code"]
                     outer.state = params.get("state", "")
-                    msg = "<h2>授权成功 ✅</h2><p>可以关掉这个页面，回到 AI 工作台。</p>"
+                    msg = "<h2>授权成功 ✓</h2><p>可以关掉这个页面，回到 AI 工作台。</p>"
                 else:
                     outer.error = params.get("error") or "回调里没有 code"
-                    msg = f"<h2>授权失败 ❌</h2><p>{outer.error}</p>"
+                    msg = f"<h2>授权失败 ✕</h2><p>{outer.error}</p>"
                 body = ("<html><meta charset='utf-8'><body style='font-family:"
                         "Microsoft YaHei;padding:40px'>" + msg + "</body></html>")
                 data = body.encode("utf-8")
@@ -358,7 +358,7 @@ class DingTalkClient:
             s = "应用机器人 · " + ("已配置" if ok else "缺少 AppKey/AppSecret")
             bad = self.looks_like_nickname()
             if bad:
-                s += f" · ⚠️ 接收人「{bad}」像是昵称，必须填 userId"
+                s += f" · ⚠ 接收人「{bad}」像是昵称，必须填 userId"
             if self._stream_running:
                 s += " · 收消息已连接"
             return s
@@ -857,7 +857,7 @@ class DingTalkClient:
                            f"我把通讯录里真实可用的 userId 查出来。")
         try:
             r = self.send(
-                f"✅ 这是一条来自 AI 工作台的测试消息。\n"
+                f"✓ 这是一条来自 AI 工作台的测试消息。\n"
                 f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"通道：{self.status_text()}\n"
                 f"收到说明配置成功，之后可以让 AI 把结果、简报、告警推到钉钉。",

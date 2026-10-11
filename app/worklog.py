@@ -16,12 +16,16 @@ import json
 import os
 import re
 
+from .workspace import internal_dir
+
 _DIR = "worklog"
 _INDEX = "index.json"
 
 
 def _dir(ws):
-    d = os.path.join(ws, _DIR)
+    # ★ v9.18.0：工作总结属于机器内部数据，藏进 <工作区>/.awb/worklog/
+    #   （老工作区还没迁移时 internal_dir 会自动回退到根目录 worklog/）
+    d = internal_dir(ws, _DIR)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -66,7 +70,7 @@ def append(ws, *, source="对话", request="", tools=None, files=None,
             if isinstance(f, dict):
                 p = f.get("path") or ""
                 good = f.get("exists")
-                mark = "✅" if good else ("❌" if good is False else "•")
+                mark = "✓" if good else ("✕" if good is False else "•")
                 size = f.get("size")
                 s = f"（{size} 字节）" if size else ""
                 lines.append(f"  - {mark} `{p}`{s}")
@@ -114,7 +118,7 @@ def _index_add(ws, title, source, ok):
 
 def list_days(ws):
     """返回 [(日期, 字节数), ...]，新的在前。"""
-    d = os.path.join(ws, _DIR)
+    d = _dir(ws)
     out = []
     if not os.path.isdir(d):
         return out
@@ -131,7 +135,7 @@ def list_days(ws):
 
 def read_day(ws, day=None):
     day = day or datetime.date.today().strftime("%Y-%m-%d")
-    p = os.path.join(ws, _DIR, day + ".md")
+    p = os.path.join(_dir(ws), day + ".md")
     try:
         with open(p, "r", encoding="utf-8") as f:
             return f.read()

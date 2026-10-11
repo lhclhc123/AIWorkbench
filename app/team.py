@@ -1,33 +1,39 @@
 # -*- coding: utf-8 -*-
-"""多角色团队 —— 让一支"产品/架构/工程/测试"小队各自独立跑，互不阻塞。
+"""多角色团队引擎 —— 让一支「预置团队」在对话里协作，每个成员各跑各的会话、互不阻塞。
 
-用户 2026-10-02 原话：
-    「再给它增加一个像 WorkBuddy 这样的团队的功能，各个工程师这种，什么产品经理啊
-      这种独立跑，然后不影响主进程，你把各个东西都协调做好。」
+用户 2026-10-11 原话（需求 13）：
+    「你团队的功能根本就做的不对，这个功能是直接放到对话中的，对话时可以选择使用团队，
+      然后设计想软件开发团队之类的，有已经写好的成员及其身份背景，然后比如项目总监
+      可以给工程师派任务之类的……」
 
-和"多个后台任务"的区别：
+和「多个后台任务」的区别：
   · 后台任务 = 一堆互不相干的活儿并行跑；
-  · 团队     = **有协作关系**的一条流水线：产品经理定需求 → 架构师出方案 + 拆任务 →
-               **多个工程师并行实现**（各自独立工作目录、独立会话、互不干扰）→
-               测试工程师验证 → 组长汇总交付。
+  · 团队     = **有协作关系**的一条流水线，而且过程要**直接显示在对话流里**。
+      总监拆需求、产出「派单表」→ 按派单**并行**派出多个成员（各自独立工作目录、独立会话）
+      → 独立校验岗复核 → 总监汇总交付。
 
-三个阶段（用户能看见每一步在干什么）：
-    ┌─ 阶段一 规划 ────────────────────────────────┐
-    │  产品经理(串行) → 架构师(串行，拿到 PM 的产出)  │
+四个阶段（每一步都会通过 on_event 抛事件，界面据此在对话流里逐条渲染）：
+    ┌─ 阶段一 派单 ────────────────────────────────┐
+    │  项目总监(串行) → 产出 JSON 派单表              │
     └──────────────────────────────────────────────┘
-    ┌─ 阶段二 建造（★ 真并行）─────────────────────┐
-    │  工程师A ┐                                     │
-    │  工程师B ├─ 各自独立目录/独立会话，同时跑        │
-    │  工程师C ┘                                     │
+    ┌─ 阶段二 并行建造（★ 真并行，按依赖分批）─────┐
+    │  第 1 批：无依赖的任务 同时跑                  │
+    │  第 2 批：依赖已满足的任务 同时跑 …            │
     └──────────────────────────────────────────────┘
-    ┌─ 阶段三 校验交付 ────────────────────────────┐
-    │  测试工程师(串行) → 组长汇总(串行)              │
+    ┌─ 阶段三 校验 ────────────────────────────────┐
+    │  独立校验岗(串行)：真的跑一遍 + 逐条对验收标准  │
+    └──────────────────────────────────────────────┘
+    ┌─ 阶段四 交付 ────────────────────────────────┐
+    │  项目总监(串行)：汇总成最终交付说明            │
     └──────────────────────────────────────────────┘
 
 产物全部落在 `workspace/team/<run_id>/`：
-    <角色>_files/   该角色的工作目录（工程师写的东西在这儿，互不覆盖）
-    report.md       组长汇总的最终交付说明
-    run.json        全过程记录（可复现、可排查）
+    <key>_files/     每个成员的工作目录（各自写的东西在这儿，互不覆盖）
+    report.md        总监汇总的最终交付说明
+    run.json         全过程记录（可复现、可排查）
+
+⚠ 本文件只动「怎么协作」；成员人设/提示词都在 `team_presets.py`（数据和引擎分开）。
+⚠ 严禁在此使用 subprocess/os.system —— 命令执行一律走 agent 工具层。
 """
 import json
 import os
@@ -36,104 +42,75 @@ import threading
 import time
 import uuid
 
+# 成员人设 + 提示词拼装 + 派单解析 + 依赖分批，全部复用 team_presets。
+from .team_presets import (                                    # noqa: F401  (部分是再导出)
+    TEAMS, TEAMS_ORDER, DEFAULT_TEAM_ID, TEAM_PREFIX,
+    get_preset, list_presets, iter_members, get_member,
+    get_lead, get_validator, spawnable_ids,
+    build_member_system, build_lead_dispatch_system,
+    parse_dispatch, topo_batches,
+)
+
+# 对外事件种类（GUI 侧按这个 kind 分派渲染逻辑；签名稳定，勿随意改）。
+EVENT_KINDS = ("phase", "dispatch", "member_start", "member_delta", "member_done", "done")
+
+
 # ---------------------------------------------------------------------------
-# 内置角色。每个角色一段独立人设 = 独立 system 提示，独立跑。
+# 向后兼容：ROLES 仍从这里导出（由 software 团队成员的 id -> 名片 生成）。
+# 老代码 / 老探针 import team.ROLES 还能用。
 # ---------------------------------------------------------------------------
 ROLES = {
-    "pm": {
-        "name": "产品经理", "emoji": "📋",
-        "system": (
-            "你是这支 AI 团队的产品经理。你的职责是**把用户那句模糊的需求变成可验收的清单**。\n"
-            "请输出（用中文，Markdown）：\n"
-            "1. 需求理解：一句话说清用户到底要什么；\n"
-            "2. 验收标准：3~6 条**可以逐条打勾验证**的具体标准（不要写「体验良好」这种空话）；\n"
-            "3. 交付物清单：最终要给用户哪些文件/结果。\n"
-            "⚠️ 不要写代码，不要执行命令，不要谈技术选型 —— 那是架构师和工程师的事。"
-        ),
-    },
-    "arch": {
-        "name": "架构师", "emoji": "🏗",
-        "system": (
-            "你是这支 AI 团队的架构师。产品经理已经给出了需求与验收标准，你要给出**技术方案**\n"
-            "并把工作拆成可以**并行**执行的任务。\n"
-            "请输出（中文 Markdown）：\n"
-            "1. 技术方案：用什么语言/库/结构，关键步骤；\n"
-            "2. 任务清单：用 ```json 代码块给出一个数组，每项形如\n"
-            '   {"title": "任务名（8 字内）", "task": "给工程师的完整指令，要写清楚产出什么文件、'
-            '放在哪个文件、怎么算做完"}\n'
-            "   拆成 2~4 个任务，**每个任务必须产出不重叠的文件**（否则并行时会互相覆盖）。\n"
-            "3. 依赖说明：哪些任务必须先做。\n"
-            "⚠️ 不写完整代码（工程师来写），但要说清接口/文件名/数据结构。"
-        ),
-    },
-    "dev": {
-        "name": "工程师", "emoji": "💻",
-        "system": (
-            "你是这支 AI 团队的一名工程师。你只负责分配给自己的**那一个**任务，\n"
-            "不要管别的任务，也不要重写别人的文件。\n"
-            "工作要求：\n"
-            "1. **必须真的写出文件**（用 write_file 工具），不要只在回答里贴代码；\n"
-            "2. 写完**必须真的运行验证一次**（run_python / run_command，命令里要出现你写的文件名），\n"
-            "   并把真实输出贴出来；跑不通就自己修，别急着说完成；\n"
-            "3. 最后用 3~5 行说明：做了什么、文件在哪、验证结果是什么（贴真实输出）。\n"
-            "⚠️ 工作目录就是你的专属目录，用相对路径写文件即可。"
-        ),
-    },
-    "qa": {
-        "name": "测试工程师", "emoji": "🧪",
-        "system": (
-            "你是这支 AI 团队的测试工程师。工程师们已经交付了代码，你要**独立验证**，\n"
-            "而不是替他们说好话。\n"
-            "工作步骤：\n"
-            "1. 用 list_dir / read_file 找到实际产物，逐个检查是否真的存在、内容是否完整；\n"
-            "2. **真的运行一遍**（run_python / run_command），把真实输出贴出来；\n"
-            "3. 逐条对照产品经理的验收标准，给每条打 ✅/❌ 并附证据；\n"
-            "4. 发现的问题要写清「哪条命令、什么报错、怎么复现」。\n"
-            "⚠️ 严禁编造测试结果；跑不起来就如实说跑不起来。"
-        ),
-    },
-    "lead": {
-        "name": "组长", "emoji": "🧭",
-        "system": (
-            "你是这支 AI 团队的组长。所有角色都干完了，你要给用户一份**最终交付说明**。\n"
-            "必须包含：\n"
-            "1. 一句话结论：任务达成了没有；\n"
-            "2. 交付物清单：**每个文件的完整路径** + 它是什么；\n"
-            "3. 验证证据：测试工程师跑出来的真实结果（贴关键输出，别只写「测试通过」）；\n"
-            "4. 未完成/有风险的部分：如实列出，不要粉饰；\n"
-            "5. 用户下一步该做什么（怎么用这些文件）。\n"
-            "⚠️ 只依据团队真实产出说话，绝不编造没发生的事。"
-        ),
-    },
+    m["id"]: {"name": m["name"], "emoji": m["emoji"], "system": m["system"]}
+    for m in get_preset("software")["members"]
 }
 
-# 默认团队配置（用户可在界面上改）
+# 老版本默认团队配置（保留导出，避免老代码 import 失败）。
 DEFAULT_TEAM = ["pm", "arch", "dev:2", "qa", "lead"]
 
 
 def _role_title(key):
-    r = ROLES.get(key)
-    return f"{r['emoji']} {r['name']}" if r else key
+    """把角色 key 翻成「emoji 名称」；兼容 key 里的 ':' / '#' 后缀。"""
+    base = str(key or "").split(":")[0].split("#")[0]
+    r = ROLES.get(base)
+    if r:
+        return f"{r['emoji']} {r['name']}"
+    m = get_member(DEFAULT_TEAM_ID, base)
+    return f"{m['emoji']} {m['name']}" if m else str(key)
 
 
+# ---------------------------------------------------------------------------
+# 流式片段回传（可选）：GUI 侧的 agent 适配器若拿到真实流式回调，
+# 调用 team.delta("片段") 即可让该成员的输出逐字进入对话流。
+# 为什么用线程局部：团队里多个成员在不同线程里并发跑，各自只该收到自己的片段。
+# ---------------------------------------------------------------------------
+_tls = threading.local()
+
+
+def delta(chunk):
+    """由成员的执行线程调用，把一段流式输出回传给当前运行的团队（可选能力）。"""
+    cb = getattr(_tls, "emit", None)
+    if cb and chunk:
+        try:
+            cb(chunk)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 旧接口：从架构师的输出里抠任务清单。保留给老代码/老探针，内部已改用派单表。
+# ---------------------------------------------------------------------------
 def parse_tasks(text):
-    """从架构师的输出里抠出任务清单。
-
-    健壮性优先：模型给的 JSON 经常带 ```json 围栏、末尾多余逗号、中文引号。
-    抠不出来就退回"按方案正文拆两段"，**绝不允许因为解析失败就让整个团队停摆**。
-    """
+    """（兼容用）从一段文本里抠出 2~4 个任务。解析失败返回 []，绝不抛异常。"""
     if not text:
         return []
     blocks = re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    cands = blocks + [text]
-    for blob in cands:
+    for blob in blocks + [text]:
         s = blob.find("[")
         e = blob.rfind("]")
         if s < 0 or e <= s:
             continue
-        raw = blob[s:e + 1]
-        raw = raw.replace("，", ",").replace("：", ":")
-        raw = re.sub(r",\s*([\]}])", r"\1", raw)          # 去掉尾逗号
+        raw = blob[s:e + 1].replace("，", ",").replace("：", ":")
+        raw = re.sub(r",\s*([\]}])", r"\1", raw)
         try:
             arr = json.loads(raw)
         except Exception:
@@ -150,8 +127,6 @@ def parse_tasks(text):
         if out:
             return out[:4]
     # 兜底：按「1. 2. 3.」之类的编号行拆
-    # ⚠️ 阈值别定太高：早先写 `len(t) > 6`，像「先做A」这种短任务名会被整条过滤掉，
-    #    明明能救回来却返回 0 个（探针实测打出来过）。
     lines = [ln.strip() for ln in text.splitlines()
              if re.match(r"^\s*(?:\d+[.、)]|[-*])\s*\S", ln)]
     out = []
@@ -162,25 +137,40 @@ def parse_tasks(text):
     return out
 
 
+# ---------------------------------------------------------------------------
+# TeamRun
+# ---------------------------------------------------------------------------
 class TeamRun:
-    """一次团队执行。**同步 run()**，由调用方丢进后台线程跑（不阻塞界面）。"""
+    """一次团队执行。**同步 run()**，由调用方丢进后台线程跑（不阻塞界面）。
+
+    对外关键点（GUI 依赖）：
+      · 构造时传 on_event(kind, payload) 收过程事件（见 EVENT_KINDS）；
+      · 传 team_id 选预置团队（默认 software）；
+      · agent_fn(member_id, prompt, files_dir, max_steps) -> {"text","files"} 是成员执行器；
+      · run() 结束后看 self.report / self.status / self.cards。
+    """
 
     def __init__(self, rid, goal, ws_path, agent_fn, taskman=None,
-                 roles=None, max_steps=6, on_change=None):
+                 roles=None, max_steps=6, on_change=None,
+                 team_id=None, on_event=None):
         self.id = rid
         self.goal = goal
         self.ws_path = os.path.abspath(ws_path)
-        self.agent_fn = agent_fn      # agent_fn(role_key, prompt, files_dir, max_steps) -> {"text","files"}
-        self.taskman = taskman        # 有的话，每个角色会成为一个可见的后台任务
-        self.roles = list(roles or DEFAULT_TEAM)
+        self.agent_fn = agent_fn      # agent_fn(member_id, prompt, files_dir, max_steps) -> {"text","files"}
+        self.taskman = taskman        # 有的话，每个成员会成为一个可见的后台任务（nested=True）
+        self.roles = list(roles or [])  # 兼容旧的 roles 参数（仅记录，流程以 team_id 为准）
         self.max_steps = int(max_steps)
         self.on_change = on_change
+        self.on_event = on_event
+        self.team = get_preset(team_id)
+        self.team_id = self.team["id"]
         self.created = time.time()
         self.ended = None
         self.status = "queued"        # queued/running/done/failed/cancelled
-        self.report = ""              # 组长最终汇总
+        self.report = ""              # 总监最终汇总
         self.error = ""
-        self.cards = {}               # key -> {role,title,status,text,files,started,ended,note}
+        self.dispatch = []            # 本轮的派单表（规整后）
+        self.cards = {}               # key -> {role,title,status,text,files,started,ended,note,task_id}
         self._cancel = threading.Event()
         self._lock = threading.RLock()
         self.dir = os.path.join(self.ws_path, "team", self.id)
@@ -192,8 +182,8 @@ class TeamRun:
         return self._cancel.is_set()
 
     def cancel(self):
+        """请求取消：置事件 + 连带取消所有还在跑的子任务。"""
         self._cancel.set()
-        # 连带取消所有还在跑的角色子任务
         if self.taskman is not None:
             for c in self.cards.values():
                 tid = c.get("task_id")
@@ -208,10 +198,22 @@ class TeamRun:
             except Exception:
                 pass
 
+    def _emit(self, kind, payload=None):
+        """向界面抛一个过程事件。**异常一律吞掉**，绝不让回调影响团队执行。"""
+        if not self.on_event:
+            return
+        data = {"kind": kind, "run_id": self.id, "team_id": self.team_id}
+        if payload:
+            data.update(payload)
+        try:
+            self.on_event(kind, data)
+        except Exception:
+            pass
+
     def _card(self, key, **kw):
         with self._lock:
             c = self.cards.setdefault(key, {
-                "role": key, "title": _role_title(key.split(":")[0]),
+                "role": key, "title": _role_title(key),
                 "status": "queued", "text": "", "files": [], "note": "",
                 "started": None, "ended": None, "task_id": "",
             })
@@ -223,33 +225,52 @@ class TeamRun:
         with self._lock:
             return {
                 "id": self.id, "goal": self.goal, "status": self.status,
+                "team_id": self.team_id, "team_name": self.team["name"],
                 "created": self.created, "ended": self.ended,
                 "elapsed": round((self.ended or time.time()) - self.created, 1),
                 "report": self.report, "error": self.error,
-                "dir": self.dir,
+                "dir": self.dir, "dispatch": [dict(d) for d in self.dispatch],
                 "cards": [dict(c) for c in self.cards.values()],
             }
 
-    # ---------- 角色执行 ----------
+    # ---------- 成员执行 ----------
     def _work_dir(self, key):
-        d = os.path.join(self.dir, key.replace(":", "_") + "_files")
+        d = os.path.join(self.dir, str(key).replace(":", "_").replace("#", "_") + "_files")
         os.makedirs(d, exist_ok=True)
         return d
 
-    def _run_role(self, key, prompt, note=""):
-        """跑一个角色。返回它的产出文本（失败返回错误说明）。"""
+    def _run_member(self, key, member, prompt, note=""):
+        """跑一个成员。返回它的产出文本（失败/取消返回空串）。
+
+        key     卡片键（如 'dev#1'、'qa'、'lead#summary'）
+        member  成员定义 dict（来自 team_presets）
+        """
         if self.cancelled:
-            self._card(key, status="cancelled", note="已取消")
+            self._card(key, role=member["id"], title=f"{member['emoji']} {member['name']}",
+                       status="cancelled", note="已取消")
             return ""
-        c = self._card(key, status="running", started=time.time(),
-                       note=note or "正在工作…")
+        name = f"{member['emoji']} {member['name']}"
+        c = self._card(key, role=member["id"], title=name, status="running",
+                       started=time.time(), note=note or "正在工作…")
         wd = self._work_dir(key)
         holder = {}
+        self._emit("member_start", {"key": key, "member": member["id"], "name": member["name"],
+                                    "title": member["title"], "emoji": member["emoji"],
+                                    "note": note, "task_title": note})
+
+        # 给成员线程挂上「流式回传」的钩子：agent_fn 若要流式，可调用 team.delta()。
+        def _emit_delta(chunk):
+            self._emit("member_delta", {"key": key, "member": member["id"],
+                                        "name": member["name"], "chunk": chunk})
 
         def _do(_task=None):
+            _tls.emit = _emit_delta
             if _task is not None:
-                _task.log_line(f"角色 {key} 开始")
-            res = self.agent_fn(key.split(":")[0], prompt, wd, self.max_steps)
+                _task.log_line(f"{name} 开始")
+            try:
+                res = self.agent_fn(member["id"], prompt, wd, self.max_steps)
+            finally:
+                _tls.emit = None
             holder["res"] = res
             return (res or {}).get("text", "")
 
@@ -258,9 +279,8 @@ class TeamRun:
                 # ★ nested=True：团队子任务不参与排队。否则「父任务占着并发槽等子任务、
                 #   子任务在队列里等槽」会直接死锁（max_running=2 时必现）。
                 t = self.taskman.submit(
-                    "agent", f"{_role_title(key.split(':')[0])} · {note or self.id}",
-                    _do, detail=prompt[:200], nested=True,
-                    dedup_key=f"team:{self.id}:{key}")
+                    "agent", f"{name} · {note or self.id}", _do,
+                    detail=prompt[:200], nested=True, dedup_key=f"team:{self.id}:{key}")
                 self._card(key, task_id=t.id)
                 if t.thread is not None:
                     t.thread.join()
@@ -270,161 +290,165 @@ class TeamRun:
                 text = _do(None)
                 st = "done"
         except Exception as exc:                       # noqa: BLE001
-            self._card(key, status="failed", ended=time.time(),
-                       text=f"[错误] {type(exc).__name__}: {exc}")
-            return f"[错误] {type(exc).__name__}: {exc}"
+            text = f"[错误] {type(exc).__name__}: {exc}"
+            self._card(key, status="failed", ended=time.time(), text=text)
+            self._emit("member_done", {"key": key, "member": member["id"],
+                                       "name": member["name"], "status": "failed",
+                                       "text": text, "files": []})
+            return text
 
         res = holder.get("res") or {}
         files = res.get("files") or []
-        if res.get("files"):
-            for f in files:
-                try:
-                    if os.path.exists(f["path"]):
-                        pass
-                except Exception:
-                    pass
         if st == "cancelled" or self.cancelled:
-            self._card(key, status="cancelled", ended=time.time(), text=text)
+            status = "cancelled"
         elif st == "failed":
-            self._card(key, status="failed", ended=time.time(), text=text)
+            status = "failed"
         else:
-            self._card(key, status="done", ended=time.time(), text=text,
-                       files=files, note="")
+            status = "done"
+        self._card(key, status=status, ended=time.time(), text=text, files=files,
+                   note=("" if status == "done" else note))
+        self._emit("member_done", {"key": key, "member": member["id"], "name": member["name"],
+                                   "title": member["title"], "emoji": member["emoji"],
+                                   "status": status, "text": text,
+                                   "files": [f.get("path") for f in files if f.get("path")]})
         self._save()
-        return text
+        return text or ""
+
+    # ---------- 派单规整 ----------
+    def _normalize_tasks(self, tasks):
+        """把派单表里不合法的 member 兜底成能干活的一线成员；依赖下标越界的去掉。"""
+        spawn = spawnable_ids(self.team_id)
+        fallback = spawn[0] if spawn else "dev"
+        out = []
+        for tk in tasks:
+            mid = str(tk.get("member") or "").strip()
+            if mid not in [m["id"] for m in iter_members(self.team_id)] or \
+                    mid in [self.team["lead"], (get_validator(self.team_id) or {}).get("id")]:
+                mid = fallback
+            deps = [d for d in (tk.get("depends_on") or [])
+                    if isinstance(d, int) and 0 <= d < len(tasks) and d != len(out)]
+            out.append({"member": mid, "title": tk.get("title", ""),
+                        "task": tk.get("task", ""), "output": tk.get("output", ""),
+                        "depends_on": deps})
+        return out
+
+    # ---------- 并行执行一批 ----------
+    def _exec_batch(self, batch, tasks, results):
+        """并行跑一批任务；依赖任务的产出会作为「前置产出」注入下批成员的提示。"""
+        threads = []
+        for idx in batch:
+            tk = tasks[idx]
+            member = get_member(self.team_id, tk["member"]) or get_lead(self.team_id)
+            key = f"{member['id']}#{idx + 1}"
+            prompt = build_member_system(self.team_id, member["id"], self.goal, dispatch=tk)
+            # 拼接前置任务产出（依赖的任务必须先做完，这里是它们的结论）。
+            pre = []
+            for d in (tk.get("depends_on") or []):
+                dt = results.get(d)
+                if dt:
+                    dtk = tasks[d]
+                    pre.append(f"### 前置任务「{dtk.get('title', '')}」的产出\n{dt[:3000]}")
+            if pre:
+                prompt += "\n\n# 【前置任务产出】（请在此基础上继续）\n" + "\n\n".join(pre)
+            th = threading.Thread(
+                target=lambda k=key, m=member, p=prompt, i=idx: results.__setitem__(
+                    i, self._run_member(k, m, p, note=tk.get("title", ""))),
+                daemon=True)
+            th.start()
+            threads.append(th)
+        for th in threads:
+            if self.cancelled:
+                break
+            th.join()
+        for th in threads:                              # 取消时也要收尾，别留悬挂线程
+            th.join(timeout=1)
 
     # ---------- 主流程 ----------
     def run(self):
         """跑完整支团队（同步）。调用方负责把它放到后台线程里。"""
         self.status = "running"
         self._touch()
+        lead = get_lead(self.team_id)
+        validator = get_validator(self.team_id)
         try:
             if self.cancelled:
                 self.status = "cancelled"
                 return self.report
 
-            # ===== 阶段一：规划（产品经理 → 架构师，串行）=====
-            pm = self._run_role("pm", self.goal, note="理解需求、定验收标准")
-            arch_prompt = (
-                f"【用户原始需求】\n{self.goal}\n\n"
-                f"【产品经理的需求梳理与验收标准】\n{pm or '（产品经理未产出，按原始需求判断）'}\n\n"
-                "请给出技术方案 + 可并行的任务清单（按你 system 里要求的 JSON 格式）。"
-            )
-            arch = self._run_role("arch", arch_prompt, note="出技术方案、拆任务")
-            tasks = parse_tasks(arch)
+            # ===== 阶段一：总监派单 =====
+            self._emit("phase", {"phase": "planning", "index": 1, "total": 4,
+                                 "label": "阶段一 · 项目总监拆解需求、产出派单表"})
+            lead_text = self._run_member(
+                "lead#dispatch", lead,
+                build_lead_dispatch_system(self.team_id, self.goal),
+                note="拆解需求、派单")
+            tasks = parse_dispatch(lead_text)
             if not tasks:
-                # 解析失败也要能往下走 —— 用一个通用兜底任务，别让整支队伍停摆
-                tasks = [{"title": "实现", "task":
-                          f"按下面的方案把东西做出来，产出可运行的文件：\n{arch[:1500]}"}]
+                # 解析失败也要能往下走 —— 用一个通用兜底任务，别让整支队伍停摆。
+                spawn = spawnable_ids(self.team_id)
+                tasks = [{"member": (spawn[0] if spawn else "dev"), "title": "实现",
+                          "task": f"按下面的安排把东西做出来，产出可运行/可交付的结果：\n{lead_text[:1500]}",
+                          "output": "（见任务说明）", "depends_on": []}]
+            tasks = self._normalize_tasks(tasks)
+            self.dispatch = tasks
+            batches = topo_batches(tasks)
+            self._emit("dispatch", {
+                "lead_text": lead_text,
+                "tasks": [dict(t, index=i) for i, t in enumerate(tasks)],
+                "batches": batches,
+            })
+            self._save()
 
-            # ===== 阶段二：建造（多个工程师 **真并行**）=====
-            n_dev = 1
-            for r in self.roles:
-                if str(r).startswith("dev"):
-                    n_dev = int(str(r).split(":")[1]) if ":" in str(r) else 1
-                    break
-            n_dev = max(1, min(n_dev, len(tasks)))
-            pool = {}
-            threads = []
-            for i in range(n_dev):
-                key = f"dev:{i + 1}"
-                tk = tasks[i]
-                prompt = (
-                    f"【总目标】{self.goal}\n\n"
-                    f"【产品经理的验收标准】\n{pm[:1500]}\n\n"
-                    f"【架构师的技术方案】\n{arch[:2000]}\n\n"
-                    f"【你负责的任务】{tk['title']}\n{tk['task']}\n\n"
-                    "请动手实现：写文件 + 真的运行验证 + 汇报结果。"
-                )
-                holder = {}
-
-                def _mk(key=key, prompt=prompt, holder=holder):
-                    def _fn(task=None):
-                        if task is not None:
-                            task.log_line(f"工程师 {key} 开工")
-                        res = self.agent_fn("dev", prompt, self._work_dir(key),
-                                            self.max_steps)
-                        holder["res"] = res
-                        return (res or {}).get("text", "")
-                    return _fn
-
-                fn = _mk()
-                if self.taskman is not None:
-                    t = self.taskman.submit(
-                        "agent", f"{_role_title('dev')} {i + 1} · {tasks[i]['title']}",
-                        fn, detail=prompt[:200], nested=True,
-                        dedup_key=f"team:{self.id}:{key}")
-                    self._card(key, status="running", started=time.time(),
-                               note=tasks[i]["title"], task_id=t.id)
-                    threads.append((key, t))
-                else:
-                    th = threading.Thread(
-                        target=lambda k=key, f=fn: pool.__setitem__(k, f(None)),
-                        daemon=True)
-                    self._card(key, status="running", started=time.time(),
-                               note=tasks[i]["title"])
-                    th.start()
-                    threads.append((key, th))
-
-            for key, obj in threads:
+            # ===== 阶段二：按派单并行建造 =====
+            self._emit("phase", {"phase": "building", "index": 2, "total": 4,
+                                 "label": f"阶段二 · 按派单并行执行（共 {len(batches)} 批）"})
+            results = {}
+            for bi, batch in enumerate(batches):
                 if self.cancelled:
                     break
-                joiner = getattr(obj, "thread", obj)
-                if joiner is not None:
-                    joiner.join()
-            # 收尾：把每个工程师的结果写进卡片
-            dev_texts = []
-            for key, obj in threads:
-                res = {}
-                if self.taskman is not None:
-                    t = obj
-                    res = {"text": t.result, "files": t.files}
-                    self._card(key, status=("cancelled" if t.status == "cancelled"
-                                            else "failed" if t.status == "failed"
-                                            else "done"),
-                               ended=t.ended or time.time(),
-                               text=t.result, files=t.files, note="")
-                else:
-                    th = obj
-                    th.join(timeout=1)
-                    res = {"text": pool.get(key, ""), "files": []}
-                    self._card(key, status="done", ended=time.time(),
-                               text=pool.get(key, ""))
-                if res.get("text"):
-                    dev_texts.append(f"### {key}\n{res['text'][:2500]}")
-            # 任务比工程师多 -> 剩下的也要有人做（否则交付不完整）
-            for tk in tasks[n_dev:]:
-                extra = self._run_role("dev:extra", (
-                    f"【总目标】{self.goal}\n【技术方案】{arch[:1500]}\n"
-                    f"【你负责的任务】{tk['title']}\n{tk['task']}\n"
-                    "请动手实现：写文件 + 真的运行验证 + 汇报结果。"),
-                    note=tk["title"])
-                if extra:
-                    dev_texts.append(f"### {tk['title']}\n{extra[:2500]}")
+                self._emit("phase", {"phase": "building", "index": 2, "total": 4,
+                                     "batch": bi + 1, "batches": len(batches),
+                                     "label": f"第 {bi + 1}/{len(batches)} 批并行（{len(batch)} 个成员）"})
+                self._exec_batch(batch, tasks, results)
 
-            # ===== 阶段三：验证（测试 → 组长，串行）=====
+            # 汇总所有成员产出
+            produced = []
+            for i, tk in enumerate(tasks):
+                txt = results.get(i) or (self.cards.get(f"{(get_member(self.team_id, tk['member']) or lead)['id']}#{i+1}", {}).get("text") or "")
+                if txt:
+                    produced.append(f"### 任务{i + 1}「{tk.get('title', '')}」（{tk.get('member', '')}）\n{txt[:3000]}")
+
             all_files = []
             for c in self.cards.values():
                 all_files += [f.get("path") for f in (c.get("files") or []) if f.get("path")]
-            file_list = "\n".join(f"- {p}" for p in all_files[:40]) or "（没有登记到文件）"
-            qa = self._run_role("qa", (
-                f"【用户原始需求】\n{self.goal}\n\n"
-                f"【产品经理的验收标准】\n{pm[:1200]}\n\n"
-                f"【工程师的交付说明】\n" + "\n\n".join(dev_texts)[:4000] + "\n\n"
-                f"【登记到的产物文件】\n{file_list}\n\n"
-                "请独立验证：找到文件、真的跑一遍、逐条对照验收标准打勾。"),
-                note="独立验证产物")
+            file_list = "\n".join(f"- {p}" for p in all_files[:40]) or "（没有登记到产物文件）"
 
-            lead = self._run_role("lead", (
-                f"【用户原始需求】\n{self.goal}\n\n"
-                f"【产品经理】\n{pm[:1200]}\n\n"
-                f"【架构师】\n{arch[:1200]}\n\n"
-                f"【工程师交付】\n" + "\n\n".join(dev_texts)[:3000] + "\n\n"
-                f"【测试工程师的验证结论】\n{qa[:2000]}\n\n"
-                f"【产物文件】\n{file_list}\n\n"
-                "请给出最终交付说明。"), note="汇总交付")
+            # ===== 阶段三：独立校验 =====
+            verify_text = ""
+            if validator:
+                self._emit("phase", {"phase": "verify", "index": 3, "total": 4,
+                                     "label": "阶段三 · 独立校验（真的跑一遍 + 逐条对验收标准）"})
+                vprompt = (
+                    build_member_system(self.team_id, validator["id"], self.goal)
+                    + "\n\n# 【团队各成员的本轮产出】\n" + ("\n\n".join(produced)[:6000] or "（无产出）")
+                    + "\n\n# 【登记到的产物文件】\n" + file_list
+                    + "\n\n请独立验证：找到产物、真的跑一遍、逐条对照验收标准打勾，发现问题附上复现步骤。"
+                )
+                verify_text = self._run_member(validator["id"], validator, vprompt, note="独立验证")
 
-            self.report = lead or qa or "（团队未产出汇总，请查看各角色卡片）"
+            # ===== 阶段四：总监汇总交付 =====
+            self._emit("phase", {"phase": "deliver", "index": 4, "total": 4,
+                                 "label": "阶段四 · 项目总监汇总最终交付说明"})
+            dprompt = (
+                build_member_system(self.team_id, lead["id"], self.goal)
+                + "\n\n# 【派单执行情况】\n" + ("\n\n".join(produced)[:5000] or "（无产出）")
+                + ("\n\n# 【独立校验岗的结论】\n" + verify_text[:2500] if verify_text else "")
+                + "\n\n# 【登记到的产物文件】\n" + file_list
+                + "\n\n请给出最终交付说明（结论 / 交付物清单含完整路径 / 验证证据 / 未完成与风险 / 用户下一步）。"
+            )
+            summary = self._run_member("lead#summary", lead, dprompt, note="汇总交付")
+
+            self.report = summary or verify_text or "（团队未产出汇总，请查看各成员卡片）"
             self.status = "cancelled" if self.cancelled else "done"
         except Exception as exc:                       # noqa: BLE001
             self.status = "failed"
@@ -434,6 +458,8 @@ class TeamRun:
             self._save()
             self._write_report()
             self._touch()
+            self._emit("done", {"status": self.status, "report": self.report,
+                                "error": self.error, "dir": self.dir})
         return self.report
 
     # ---------- 落盘 ----------
@@ -450,12 +476,13 @@ class TeamRun:
     def _write_report(self):
         try:
             lines = [f"# AI 团队执行报告：{self.id}", "",
+                     f"- 团队：{self.team['name']}（{self.team_id}）",
                      f"- 需求：{self.goal}",
                      f"- 状态：{self.status}",
                      f"- 用时：{round((self.ended or time.time()) - self.created, 1)} 秒", ""]
             for c in self.cards.values():
                 lines += [f"## {c['title']}（{c['status']}）",
-                          f"工作目录：`{os.path.join(self.dir, c['role'].replace(':', '_') + '_files')}`", ""]
+                          f"工作目录：`{os.path.join(self.dir, str(c['role']).replace(':', '_') + '_files')}`", ""]
                 if c.get("files"):
                     lines += ["产物："] + [f"- `{f['path']}`" for f in c["files"]] + [""]
                 lines += [str(c.get("text") or "")[:6000], ""]
@@ -465,6 +492,9 @@ class TeamRun:
             pass
 
 
+# ---------------------------------------------------------------------------
+# TeamManager
+# ---------------------------------------------------------------------------
 class TeamManager:
     """管理所有团队执行（内存 + 落盘）。"""
 
@@ -487,10 +517,13 @@ class TeamManager:
             except Exception:
                 pass
 
-    def create(self, goal, agent_fn, taskman=None, roles=None, max_steps=6):
+    def create(self, goal, agent_fn, taskman=None, roles=None, max_steps=6,
+               team_id=None, on_event=None):
+        """新建一次团队执行，**立刻返回 TeamRun**（真正执行在 run() 里，由调用方丢后台）。"""
         rid = "team-" + time.strftime("%m%d-%H%M") + "-" + uuid.uuid4().hex[:4]
         run = TeamRun(rid, goal, self.ws_path, agent_fn, taskman=taskman,
-                      roles=roles, max_steps=max_steps, on_change=self._notify)
+                      roles=roles, max_steps=max_steps, on_change=self._notify,
+                      team_id=team_id, on_event=on_event)
         self._runs[rid] = run
         self._order.insert(0, rid)
         return run

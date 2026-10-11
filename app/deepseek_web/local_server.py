@@ -28,6 +28,13 @@ from .web_driver import WebDriverError
 # 发送给 llm_client 的 SSE chunk 里用的模型标识
 MODEL_ID = config.WEB_MODEL_ID
 
+# 防呆阈值（"反复新建"是病，要能在日志里被看见）
+# 启动初期同时接入主对话 + 两条旁路调用是正常的，所以**全局**阈值放宽；
+# 但"同一个对话指纹在同一个时间窗里被建了两次"是 100% 的病 —— 单独盯住它。
+NEW_CHAT_REPEAT_WINDOW = 120.0
+NEW_CHAT_SAME_KEY_WARN = 2      # 同一指纹在窗口内新建 >= 2 次 -> 喊
+NEW_CHAT_TOTAL_WARN = 6         # 窗口内总共新建 >= 6 次 -> 喊
+
 
 class WebTask:
     """一次网页调用的任务记录（用于幂等与镜像）。"""
@@ -78,9 +85,21 @@ class LocalServer:
         self._task_lock = threading.Lock()
         self._tasks = {}
 
-        # 当前网页会话"我们已发送过的消息列表"
+        # 当前网页会话"我们已发送过的消息列表"（向后兼容字段，随当前会话同步）
         self._sent_lock = threading.Lock()
         self._sent_messages = []
+
+        # ---- v9.18.0：会话路由表（一个工作台对话 <-> 一个 DeepSeek 网页会话）----
+        # _sessions: 精确指纹 -> {"url", "messages", "created_at", "last_used"}
+        # _loose_map: 宽松指纹 -> 精确指纹（给模板型旁路调用兜底，避免每轮新建）
+        # _active_key: 当前网页正停在哪个会话上
+        self._sess_lock = threading.RLock()
+        self._sessions = {}
+        self._loose_map = {}
+        self._active_key = None
+        # 防呆：新建次数 + 近期新建流水（暴露"反复新建"这种病）
+        self._new_chat_count = 0
+        self._new_chat_log = deque(maxlen=30)
 
         self._notices = deque(maxlen=50)
         self._notice_lock = threading.Lock()
@@ -92,7 +111,7 @@ class LocalServer:
     def start(self, preferred_port=None):
         """启动服务；返回实际监听的端口（固定端口被占用则回退随机端口）。
 
-        ⚠️ 注意 `preferred_port=0` 的语义是"**随机端口**"，不是"用默认端口"。
+        ⚠ 注意 `preferred_port=0` 的语义是"**随机端口**"，不是"用默认端口"。
         旧写法 `int(preferred_port or config.WEB_DEFAULT_PORT)` 里 `0 or X == X`，
         会把 0 吞掉 -> 传 0 变成抢 18921。测试探针因此和真机实例撞端口，
         又因为 Windows 的 SO_REUSEADDR 允许重复绑定，请求会被真机实例截走，
@@ -181,7 +200,7 @@ class LocalServer:
                 kind, detail = errors.WebErrorKind.OTHER, ""
         if not detail:
             detail = errors.WEB_ERROR_TEXT.get(kind, "")
-        return {
+        st = {
             "state": kind.value,
             "kind": kind.value,
             "detail": detail,
@@ -191,6 +210,12 @@ class LocalServer:
             "port": self._port,
             "last_error": self._last_error,
         }
+        # v9.18.0：会话路由概况（排查"为什么 DeepSeek 里冒出这么多会话"）
+        try:
+            st.update(self.session_stats())
+        except Exception:
+            pass
+        return st
 
     def selftest(self):
         """三项自检：① 网页可达 ② 已登录 ③ 能否取回一条答复。"""
@@ -228,14 +253,93 @@ class LocalServer:
         else:
             out.append({"name": "能否取回答复", "ok": False, "detail": "未登录，无法取回答复"})
         # 自检发过话之后，网页会话状态已变，重置"已发送消息"基线
-        with self._sent_lock:
-            self._sent_messages = []
+        self.reset_conversation_state()
         return out
 
     def reset_conversation_state(self):
-        """网页被重载 / 新建对话后，忘掉"以为网页已拥有的消息"。"""
+        """网页被重载 / 新建对话后，忘掉"以为网页已拥有的消息"。
+
+        v9.18.0：只清**当前**会话的消息基线，**不动**会话路由表 ——
+        路由表丢了就会退化成"下一轮重新新建网页会话"，正是要修的病。
+        """
         with self._sent_lock:
             self._sent_messages = []
+        with self._sess_lock:
+            sess = self._sessions.get(self._active_key)
+        if sess is not None:
+            sess["messages"] = []
+
+    def forget_sessions(self):
+        """彻底清空会话路由表（用户明确要求"重置网页会话"时才该调）。"""
+        with self._sess_lock:
+            self._sessions.clear()
+            self._loose_map.clear()
+            self._active_key = None
+        with self._sent_lock:
+            self._sent_messages = []
+
+    # ---------- v9.18.0：会话路由 ----------
+    def _lookup_session(self, strict, loose):
+        """按 精确指纹 -> 宽松指纹 找已登记的会话；返回 (key, sess) 或 (None, None)。"""
+        with self._sess_lock:
+            key = strict if strict in self._sessions else self._loose_map.get(loose)
+            sess = self._sessions.get(key)
+            if sess is None:
+                return None, None
+            return key, sess
+
+    def _register_session(self, strict, loose):
+        """登记一个**刚新建**的网页会话并置为当前。"""
+        with self._sess_lock:
+            sess = {"url": "", "messages": [], "created_at": time.time(),
+                    "last_used": time.time()}
+            self._sessions[strict] = sess
+            self._loose_map.setdefault(loose, strict)
+            self._active_key = strict
+            return sess
+
+    def _set_active(self, key):
+        with self._sess_lock:
+            self._active_key = key
+
+    def _active(self):
+        with self._sess_lock:
+            return self._active_key
+
+    def _count_new_chat(self, strict, reason):
+        """防呆：每次新建都留痕；短时间内反复新建要**喊出来**。"""
+        now = time.time()
+        with self._sess_lock:
+            self._new_chat_count += 1
+            self._new_chat_log.append((now, strict, reason))
+            total = self._new_chat_count
+            recent = [x for x in self._new_chat_log
+                      if now - x[0] < NEW_CHAT_REPEAT_WINDOW]
+        self._logf("info", f"新建网页会话（原因={reason}，指纹={strict[:8]}，"
+                           f"本次进程累计 {total}）")
+        same = [x for x in recent if x[1] == strict]
+        if len(same) >= NEW_CHAT_SAME_KEY_WARN:
+            self._logf("warn",
+                       f"★防呆：同一个对话指纹 {strict[:8]} 在 "
+                       f"{NEW_CHAT_REPEAT_WINDOW:.0f}s 内被新建了 {len(same)} 次"
+                       f"（累计 {total}）—— 这就是「每轮新建」的病，请查会话指纹。")
+        elif len(recent) >= NEW_CHAT_TOTAL_WARN:
+            self._logf("warn",
+                       f"★防呆：{NEW_CHAT_REPEAT_WINDOW:.0f}s 内共新建 "
+                       f"{len(recent)} 个网页会话（累计 {total}），数量异常，"
+                       "请查是不是有请求绕过了会话路由。")
+        return total
+
+    def session_stats(self):
+        """给 /status 用的会话路由概况（排查"为什么建了这么多会话"）。"""
+        with self._sess_lock:
+            return {
+                "web_sessions": len(self._sessions),
+                "web_active": self._active_key or "",
+                "web_new_chat_count": self._new_chat_count,
+                "web_session_urls": [s.get("url", "")[-18:]
+                                     for s in self._sessions.values()],
+            }
 
     # ---------- SSE 工具 ----------
     def _chunk_obj(self, content=None, reasoning=None, finish=None):
@@ -538,35 +642,59 @@ class _Handler(BaseHTTPRequestHandler):
                 task.detail = "" if kind == errors.WebErrorKind.NOT_LOGGED_IN else detail
                 return
 
-            # 前缀增量：网页靠自身记忆保住上文，只发新增尾段
-            with app._sent_lock:
-                sent = list(app._sent_messages)
-            tail = prompt_mod.diff_tail(sent, task.messages)
-            if tail is None:
-                # 前缀不命中 -> 换对话：新建网页对话 + 全量平铺
+            # ---------- v9.18.0：会话路由（严格一一对应，绝不每轮新建）----------
+            # 判据按优先级排，**只有最后一种情况才允许新建网页会话**：
+            #   ① 本次请求是"当前会话"已发消息的严格前缀扩展 -> 原地复用（零新建）
+            #   ② 精确/宽松指纹命中已登记的会话 -> 导航回那个会话复用（零新建）
+            #   ③ 从没见过这个指纹 -> 确实是新对话 -> 才新建一次
+            strict = prompt_mod.conversation_key(task.messages)
+            loose = prompt_mod.loose_key(task.messages)
+            key, sess = app._lookup_session(strict, loose)
+
+            tail = None
+            if sess is not None and key == app._active():
+                # ① 正在这个会话上：前缀增量（网页靠自身记忆保住上文）
+                tail = prompt_mod.diff_tail(sess["messages"], task.messages)
+
+            if sess is not None and tail is None:
+                # ② 切回一个已登记的会话（旁路调用结束回来了 / 用户切回旧对话）
+                url = sess.get("url") or ""
+                if url and driver.resume_session(url):
+                    app._set_active(key)
+                    app._logf("info", f"已切回既有网页会话 …{url[-18:]}（未新建）")
+                    tail = prompt_mod.diff_tail(sess["messages"], task.messages)
+                else:
+                    app._logf("warn", f"登记的网页会话已失效（{url[-18:] or '无地址'}），"
+                                      "将新建一次")
+                    sess = None
+
+            if sess is None:
+                # ③ 唯一的新建点：第一次见到这个对话指纹
                 try:
                     driver.new_conversation()
-                    app.reset_conversation_state()
-                    app.push_notice("检测到新的对话，已在 DeepSeek 网页里新建一个会话。")
                 except WebDriverError as exc:
                     task.error = exc.kind
                     task.detail = str(exc)
                     return
+                sess = app._register_session(strict, loose)
+                app._count_new_chat(strict, "首次见到这个对话指纹")
+                app.push_notice("已在 DeepSeek 网页里新建一个会话"
+                                "（这个对话第一次接入网页版，之后一直复用它）。")
+                tail = prompt_mod.flatten(task.messages)
+            else:
+                app._set_active(key)
+
+            if tail is None:
+                # 前缀不命中（历史被压缩 / 编辑重发）：**全量重发到同一个已有会话**，
+                # 绝不因为"判据没命中"就去新建一个网页会话。
                 tail = prompt_mod.flatten(task.messages)
 
-            # 超长：新建对话 + 携带最近若干轮（必须给提示，禁止静默丢弃）
+            # 超长：裁剪后重发到**同一个**会话（必须给提示，禁止静默丢弃）
             if prompt_mod.estimate_chars(task.messages) > config.WEB_MAX_PROMPT_CHARS:
-                try:
-                    driver.new_conversation()
-                    app.reset_conversation_state()
-                    trimmed = prompt_mod.trim_recent(task.messages, keep_turns=6)
-                    tail = prompt_mod.flatten(trimmed)
-                    app.push_notice("网页会话较长，已新建网页对话并携带最近 6 轮上下文"
-                                    "（更早内容未带入网页）。")
-                except WebDriverError as exc:
-                    task.error = exc.kind
-                    task.detail = str(exc)
-                    return
+                trimmed = prompt_mod.trim_recent(task.messages, keep_turns=6)
+                tail = prompt_mod.flatten(trimmed)
+                app.push_notice("本轮内容较长，已只携带最近 6 轮上下文发给网页"
+                                "（更早内容未带入，但没有新建网页会话）。")
 
             if not (tail or "").strip():
                 task.error = errors.WebErrorKind.OTHER
@@ -597,6 +725,18 @@ class _Handler(BaseHTTPRequestHandler):
 
             task.answer = answer
             task.state = "done"
+
+            # 记下这个会话的网页地址（第一次发送后网页才会给出 /a/chat/s/<id>）：
+            # 下次要切回来时**直接导航过去复用**，不必再新建。
+            try:
+                url = driver.session_url()
+            except Exception:
+                url = ""
+            if url:
+                sess["url"] = url
+            sess["messages"] = [dict(m) for m in task.messages]
+            sess["last_used"] = time.time()
+            app._set_active(key)
             with app._sent_lock:
                 app._sent_messages = [dict(m) for m in task.messages]
         except Exception as exc:               # pragma: no cover - 兜底

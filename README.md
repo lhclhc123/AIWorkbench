@@ -1,6 +1,6 @@
 # AI 工作台 v9（本地 AI Agent 桌面应用）
 
-一个**对标 WorkBuddy** 的本地 AI Agent 桌面程序 —— 流式对话、**62 个真实可用工具**、**技能系统**、**定时任务自动执行**、**子代理委派**、**多任务并行 + 多角色团队**、**不懂就问（向用户提问）**、**多语言代码生成**、**每对话独立文件夹 + 双层记忆**、**语音输入 + 语音播报**、**钉钉接入**、**自动检查更新**、文档读写、长期记忆、任务计划面板、MCP 扩展。全部用你自己的 API 密钥，**数据不出本机**，**全免费**。
+一个**对标 WorkBuddy** 的本地 AI Agent 桌面程序 —— 流式对话、**63 个真实可用工具**、**技能系统**、**定时任务自动执行**、**子代理委派**、**多任务并行 + 对话内多角色团队**、**内嵌浏览器内核（真实抓包）**、**思维链实时呈现**、**不懂就问（向用户提问）**、**多语言代码生成**、**每对话独立文件夹 + 双层记忆**、**语音输入 + 语音播报**、**钉钉接入**、**自动检查更新**，文档读写、长期记忆、任务计划面板、MCP 扩展。全部用你自己的 API 密钥，**数据不出本机**，**全免费**。
 
 > v9 主题：从「会调工具的聊天框」升级为「能自己排班干活的助手」。
 > 密钥不再明文落盘 —— 内嵌混淆密文 + Windows DPAPI 加密。
@@ -31,6 +31,15 @@
 
 | 能力 | 说明 |
 | --- | --- |
+| 🌐 **内嵌浏览器内核（v9.18.0）** | 新增 `web_visit` 工具 + 顶部「浏览器」页：用**真实 Chromium 内核**打开网页、等 JS 跑完再取正文，并把页面发出的网络请求一起抓回来（结果里直接列出「疑似数据接口」，AI 照着就能复现）。专治单页应用、各种后台、易查分之流 —— 这类站用普通抓取只能拿到一具空壳。浏览器页里也能人工打开、点「交给 AI 分析当前页」一键把内容填进输入框。 |
+| 🔍 **关键词定向搜索（v9.18.0）** | `web_search` 支持 `site` 参数做**站内定向搜索**（`site="gov.cn"` 只查官网），查官方资料不再被一堆二手内容带偏；也可以直接写 `site:域名 关键词`。 |
+| 👥 **团队进对话（v9.18.0）** | 团队不再是另一个页面 —— **输入框上方多了一条「⬡ 团队」**：对话时随手选一支预置小队（**软件开发团队** / **资料调研团队**，成员都有写好的身份背景），发消息就由这支队伍接手。项目总监拆需求派单 → 成员并行开工（名片会**亮灯**显示谁在进行中）→ 独立校验 → 总监汇总，整份汇总直接成为这一轮的回复。团队选择**每个对话各记各的**，互不干扰。 |
+| 🧠 **思维链实时呈现（v9.18.0）** | 带思维链的模型（DeepSeek-V4.x / Qwen3.x 等）**边想边显示**："思考中"那张卡会实时滚动推理过程，不再让你对着转圈干等十几秒只看结果。 |
+| ⏹ **停止即刻收尾（v9.18.0）** | 点「停止」不再等十几秒：底层网络连接被真的掐断（不是只置个标志位），并且**不再额外调一次模型**去"补一句总结"，而是从已有内容里把**最近一段够大的结论**捞出来当最终答复。 |
+| 🧵 **每个对话都能同时跑（v9.18.0）** | 多对话**真正独立**：A 对话在思考时切到 B，B 不再显示成"思考中"，A 本轮已经产出的过程与正文也不会消失（切回来原样恢复）。列表里正在跑的对话标「● 运行中」。 |
+| 🗂 **工作区只留产物（v9.18.0）** | 工作区根目录只剩 `chats/`、`MEMORY.md`、`settings.json`、`mcp.json`（内部数据统一收进隐藏的 `.awb/`），每个对话的产物落在自己的 `chats/<序号_标题>/files/`。 |
+| 🔵 **图标全部单色化（v9.18.0）** | 界面里所有图标从彩色 emoji 换成**单色字形**（新增 `app/icons.py` 作为唯一来源），风格统一、不再花花绿绿。 |
+| 🛡 **两个真 bug 修复（v9.18.0）** | ① `write_file` **空内容硬闸**：以前模型只给路径不给内容会写出 0 字节文件、还回一句"已确认落盘"（谎报成功 + 静默截断原文件），现在直接拒绝并告诉它怎么补；② **"一句话都没说出口"硬保险**：整轮没有产出任何回复时，自动把最近一段结论顶上来，绝不让一轮对话静默收场。 |
 | 🧩 **技能系统（Skills）** | 仿 Claude Skills / WorkBuddy 技能：`SKILL.md` + YAML 头（name / description / when）。内置 **12 个**开箱即用技能，工作区可自建，AI 通过 `list_skills` / `use_skill` 主动加载并按步骤执行。顶部「技能」页可视化管理与新建。 |
 | ⏰ **定时任务** | 每天 / 每周 / 每小时 / 按间隔 / 仅一次；用自然语言写时间（"每天 8:00"、"工作日 9 点"、"每 2 小时"、"周五 18:00"）。到点**后台无人值守跑完整 Agent 循环**，结果可推送到钉钉。顶部「定时」页管理，支持「立即跑一次」。 |
 | 👥 **子代理委派** | `spawn_agent` 开一个**独立上下文**的子代理去干子任务（如"先把这三个文件读完再汇报"），只把结论带回主对话，主上下文不被中间过程污染。 |
@@ -64,7 +73,7 @@
 - 🫧 **气泡式消息卡片**：用户靠右蓝色气泡 / AI 靠左灰色气泡 / 工具结果黄色卡片。
 - 📋 **一键复制**：每条消息可复制原始 Markdown。
 - 🔧 **工具结果可折叠**：长内容默认折叠，头部标注这一步做了什么。
-- 🎨 **11 个页面**：对话 / 技能 / 定时 / 记忆 / 工具记录 / 集成 / ⚡ 并行任务 / 👥 团队 / 助理 / 设置 / 关于（侧边导航）。
+- 🎨 **12 个页面**：对话 / 技能 / 浏览器 / 定时 / 记忆 / 工具记录 / ⚡ 并行任务 / 👥 团队 / 助理 / 设置 / 关于 / 🛠（侧栏改成"对话列表上方的几行小格子"导航，手机上也好点）。
 - 🌗 **浅色 / 深色主题**：一键切换，深色模式强制调色板保证文字可读。
 - 🗂 **多会话**：左侧列表管理多个对话，互不干扰。
 - 📝 **Markdown + 代码高亮**：代码块语法高亮、可复制。
@@ -115,21 +124,22 @@
 
 ---
 
-## 62 个内置工具
+## 63 个内置工具
 
 | 分类 | 工具 |
 | --- | --- |
 | 读 / 理解（10） | `read_file` `list_dir` `read_document` `read_image` `search_files` `fetch_url` `system_info` `now` `search_history` `window_list` |
 | 写 / 生成（5） | `write_file` `create_document` `file_op` `open_path` `archive` |
-| 执行 / 系统（7） | `run_command` `run_python` `list_processes` `kill_process` `clipboard` `screenshot` `notify` |
-| 联网（3） | `web_search` `download_file` `http_request` |
+| 执行 / 系统（8） | `run_command` `run_python` `build_exe` `list_processes` `kill_process` `clipboard` `screenshot` `notify` |
+| 联网（4） | `web_search` `web_visit` `download_file` `http_request` |
 | 网页采集 / GitHub（3） | `web_scrape` `web_form_batch` `github` |
 | 记忆 / 计划 / 知识库（5） | `remember` `recall` `update_plan` `build_index` `search_knowledge` |
 | 语音（2） | `transcribe_audio` `speak_text` |
-| 钉钉（2） | `dingtalk_push` `dingtalk_status` |
+| 钉钉（3） | `dingtalk_push` `dingtalk_status` `dingtalk` |
 | 图片 / 图表（2） | `image_op` `create_chart` |
 | 提醒 / 更新（2） | `reminder` `check_update` |
 | 技能 / 定时 / 子代理（7） | `list_skills` `use_skill` `schedule_task` `list_tasks` `cancel_task` `run_task` `spawn_agent` |
+| 并行任务 / 团队 / 工作日志（9） | `run_bg` `bg_list` `bg_status` `bg_wait` `bg_cancel` `team_run` `team_status` `write_worklog` `read_worklog` |
 | 交互（1） | `ask_user` |
 | MCP（2） | `mcp_list` `mcp_call` |
 
@@ -242,15 +252,20 @@ AIWorkbench/
 │  ├─ knowledge.py          # 本地知识库（倒排索引 + BM25）
 │  ├─ trace.py              # 工具调用追踪
 │  ├─ mcp_client.py         # 最小 MCP 客户端（stdio + JSON-RPC）
-│  ├─ workspace.py          # 设置 / 对话持久化
+│  ├─ workspace.py          # 设置 / 对话持久化（内部数据收进 .awb/）
+│  ├─ webengine.py          # ★ 真实浏览器内核（v9.18.0）：离屏渲染 + 请求嗅探抓包
+│  ├─ team_presets.py       # ★ 预置团队人设（v9.18.0）：软件开发 / 资料调研小队
+│  ├─ icons.py              # ★ 图标字形唯一来源（v9.18.0）：全单色，禁彩色 emoji
 │  ├─ themes.py             # 主题
 │  ├─ markdown_render.py    # Markdown -> 高亮 HTML
 │  └─ gui/
-│     ├─ main_window.py     # 主窗口（托盘 / 热键 / 附件 / 后台 Agent 通道）
-│     ├─ pages.py           # 11 个页面（含并行任务页 / 团队页）
+│     ├─ main_window.py     # 主窗口（托盘 / 热键 / 附件 / 后台 Agent 通道 / 对话内团队条）
+│     ├─ pages.py           # 12 个页面（新增「浏览器」页 v9.18.0）
+│     ├─ browser_page.py    # ★ 内嵌浏览器页（v9.18.0）：地址栏 + Chromium + 一键交给 AI
+│     ├─ team_bar.py        # ★ 对话内团队条（v9.18.0）：选团队 + 成员状态灯
 │     ├─ chat_worker.py     # 前台 Agent 多轮循环
 │     ├─ voice_bar.py       # 语音条
-│     ├─ widgets.py         # 消息卡片等
+│     ├─ widgets.py         # 消息卡片等（含思维链卡 ReasoningCard v9.18.0）
 │     ├─ panels.py          # 计划面板 / 记忆 / 工具记录 / MCP
 │     └─ settings_dialog.py   # （早期遗留文件，产品已改用「设置」页，不参与打包）
 └─ tests/                   # 自动化测试（开发用，见下）
@@ -286,8 +301,12 @@ python main.py --selftest
 测试套件：
 
 ```powershell
+# ★ v9.18.0：一条命令跑全量回归（带超时保护 + 汇总表 + 逐脚本完整日志）
+python tests/run_all_v9180.py            # 全量（含联网用例）
+python tests/run_all_v9180.py --fast     # 跳过联网用例，约 3 分钟
+
 python tests/test_v91.py         # 单元测试：技能/定时/子代理/别名路由/提示词
-python tests/smoke_gui_v9.py     # GUI 冒烟：11 个页面能否构建
+python tests/smoke_gui_v9.py     # GUI 冒烟：12 个页面能否构建
 python tests/smoke_gui_v91.py    # GUI 冒烟：技能页/定时页/附件/编辑/热键/托盘
 python tests/live_v91.py         # 真实模型 E2E（需联网 + 已配 key）
 python tests/check_nosecrets.py  # 扫描产物：确认没有明文密钥
@@ -298,20 +317,21 @@ python tests/check_nosecrets.py  # 扫描产物：确认没有明文密钥
 ## 打包为 exe
 
 ```powershell
-python build_v9.py
+python build_v9180.py
 ```
 
-产物在 `dist_v9\AIWorkbench\AIWorkbench.exe`（onedir 模式，附带依赖），并在 `dist_v9\` 生成 `AIWorkbench_v9.zip`。
+产物在 `dist_v9180\AIWorkbench\AIWorkbench.exe`（onedir 模式，附带依赖），并在 `dist_v9180\` 生成 `AIWorkbench_v9.zip`。
 
 > **打包注意**：
 > - `python-docx` / `python-pptx` 依赖包内模板文件，`reportlab` 依赖字体数据 —— 脚本已用 `--collect-data` / `--collect-submodules` 显式收进包。
 > - 本机若同时装有 PyQt5 / PySide，会导致 PyInstaller abort —— 脚本已显式 `--exclude-module`。
+> - ★ **v9.18.0 起要把 QtWebEngine 的浏览器内核打进包**：`QtWebEngineProcess.exe` / `resources/` / `translations/` 必须一起收（漏了运行时会白屏或起不来），`build_v9180.py` 已按实测路径自动处理。这会让包体积明显变大 —— 换来的是"能像浏览器一样打开 JS 渲染的页面并抓包"。
 > - exe 带版本信息（公司名 / 描述 / 版本号），可在文件属性里看到。
 
 打包完成后验证：
 
 ```powershell
-dist_v9\AIWorkbench\AIWorkbench.exe --selftest
+dist_v9180\AIWorkbench\AIWorkbench.exe --selftest
 ```
 
 ---

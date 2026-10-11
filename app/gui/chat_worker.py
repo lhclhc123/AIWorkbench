@@ -26,6 +26,54 @@ def _has_real_proof(text):
 _PREVIEW_MAX_LINES = 60
 
 # ---------------------------------------------------------------------------
+# ★ v9.18.0（用户新增要求「确保给大模型的对话要有上下文，如果过长可以适当压缩」）：
+#   把「历史压缩」抽成**纯函数**，方便单元测试不依赖 Qt / 真实模型。
+#   规则：
+#     · 消息数太少（< min_msgs）或总字数没到 threshold 就不压，原样返回；
+#     · 永远保留 system 头（用户文件夹 / 日期 / 偏好都在这里）+ 最近 keep 条，
+#       **绝不**把最近上下文丢掉 —— 压缩只动"更早的"历史；
+#     · 压缩前提是 summarize() 能返回非空摘要（拿不到就原样返回，绝不留白）。
+def compact_history(msgs, summarize, *, threshold=70000, keep=8, min_msgs=12):
+    """把过长的对话历史压成「系统摘要 + 最近若干条」。
+
+    msgs       : 传给大模型的消息列表（含 role/content）。
+    summarize  : callable(prompt_text) -> str，调用摘要模型；返回纯中文摘要。
+                 由调用方注入（方法里注入 self.client.chat，测试里注入假函数），
+                 这样本函数保持纯函数、可独立验证。
+    返回       : 新的消息列表（压缩后）；不该压缩时**原样返回传入的那一份引用**
+                 （这样上层用 ``is not`` 就能判断「到底压没压」，不会每轮都误报）。
+    """
+    if len(msgs) < min_msgs:
+        return msgs
+    total = sum(len(str(m.get("content") or "")) for m in msgs)
+    if total < threshold:
+        return msgs
+    head = msgs[0] if msgs and msgs[0].get("role") == "system" else None
+    older = msgs[1:-keep] if head else msgs[:-keep]
+    if len(older) < 4:
+        return msgs
+    role_name = {"user": "用户", "assistant": "AI", "tool": "工具"}
+    lines = []
+    for m in older:
+        r = role_name.get(m.get("role"), str(m.get("role")))
+        lines.append(f"{r}: {str(m.get('content') or '')[:900]}")
+    try:
+        summary = summarize("\n".join(lines)[-30000:])
+    except Exception:
+        return msgs
+    summary = (summary or "").strip()
+    if not summary:
+        return msgs
+    new_msgs = []
+    if head:
+        new_msgs.append(head)
+    new_msgs.append({"role": "system",
+                     "content": "# 早前对话摘要（原始记录过长，已自动压缩）\n" + summary})
+    new_msgs.extend(msgs[-keep:])
+    return new_msgs
+
+
+# ---------------------------------------------------------------------------
 # ★ v9.16.0：一轮里多个工具调用 —— 只读、无副作用的可以**并行跑**。
 #   用户原话：「模型在跑我本地命令的时候不影响它继续思考，也可以多条链路同时执行」。
 #   老版本一轮拿到 5 个调用就逐个串行 execute，查 5 个网页/5 个文件要等 5 次往返。
@@ -39,8 +87,16 @@ _PREVIEW_MAX_LINES = 60
 _PARALLEL_SAFE_TOOLS = {
     "read_file", "list_dir", "read_document", "system_info", "now",
     "web_scrape", "http_request", "fetch_url", "web_search",
+    # ★ v9.18.0（需求 2）：`web_visit` 用浏览器内核打开网页、返回正文 + 抓到的接口，
+    #   全程只读（不写盘、不动环境），所以和 web_scrape 一样可以并行。
+    "web_visit",
     "list_processes", "read_worklog", "list_skills", "github",
     "bg_list", "bg_status", "team_status", "check_update", "list_tasks",
+    # ★ v9.18.0（需求 9「工具再多一点」）：扩容工具集里**默认只读**的工具也可并行
+    #   （只读扫描/诊断，互不干扰）：disk_usage / find_duplicate / file_hash /
+    #   text_diff / net_info。写入类的工具（excel_op/write、pdf_op/merge、image_batch、
+    #   compile_run、pip_manage/install、git_op/push、text_op/replace）一律不进这里。
+    "disk_usage", "find_duplicate", "file_hash", "text_diff", "net_info",
 }
 # 并行度：4 条同时查已经够快，再多只会互相抢带宽/句柄
 _PARALLEL_MAX = 4
@@ -117,6 +173,7 @@ def _write_preview(call):
 
 class ChatWorker(QThread):
     token = pyqtSignal(str)            # 增量文本
+    reason = pyqtSignal(str)           # ★ v9.18.0（需求 17）思维链增量，边来边显示
     tool_start = pyqtSignal(str)       # 工具调用描述
     tool_result = pyqtSignal(str)      # 工具结果
     finished = pyqtSignal(list)        # 只含"本轮新增的、要显示给用户"的消息
@@ -156,6 +213,11 @@ class ChatWorker(QThread):
         # 真思维链（reasoning_content）累积缓冲：只有支持思维链的模型才会往里写，
         # 其它模型回调 0 次，行为与以前完全一致。
         self._reason_buf = []
+        # ★ v9.18.0（需求 17）：思维链要不要**实时**推给界面。
+        #   正常对话=True —— 让用户看得见模型在想什么（否则"思考慢"其实只是
+        #   中间过程被吞了）；程序内部自己发起的调用（上下文压缩摘要、收尾补答）
+        #   会临时置 False —— 那是机器自己的活，不该混进用户的思考区。
+        self._emit_reason = True
 
     def confirm(self, ok: bool):
         self._confirm_res = ok
@@ -189,9 +251,14 @@ class ChatWorker(QThread):
     def abort(self):
         """用户点了右下角的方形「停止」：立刻中断本轮。
 
-        只置标志位 —— 循环里的 `if self._abort` 会在下一个可中断点跳出，
-        流式 token 也会停止转发（见 _on_token），所以界面会立即"停下"。
-        已经产生的消息照常收尾（_run_impl 末尾的统一收尾逻辑会跑完）。
+        ★ v9.18.0（需求 15「点完停止后任务要等好久才能停止」）：
+          老实现只置一个标志位，靠循环"跑到下一个可中断点"才发现已经停了。
+          可是循环大部分时间都**阻塞**在两处：① 读模型的流式响应；
+          ② 等用户确认命令。这两处不醒，标志位就形同虚设。
+          所以现在要三件事一起做，才能真正"点了就停"：
+            1) 置标志位（循环里的检查点会立刻跳出）；
+            2) 让 LLM 客户端把正在收流的响应关掉 —— 流一断，读循环马上返回；
+            3) 把"等用户确认 / 等用户回答"的事件放行，别让后台还傻等着超时。
         """
         self._abort = True
         try:
@@ -200,6 +267,19 @@ class ChatWorker(QThread):
                 cb()
         except Exception:
             pass
+        # 把可能正卡着的两个等待放行（点停止 = 用户不想再管这一轮了）
+        for ev, val in ((getattr(self, "_confirm_event", None), False),
+                        (getattr(self, "_ask_event", None), "")):
+            if ev is None:
+                continue
+            try:
+                if ev is self._confirm_event:
+                    self._confirm_res = val
+                else:
+                    self._ask_res = val
+                ev.set()
+            except Exception:
+                pass
 
     # ---------- 并行执行一批只读工具（v9.16.0）----------
     def _run_parallel_calls(self, pairs):
@@ -209,7 +289,7 @@ class ChatWorker(QThread):
         标准线程池最省事，也不会和 Qt 事件循环纠缠。真正的工具信号
         （tool_start / tool_result）仍然由本线程按原顺序发，界面行为不变。
 
-        ⚠️ 任何一个线程抛异常都不能拖垮整轮 —— 把它转成 [错误] 文本，
+        ⚠ 任何一个线程抛异常都不能拖垮整轮 —— 把它转成 [错误] 文本，
            让模型看到失败原因并自己决定下一步（和串行时的行为一致）。
         """
         from concurrent.futures import ThreadPoolExecutor
@@ -227,17 +307,117 @@ class ChatWorker(QThread):
         return out
 
     # ---------- 真思维链（reasoning_content）----------
+    def _clean_for_show(self, s):
+        """把工具调用标记从一段文本里剥掉（捞结论时用，免得答复里全是 <tool_call>）。"""
+        try:
+            return agent_mod.TOOL_BODY_RE.sub(
+                "", agent_mod.TOOL_BLOCK_RE.sub("", str(s or ""))).strip()
+        except Exception:
+            return str(s or "").strip()
+
+    def _salvage_conclusion(self, min_len=24, stopped=True):
+        """把"最近一段够大的结论"捞出来当最终答复。
+
+        ★ v9.18.0（需求 15）用户原话：
+          「把最近的大一点的结论当为最终结论」
+
+        为什么不能简单取最后一条助手文本：Agent 循环里模型每轮吐的多半是
+        「我先看看目录」这类**过程话**，几个字、没有结论价值。
+        所以从后往前找**长度够大**的那一条；④ 实在什么都没有，就诚实说明
+        "还没产出结论"，并把已经跑过的工具结果摘要附上 —— 绝不编。
+
+        `stopped`：**两种完全不同的触发场景，措辞必须分开**（否则会撒谎）——
+          · True  —— 用户点了停止（需求 15）。答复开头写「已按你的操作停止」。
+          · False —— 循环自己跑完了却**一句话都没能说出口**（max_iter 耗尽、
+                     模型连续吐空、被异常打断……）。这时写「已按你的操作停止」
+                     就是假话，改成如实说"这一轮没能给出正式答复"。
+                     见 `_run_impl` 收尾处那道硬保险 ——
+                     复盘包实测有 **16 轮**用户完全看不到任何回应，
+                     用户唯一的反应就是把同一句话再发一遍（数据里 25 句是重复）。
+        """
+        def _cl(s):
+            return self._clean_for_show(s)
+
+        tag = "（已按你的操作停止）" if stopped else "（这一轮我没能给出正式答复）"
+        tag3 = ("（已按你的操作停止，本轮还没给出正式结论；"
+                "下面是停下之前的推理进展）") if stopped else \
+               ("（本轮还没给出正式结论；下面是已经跑出来的推理进展）")
+        tag4 = ("（已按你的操作停止）本轮还没产出结论。" if stopped
+                else "（这一轮我没能给出正式答复）本轮还没产出结论。")
+
+        # ① 已经落库的正式答复
+        for m in reversed(self.out_messages):
+            if m.get("role") == "assistant":
+                c = _cl(m.get("content"))
+                if len(c) >= min_len:
+                    return tag + "\n\n" + c
+        # ② 中途那些"剥掉工具调用之后还够长"的模型输出，取最长的那条
+        cands = []
+        for m in self.api_messages[-8:]:
+            if m.get("role") == "assistant":
+                c = _cl(m.get("content"))
+                if len(c) >= min_len:
+                    cands.append(c)
+        if cands:
+            return (tag + "下面是我停下之前已经得出的结论：\n\n"
+                    + max(cands, key=len))
+        # ③ 思维链里最后一段
+        for m in reversed(self.out_messages):
+            if m.get("role") == "thinking":
+                c = _cl(m.get("content"))
+                if len(c) >= min_len:
+                    return tag3 + "\n\n" + c
+        # ④ 兜底：什么都不编，如实说清 + 附上工具结果
+        tools = [_cl(m.get("content")) for m in self.out_messages
+                 if m.get("role") == "tool" and _cl(m.get("content"))]
+        tail = ""
+        if tools:
+            tail = ("\n\n**停下之前已经执行的工具**（最近几条）：\n\n"
+                    + "\n".join("- " + t[:160] for t in tools[-3:]))
+        return tag4 + tail
+
     def _collect_reason(self, delta):
-        """收集思维链增量（默认 None 的模型不会调用）。"""
+        """收集思维链增量（默认 None 的模型不会调用）。
+
+        ★ v9.18.0（需求 17）：除了往缓冲里攒（整轮结束后折成「深度思考」块落库），
+          还**实时**把增量推给界面 —— 用户能看着模型一句句想，而不是对着转圈干等。
+          这是"响应慢"体感最直接的缓解手段：等待时间没变，但等待**看得见**了。
+        """
         if delta and not self._abort:
             self._reason_buf.append(delta)
+            if self._emit_reason:
+                self.reason.emit(delta)
 
-    def _take_reason(self, limit=6000):
-        """取走并清空思维链缓冲。过长时截断，避免把对话文件撑爆。"""
+    # ★★ v9.18.0（用户反馈）：思维链过长**不许再砍尾巴**。
+    #   老实现是 `txt[:16000] + "…（已截断）"` —— 只留开头、砍掉结尾。可思维链的价值
+    #   恰恰在**收尾那几段**（模型把前面绕的圈收敛成一个结论），砍尾巴等于把结论扔了，
+    #   用户看到的就是"思维链被截断"。
+    #   现在的策略：留一个**很高的安全上限**（防病态膨胀把对话文件撑爆），
+    #   一旦真的超了，**掐中间、两头都留**（头 170k + 尾 30k）并写明丢了多少字 ——
+    #   既不静默，也不丢结论。
+    REASON_MAX = 200_000
+    REASON_TAIL = 30_000
+
+    def _take_reason(self, limit=None):
+        """取走并清空思维链缓冲。
+
+        `limit=None`（默认）走上面的「掐中间、保两头」策略；
+        显式传数字则退回老行为（只留前 limit 字），探针会用这个口子做对照。
+        """
         txt = "".join(self._reason_buf).strip()
         self._reason_buf = []
-        if len(txt) > limit:
-            txt = txt[:limit] + "\n…（思维链过长，已截断）"
+        if limit is not None:
+            # 显式 limit：老语义（给探针/老调用点留的兼容口）
+            if len(txt) > limit:
+                txt = txt[:limit] + "\n…（思维链过长，已截断）"
+            return txt
+        cap = self.REASON_MAX
+        if len(txt) > cap:
+            head = cap - self.REASON_TAIL
+            dropped = len(txt) - cap
+            txt = (txt[:head]
+                   + f"\n\n…（中间 {dropped} 字太长没显示；开头与**结尾结论**都已保留）…\n\n"
+                   + txt[-self.REASON_TAIL:])
         return txt
 
     # ---------- 注入给 AgentRunner 的回调（工具执行时在工作线程内被调用）----------
@@ -281,44 +461,34 @@ class ChatWorker(QThread):
         """历史对话太长时自动压缩：把较早的消息摘要成一段，只保留最近若干条。
 
         这样长对话不会因为超出上下文窗口而报错，也不会让每一轮都慢得要死。
+        ★ v9.18.0：抽出 `compact_history` 纯函数后，这里只是注入「真正的摘要模型」
+          并回填结果；规则与边界判定都集中在纯函数里（更稳、更好测）。
+
+        用户要求「确保给大模型的对话要有上下文，如果过长可以适当压缩」：
+          · 压缩**只动更早的历史**，system 头（用户文件夹/日期/偏好）和
+            最近 keep 条**永远原样保留**，上下文不丢；
+          · 摘要会把「当前工作目录 / 日期 / 最近操作的文件路径 / 用户偏好」
+            一并写进去，压缩后模型依然有够用的 grounding。
         """
-        msgs = self.api_messages
-        if len(msgs) <= keep + 5:
-            return
-        total = sum(len(str(m.get("content") or "")) for m in msgs)
-        if total < threshold:
-            return
-        head = msgs[0] if msgs and msgs[0].get("role") == "system" else None
-        older = msgs[1:-keep] if head else msgs[:-keep]
-        if len(older) < 4:
-            return
-        role_name = {"user": "用户", "assistant": "AI", "tool": "工具"}
-        lines = []
-        for m in older:
-            r = role_name.get(m.get("role"), str(m.get("role")))
-            lines.append(f"{r}: {str(m.get('content') or '')[:900]}")
-        try:
-            summary = self.client.chat(
+        def _summarize(prompt_text):
+            return self.client.chat(
                 [{"role": "system", "content":
-                    "你是对话摘要器。把下面这段对话压缩成一段不超过 500 字的中文摘要，"
-                    "只保留：用户的目标与偏好、已经完成的事、关键结论与结论依据、"
-                    "未完成事项、涉及的文件路径。不要评论、不要客套，直接给摘要。"},
-                 {"role": "user", "content": "\n".join(lines)[-30000:]}],
+                    "你是对话摘要器。把下面这段早期对话压缩成一段不超过 500 字的中文摘要，"
+                    "只保留这些「模型继续干活必须知道」的东西，按条目给：\n"
+                    "1) 用户的目标与偏好（语言/工具/风格）；\n"
+                    "2) 已经完成的事、关键结论与结论依据；\n"
+                    "3) 未完成事项、下一步要做什么；\n"
+                    "4) **当前工作目录（绝对路径）**与**日期**；\n"
+                    "5) 涉及过的文件名与路径（相对工作目录）。\n"
+                    "不要评论、不要客套、不要编造没说过的事，直接给摘要。"},
+                 {"role": "user", "content": prompt_text}],
                 "auto", False, None, 60)
-        except Exception:
-            return
-        summary = (summary or "").strip()
-        if not summary:
-            return
-        new_msgs = []
-        if head:
-            new_msgs.append(head)
-        new_msgs.append({"role": "system",
-                         "content": "# 早前对话摘要（原始记录过长，已自动压缩）\n" + summary})
-        new_msgs.extend(msgs[-keep:])
-        self.api_messages = new_msgs
-        self.notice.emit(f"历史对话较长，已自动压缩为摘要（保留最近 {keep} 条，"
-                         f"前面的内容不会丢，只是变成摘要）。")
+        new_msgs = compact_history(self.api_messages, _summarize,
+                                   threshold=threshold, keep=keep)
+        if new_msgs is not self.api_messages:
+            self.api_messages = new_msgs
+            self.notice.emit(f"历史对话较长，已自动压缩为摘要（保留最近 {keep} 条，"
+                             f"前面的内容不会丢，只是变成摘要）。")
 
     def _clean(self, text):
         """去掉工具调用标记，只留下要给用户看的正文。"""
@@ -598,11 +768,10 @@ class ChatWorker(QThread):
                         calls = [synth]
 
                 # 没有解析出工具调用：要么是真·最终答复，要么是格式跑偏
+                # ★ 修复 UnboundLocalError：_project 在「有工具调用」分支外（第 942 / 1245 行）
+                #   也会被引用，必须每轮无条件先算好，不能只在「无工具调用」分支里赋值。
+                _project = agent_mod.needs_project_flow(last_user)
                 if not calls:
-                    # A-2) 用户要的是「独立开发出一个成品」-> 强制走工程化五步：
-                    #      检查环境 -> 列任务清单 -> 生成 -> 自校验 -> 交付。
-                    #      这里在模型想收尾时逐关检查，缺哪关就催哪关（各最多 1 次）。
-                    _project = agent_mod.needs_project_flow(last_user)
                     if _project and not env_checked and project_env_nudges < 1:
                         project_env_nudges += 1
                         self.api_messages.append({"role": "assistant", "content": text})
@@ -792,7 +961,7 @@ class ChatWorker(QThread):
                                        "（系统代跑，以下是真实输出）：\n\n" + auto)
                         elif not verified_after_write:
                             final = (final.rstrip()
-                                     + "\n\n> ⚠️ **说明**：本轮我只写出了代码文件，"
+                                     + "\n\n> ⚠ **说明**：本轮我只写出了代码文件，"
                                        "**没有真的运行过验证**（没跑测试）。"
                                        "上面写的「已完成」只代表文件已生成，"
                                        "**不代表验证通过**；要我再跑一遍就说一声。")
@@ -813,7 +982,7 @@ class ChatWorker(QThread):
                 # 现在额外 append 成 role="thinking"，由界面渲染成默认收起的「深度思考」块。
                 # 优先用模型的**真思维链**（reasoning_content）；没有思维链的模型
                 # （如 glm-4-flash，回调 0 次）则退回用它的中间正文，行为与以前一致。
-                # ⚠️ 绝不能影响 out_messages 里 assistant / tool 的语义：
+                # ⚠ 绝不能影响 out_messages 里 assistant / tool 的语义：
                 #    工作总结（wrapup -> worklog）、files 统计、假成功防御（honest_ok）
                 #    都只认这两种角色，所以中间过程用独立的 thinking 角色承载。
                 _think = _reason or self._clean(text)
@@ -854,7 +1023,13 @@ class ChatWorker(QThread):
                         f"{name}  {json.dumps(call.get('arguments', {}), ensure_ascii=False)}")
 
                     confirm_cb = None
+                    # ★ v9.18.0：把"可能写文件"的工具也接上确认框 —— 沙箱闸门
+                    #   只在**工作区外 / 受保护目标**时才真的回调它，所以工作区内的
+                    #   正常写入不会多弹框；越界写入则能由用户点头放行（而不是硬拒）。
+                    #   run_python 也接上：检出删除/系统级代码时要问一声。
                     need_confirm = (name == "run_command"
+                                    or name == "run_python"
+                                    or name in agent_mod.SANDBOX_WRITE_TOOLS
                                     or (name == "file_op"
                                         and str(call.get("arguments", {})
                                                 .get("op", "")).lower() == "delete"))
@@ -997,17 +1172,33 @@ class ChatWorker(QThread):
                     items = sorted(os.listdir(self.runner.files_dir))
                 except Exception:
                     items = []
-                chk.append("📂 工作区当前文件：" + (", ".join(items) if items else "（空）"))
+                chk.append("▰ 工作区当前文件：" + (", ".join(items) if items else "（空）"))
                 self.out_messages.append({
                     "role": "tool",
                     "content": "【系统完成自检】\n" + "\n".join(chk),
                 })
 
             # ---------- 收尾：保证一定有一条最终答复 ----------
-            if not any(m.get("role") == "assistant" for m in self.out_messages):
+            # ★ v9.18.0（需求 15）：用户点了停止 —— **绝不再调模型**。
+            #   老代码在这里会再发一次 LLM 请求去"补一条最终答复"，而模型往往
+            #   又要滔滔不绝几十秒 —— 用户体感就是"点了停止它还停不下来"。
+            #   改成直接从已有内容里捞最近一段够大的结论当最终答复。
+            if self._abort:
+                _has_good = any(
+                    m.get("role") == "assistant"
+                    and len(str(m.get("content") or "").strip()) >= 24
+                    for m in self.out_messages)
+                if not _has_good:
+                    self.out_messages.append(
+                        {"role": "assistant",
+                         "content": self._salvage_conclusion()})
+            elif not any(m.get("role") == "assistant" for m in self.out_messages):
                 try:
                     self.api_messages.append({"role": "user",
                                               "content": agent_mod.WRAPUP_HINT})
+                    # ★ v9.18.0（需求 17）：这是程序自己发起的「补一条最终答复」，
+                    #   它的思维链不该混进用户的思考区 —— 临时关掉实时推送。
+                    self._emit_reason = False
                     text = self.client.chat(self.api_messages, self.model_sel,
                                             self.enable_search, on_token=self._on_token,
                                             on_reasoning=self._collect_reason)
@@ -1018,6 +1209,9 @@ class ChatWorker(QThread):
                     text = (text or "").strip()
                 except Exception:
                     text = ""
+                finally:
+                    # 无论成功与否都要还回来，否则后面几轮模型的思考全被吞掉
+                    self._emit_reason = True
                 if not text:
                     text = ("这一步没能自动完成。工具尝试返回如下：\n\n"
                             + "\n".join("- " + (m.get("content") or "")[:160]
@@ -1028,7 +1222,7 @@ class ChatWorker(QThread):
 
             # ---------- 诚实兜底：用户要写文件，但始终没写成，别说"已完成" ----------
             if agent_mod.needs_write_action(last_user) and not write_done:
-                warn = ("\n\n> ⚠️ 提醒：你这次要求「写入 / 创建文件」，"
+                warn = ("\n\n> ⚠ 提醒：你这次要求「写入 / 创建文件」，"
                         "但本次**没有成功写出任何文件**（可能是我没调对工具，或路径没有权限）。"
                         "上面回复里若出现「已创建 / 已保存」字样，请以这条提醒为准。"
                         "可以再让我试一次，或把完整路径直接告诉我。")
@@ -1047,7 +1241,8 @@ class ChatWorker(QThread):
             #   后两种以前直接进收尾，**代跑验证压根没机会执行**
             #   （2026-09-30 实测：模型为 ModuleNotFoundError 空转 21 轮把迭代耗尽，
             #    用户最后只拿到一句道歉，界面上一条真实输出都没有）。
-            if _project and write_done and not verified_after_write:
+            if (_project and write_done and not verified_after_write
+                    and not self._abort):
                 auto = self._auto_verify(written_paths)
                 if auto:
                     verified_after_write = True
@@ -1066,6 +1261,25 @@ class ChatWorker(QThread):
                             {"role": "assistant",
                              "content": "这轮没跑完就停下了，我先把程序跑了一遍，"
                                         "真实输出如下：\n\n" + auto})
+
+            # ---------- ★★ v9.18.0：「一句话都没说出口」的硬保险 ----------
+            #   复盘包实测（120KB 真实工具调用轨迹 + 6 段真实对话）：
+            #   有 **16 轮**用户完全看不到任何回应 —— 没有正文、没有思考、
+            #   没有工具卡片，界面上什么都没有。用户的唯一反应就是**把同一句话
+            #   再发一遍**（数据里 25 句用户消息是上一句的重复，占 12%）。
+            #   这条链上的老代码是"信任上层一定能给出答复"，但只要有一环漏了
+            #   （循环耗尽 / 模型连续吐空 / 清理后正文变成空串），用户就对着空气说话。
+            #
+            #   所以这里加一道**机械保险**，不再靠"应该没问题"：
+            #   整轮跑完如果**一条非空的助手正文都没有**，就把最近一段够大的结论
+            #   捞出来顶上（`_salvage_conclusion(stopped=False)` 还能退到工具结果
+            #   摘要；最差也会如实说"本轮没产出结论"，绝不静默收场）。
+            if not any(m.get("role") == "assistant"
+                       and str(m.get("content") or "").strip()
+                       for m in self.out_messages):
+                self.out_messages.append(
+                    {"role": "assistant",
+                     "content": self._salvage_conclusion(stopped=False)})
 
             self.phase.emit("idle", "")
             self.finished.emit(self.out_messages)

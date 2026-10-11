@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """messages[] 与"一段提示词"之间的纯函数转换。
 
+v9.18.0 新增 `conversation_key()` / `loose_key()`：
+把"这批 messages 属于哪个 AI 工作台对话"算成一个**跨轮次稳定**的指纹，
+让网页侧可以做到「一个工作台对话 == 一个 DeepSeek 网页会话」。
+
 为什么单独成模块（见 02-arch.md 1.2）：
 - `messages -> 单段提示词`、`前缀增量判定`、`超长裁剪` 都是**纯函数**，
   不掺网络也不碰 DOM，可以离线单测（QA 友好）。
 - DeepSeek 网页版没有 API 参数，只能"一段提示词进、一段原文出"，
   所以必须在客户端把 OpenAI 的 messages[] 摊平。
 """
+import hashlib
+
 # 每个角色在摊平提示词里的中文标签。
 ROLE_TAG = {
     "system": "系统",
@@ -106,6 +112,59 @@ def diff_tail(prev, cur):
         if _signature(prev[i]) != _signature(cur[i]):
             return None
     return flatten(cur[n:])
+
+
+# ---------------------------------------------------------------------------
+# v9.18.0：对话指纹（"这批 messages 属于哪个工作台对话"）
+#
+# 为什么需要它：v9.18.0 之前，网页侧**只有一个**"已发送消息"基线，判据是
+# "本次 messages 是不是它的严格前缀"。于是任何**不是主对话**的请求
+# （记忆提炼 / 对话自动命名 / 后台链路）都会让前缀失配 -> 新建一个 DeepSeek
+# 网页会话；等主对话下一轮回来，它又不匹配那个辅助基线 -> **再新建一个**。
+# 一来一回，用户只有一条对话，DeepSeek 那边却被建出十几二十条新会话。
+#
+# 指纹必须**跨轮次稳定**，所以刻意排除这些会变的东西：
+#   ✗ system 全文（长期记忆 / 技能清单 / 定时任务 / 时间，每轮都变）
+#   ✗ 消息条数、时间戳、工具清单、最近几轮的内容
+# 只取"第一条真实用户消息"——它在整个对话生命周期里是不变的。
+# ---------------------------------------------------------------------------
+# 「宽松指纹」的前缀长度：给**模板型**的旁路调用（记忆提炼 / 自动命名）用。
+# 它们的首条 user 是固定模板 + 每轮不同的正文，取前 N 字即可稳定命中同一个桶。
+LOOSE_PREFIX_CHARS = 200
+
+
+def _first_user_text(messages):
+    """第一条**非 system**消息的正文（整段对话里最稳定的那一句）。"""
+    for msg in messages or []:
+        if _role_of(msg) != "system":
+            return _content_of(msg)
+    return ""
+
+
+def _anchor_text(messages):
+    """指纹锚点文本：首条真实用户消息；没有就退回全量摊平（保证不撞空串）。"""
+    text = (_first_user_text(messages) or "").strip()
+    if text:
+        return text
+    return (flatten(messages) or "").strip()
+
+
+def _digest(text):
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def conversation_key(messages):
+    """精确对话指纹（完整首条用户消息）。用于主对话，避免两个对话撞车。"""
+    return _digest(_anchor_text(messages))
+
+
+def loose_key(messages):
+    """宽松对话指纹（首条用户消息的前 LOOSE_PREFIX_CHARS 字）。
+
+    只给"模板型旁路调用"兜底：它们的正文每轮换，但模板前缀固定，
+    靠这个前缀就能一直复用同一个网页会话，而不是每轮新建。
+    """
+    return _digest(_anchor_text(messages)[:LOOSE_PREFIX_CHARS])
 
 
 def trim_recent(messages, keep_turns=6):

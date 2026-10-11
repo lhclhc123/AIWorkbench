@@ -8,6 +8,8 @@ import json
 import threading
 import time
 
+from .workspace import internal_dir
+
 MAX_KEEP = 2000
 
 # ★ v9.16.0：一轮里多个工具会**并行**执行，它们会同时往同一个 jsonl 追加。
@@ -18,7 +20,9 @@ _WRITE_LOCK = threading.RLock()
 
 class TraceLog:
     def __init__(self, workspace_path: str):
-        self.dir = os.path.join(workspace_path, "traces")
+        # ★ v9.18.0：轨迹是机器内部数据，藏进 <工作区>/.awb/traces/
+        #   （老工作区还没迁移时 internal_dir 会自动回退到根目录 traces/）
+        self.dir = internal_dir(workspace_path, "traces")
         self.path = os.path.join(self.dir, "tool_calls.jsonl")
         try:
             os.makedirs(self.dir, exist_ok=True)

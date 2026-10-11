@@ -21,8 +21,60 @@ from .. import themes
 
 BODY_WIDTH = 640          # 消息卡片正文固定宽度（便于精确计算高度）
 CODE_LINE_H = 22          # 代码块每行像素高（与 CSS line-height 保持一致）
+CODE_PAD = 10             # 代码块内边距（让代码真的是"一块"，不贴着卡片边）
+CODE_MAX_BODY_H = 460     # 代码区高度上限：超了就在卡片内部纵向滚动，不把界面撑爆
 RADIUS_BUBBLE = 16
 RADIUS_CARD = 12
+
+
+def _rgb(hex_color):
+    h = (hex_color or "").strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return None
+
+
+def _shade(hex_color, delta):
+    """把颜色整体提亮(delta>0)/压暗(delta<0) —— 用于从 token 推导边框、页头色。"""
+    c = _rgb(hex_color)
+    if c is None:
+        return hex_color
+    return "#%02x%02x%02x" % tuple(max(0, min(255, v + delta)) for v in c)
+
+
+def _lum(hex_color):
+    c = _rgb(hex_color)
+    if c is None:
+        return 0.5
+    return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255.0
+
+
+def code_surface(t):
+    """代码块的一套配色（底色 / 边框 / 页头），**保证和聊天底色拉得开**。
+
+    ★ v9.18.0 修「代码看不出是代码」：浅色主题下 `code_bg=#f6f8fa` 和
+      `chat_bg=#f4f6f8` 几乎是同一个颜色（亮度差 0.01），再加一条极浅的边框，
+      用户眼里就是"一段没有格式的普通文字"。这里按**相对聊天底色的亮度差**
+      自动兜底：底色太接近就朝反方向推一档，任何主题下代码块都是一块
+      看得见的独立区域。
+    """
+    chat = t.get("chat_bg") or t.get("window_bg") or "#ffffff"
+    bg = t.get("code_bg") or "#f6f8fa"
+    if abs(_lum(bg) - _lum(chat)) < 0.10:
+        bg = _shade(bg, 34 if _lum(chat) < 0.5 else -28)
+    border = t.get("code_border") or "#dfe3e8"
+    if abs(_lum(border) - _lum(bg)) < 0.08:
+        border = _shade(bg, 30 if _lum(bg) < 0.5 else -34)
+    head = _shade(bg, 12 if _lum(bg) < 0.5 else -10)
+    return {
+        "bg": bg,
+        "border": border,
+        "head_bg": head,
+        "text": t.get("code_text") or "#24292e",
+    }
 
 # 角色 -> 标题栏文案。"thinking" 是 v9.8 新增的「深度思考」中间过程块。
 _ROLE_LABEL = {"user": "你", "assistant": "AI 助手", "tool": "工具",
@@ -170,14 +222,17 @@ class StatusLine(QWidget):
 
     _PHASES = {
         "idle":   ("●", "就绪"),
-        "model":  ("🧠", "正在调用模型"),
-        "answer": ("✍️", "正在生成回复"),
-        "tool":   ("🔧", "正在执行"),
-        "search": ("🔍", "正在联网搜索"),
-        "verify": ("🧪", "正在运行验证"),
-        "write":  ("📝", "正在写文件"),
-        "web":    ("🌐", "正在等待 DeepSeek 网页输出"),
+        "model":  ("◈", "正在调用模型"),
+        "answer": ("✎", "正在生成回复"),
+        "tool":   ("⚙", "正在执行"),
+        "search": ("⊙", "正在联网搜索"),
+        "verify": ("⚗", "正在运行验证"),
+        "write":  ("✎", "正在写文件"),
+        "web":    ("◎", "正在等待 DeepSeek 网页输出"),
         "stop":   ("⏹", "已停止"),
+        # ★ v9.18.0（需求 13）：对话里选了团队时，状态行要能说清"现在是谁在干活"，
+        #   而不是笼统一句"正在调用模型"。`⬡` 与 `icons.ic("team")` 同字形。
+        "team":   ("⬡", "团队协作中"),
     }
 
     def __init__(self, parent=None):
@@ -233,7 +288,7 @@ class StatusLine(QWidget):
 class ChatInput(QPlainTextEdit):
     """聊天输入框：Enter 发送，Shift+Enter 换行。
 
-    ⚠️ 中文输入法正在组字（拼音还没上屏）时，Enter 应该交给输入法选词，
+    ⚠ 中文输入法正在组字（拼音还没上屏）时，Enter 应该交给输入法选词，
     绝不能当成"发送"。这里用两重判断：Qt 的 `QInputMethod.isComposing()`
     加上自己维护的 `inputMethodEvent` 组字状态，避免误发半句话。
     """
@@ -321,7 +376,41 @@ class ThinkingIndicator(QWidget):
 
 
 class CodeBlockWidget(QFrame):
-    """独立代码块卡片：语言标签 + 复制/保存按钮 + 高亮代码。"""
+    """独立代码块卡片：语言标签 + 复制/保存按钮 + 高亮代码。
+
+    ★★ v9.18.0 修「代码/命令都挤成一行、又长又带横向拖动条、下面一大片空白」：
+       真凶是 `_inline_pygments()`（Pygments `nowrap=True`）吐出的是**裸 <span>**，
+       里面虽然有 `\n`，但 HTML 里换行 = 空白 → Qt 的富文本引擎把整段**塌成一行**。
+       于是：① 代码全部挤在一行、非常长；② 为了看全只能横向拖（那条"能拖的进度条"）；
+       ③ 但控件高度是按**原始行数**算的（`lines * CODE_LINE_H`）→ 底下空一大片。
+       修法三步：① 外面**补一层 `<pre style="white-space:pre-wrap">`** 把换行还原；
+                 ② 换成 `WidgetWidth` 自动换行 + 关掉横向滚动条；
+                 ③ 高度改成**按文档真实渲染高度**算，不再拿行数估。
+    """
+
+    # 语言 -> 左上角显示的标注（用户要求：代码标 `.py`/`.cpp`，命令标 `.bash`）
+    _TAG = {
+        "python": ".py", "py": ".py", "python3": ".py",
+        "c": ".c", "h": ".h", "hpp": ".hpp", "cpp": ".cpp", "c++": ".cpp",
+        "cxx": ".cpp", "cc": ".cpp", "csharp": ".cs", "cs": ".cs",
+        "java": ".java", "go": ".go", "golang": ".go", "rust": ".rs", "rs": ".rs",
+        "php": ".php", "ruby": ".rb", "rb": ".rb", "perl": ".pl", "lua": ".lua",
+        "kotlin": ".kt", "kt": ".kt", "swift": ".swift", "scala": ".scala",
+        "javascript": ".js", "js": ".js", "node": ".js", "jsx": ".jsx",
+        "typescript": ".ts", "ts": ".ts", "tsx": ".tsx", "vue": ".vue",
+        "svelte": ".svelte", "dart": ".dart",
+        "html": ".html", "css": ".css", "scss": ".scss", "less": ".less",
+        "json": ".json", "yaml": ".yml", "yml": ".yml", "toml": ".toml",
+        "ini": ".ini", "sql": ".sql", "xml": ".xml",
+        "markdown": ".md", "md": ".md", "text": ".txt", "plaintext": ".txt",
+        "makefile": ".mk", "cmake": ".cmake", "dockerfile": "Dockerfile",
+        "diff": ".diff", "patch": ".patch", "regex": ".regex",
+        # 命令类：一律标 .bash（用户明确要的）
+        "sh": ".bash", "bash": ".bash", "shell": ".bash", "zsh": ".bash",
+        "console": ".bash", "cmd": ".bat", "bat": ".bat",
+        "batch": ".bat", "powershell": ".ps1", "ps1": ".ps1", "ps": ".ps1",
+        "pwsh": ".ps1",
+    }
 
     # 语言 -> 默认扩展名（点「保存为文件」时用）
     _EXT = {
@@ -333,31 +422,50 @@ class CodeBlockWidget(QFrame):
         "rust": ".rs", "rs": ".rs", "php": ".php", "ruby": ".rb",
         "html": ".html", "css": ".css", "scss": ".scss", "json": ".json",
         "yaml": ".yml", "yml": ".yml", "toml": ".toml", "ini": ".ini",
-        "sql": ".sql", "sh": ".sh", "shell": ".sh", "bash": ".sh",
+        "sql": ".sql", "sh": ".sh", "shell": ".sh", "bash": ".bash",
         "powershell": ".ps1", "ps1": ".ps1", "bat": ".bat", "cmd": ".bat",
         "xml": ".xml", "markdown": ".md", "md": ".md", "text": ".txt",
     }
 
+    @classmethod
+    def tag_of(cls, lang):
+        """语言 -> 左上角标签（'.py' / '.cpp' / '.bash'）。空语言返回 ''。"""
+        l = (lang or "").strip().lower()
+        if not l:
+            return ""
+        if l in cls._TAG:
+            return cls._TAG[l]
+        if re.fullmatch(r"[a-z0-9+#.]+", l):
+            return "." + l.lstrip(".")
+        return l
+
     def __init__(self, lang, code_html, raw_code, parent=None):
         super().__init__(parent)
         t = themes.tokens()
+        cs = code_surface(t)          # ★ v9.18.0：保证底色和聊天底色拉得开
         self._raw = raw_code or ""
         self._lang = (lang or "").strip().lower()
+        # 复用标记：流式刷新时 (语言, 代码) 没变就整块复用，不重建控件
+        self._sig = (self._lang, self._raw)
         self.setStyleSheet(
-            f"CodeBlockWidget{{background:{t['code_bg']};"
-            f"border:1px solid {t['code_border']};border-radius:{RADIUS_CARD}px;}}")
+            f"CodeBlockWidget{{background:{cs['bg']};"
+            f"border:1px solid {cs['border']};border-radius:{RADIUS_CARD}px;}}")
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(0, 0, 0, 0)
         vbox.setSpacing(0)
 
         head = QWidget()
         head.setStyleSheet(
-            f"background:{t['code_head_bg']};border-top-left-radius:{RADIUS_CARD}px;"
-            f"border-top-right-radius:{RADIUS_CARD}px;border-bottom:1px solid {t['code_border']};")
+            f"background:{cs['head_bg']};border-top-left-radius:{RADIUS_CARD}px;"
+            f"border-top-right-radius:{RADIUS_CARD}px;"
+            f"border-bottom:1px solid {cs['border']};")
         hrow = QHBoxLayout(head)
         hrow.setContentsMargins(12, 6, 10, 6)
         hrow.setSpacing(8)
-        lbl = QLabel((lang or "代码").upper())
+        # ★ v9.18.0：左上角标注改成"扩展名"样式（.py / .cpp / .bash），
+        #   让用户一眼就知道这是什么文件/命令（以前显示的是大写语言名 "PYTHON"）。
+        tag = self.tag_of(lang)
+        lbl = QLabel(tag or "代码")
         lbl.setStyleSheet(f"color:{t['text_muted']};font-size:12px;font-weight:bold;")
         hrow.addWidget(lbl)
         hrow.addStretch(1)
@@ -378,19 +486,60 @@ class CodeBlockWidget(QFrame):
         body.setReadOnly(True)
         body.setOpenExternalLinks(False)
         body.setFrameShape(QFrame.Shape.NoFrame)
-        body.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        # ★ v9.18.0：自动换行 + 关掉横向滚动条（以前是 NoWrap + 横向滚动条 →
+        #   代码挤成一行、还得拖着看）。
+        body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body.setStyleSheet(
-            f"background:{t['code_bg']};border:none;color:{t['code_text']};padding:0px;"
+            f"background:{cs['bg']};border:none;color:{cs['text']};padding:0px;"
             "font-family:Consolas,'Microsoft YaHei',monospace;font-size:13px;line-height:22px;")
-        body.setHtml(code_html or "")
+        doc = body.document()
+        try:
+            # ★ v9.18.0：给代码留内边距（原来贴着卡片边，看着不像"一块代码"）
+            doc.setDocumentMargin(CODE_PAD)
+        except Exception:
+            pass
+        # ★ 关键：给裸 <span> 补一层 <pre style="white-space:pre-wrap">。
+        #   `_inline_pygments()` 用 Pygments nowrap=True，输出没有 <pre>，
+        #   HTML 里换行=空白 → Qt 会把整段代码塌成一行（这就是"只占一行"的真凶）。
+        body.setHtml('<pre style="white-space:pre-wrap;word-break:break-word;'
+                     'margin:0;padding:0;">' + (code_html or "") + "</pre>")
         vbox.addWidget(body)
         self.body = body
 
-        lines = max(1, len((raw_code or "").rstrip("\n").split("\n")))
         self.setFixedWidth(BODY_WIDTH)
-        body.setFixedHeight(lines * CODE_LINE_H + 20)
+        self._fit_body_height()
+
+    def _fit_body_height(self):
+        """按**文档真实渲染高度**撑开正文区（不再用行数估算 → 不留大片空白）。
+
+        ★ v9.18.0：高度封顶 `CODE_MAX_BODY_H` —— 几百行的生成文件以前会把消息
+          卡片抻到几千像素（"把界面撑爆"），现在超了就在**卡片内部纵向滚动**。
+        """
+        body = self.body
+        w = BODY_WIDTH - 2
+        try:
+            doc = body.document()
+            doc.setTextWidth(w)
+            h = int(doc.size().height())
+        except Exception:
+            h = 0
+        if h <= 0:
+            lines = max(1, len((self._raw or "").rstrip("\n").split("\n")))
+            h = lines * CODE_LINE_H
+        if h > CODE_MAX_BODY_H:
+            # 要让出滚动条的宽度，否则最后几个字会被压到滚动条底下
+            try:
+                doc.setTextWidth(w - 14)
+            except Exception:
+                pass
+            body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            body.setFixedHeight(CODE_MAX_BODY_H)
+        else:
+            body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            body.setFixedHeight(max(h, CODE_LINE_H + 6))
+        body.setFixedWidth(w)
 
     def _copy(self):
         QGuiApplication.clipboard().setText(self._raw)
@@ -495,7 +644,7 @@ class MessageCard(QWidget):
 
         header = QHBoxLayout()
         header.setSpacing(6)
-        _ICO = {"tool": "⚙", "thinking": "💭", "assistant": "◍", "user": ""}
+        _ICO = {"tool": "⚙", "thinking": "◍", "assistant": "◍", "user": ""}
         prefix = _ICO.get(role, "")
         label = QLabel((prefix + " " + self._label).strip())
         header.addWidget(label)
@@ -714,14 +863,35 @@ class MessageCard(QWidget):
 
     def _rebuild(self):
         self.body.setHtml(self._prose)
+        # ★ v9.18.0：代码块控件**能复用就复用**。
+        #   流式输出时这里每 110ms 被调一次，老实现是"全部销毁再重建" ——
+        #   已经写完的代码块（常常几百行）也要跟着反复销毁重建 + 重新跑一遍
+        #   QTextBrowser 布局，又卡又闪。现在按 (语言, 代码) 签名比对：
+        #   没变的那几块原样留着，只有正在长的那一块才重建。
+        old = []
         while self.code_host.count():
             it = self.code_host.takeAt(0)
             w = it.widget()
             if w is not None:
-                w.deleteLater()
+                old.append(w)
+        pool = {}
+        for w in old:
+            sig = getattr(w, "_sig", None)
+            if sig is not None:
+                pool.setdefault(sig, w)
+        fresh = []
         for b in self._blocks:
-            cw = CodeBlockWidget(b.get("lang", ""), b.get("html", ""), b.get("code", ""))
-            self.code_host.addWidget(cw)
+            sig = (b.get("lang", ""), b.get("code", ""))
+            w = pool.pop(sig, None)
+            if w is None:
+                w = CodeBlockWidget(b.get("lang", ""), b.get("html", ""),
+                                    b.get("code", ""))
+            fresh.append(w)
+        for w in pool.values():          # 这次没被复用的：销毁
+            w.setParent(None)
+            w.deleteLater()
+        for w in fresh:
+            self.code_host.addWidget(w)
         self._apply_height_policy()
 
     def _apply_height_policy(self):
@@ -769,6 +939,331 @@ class MessageCard(QWidget):
         self.collapse_changed.emit(self._collapsed)
 
 
+class ProcessGroup(QWidget):
+    """把连续的过程消息（工具调用 / 深度思考）折成**一条**默认隐藏的摘要行。
+
+    ★ v9.18.0（用户需求 9）："按照不同的层级，把过程性消息都隐藏，参考 workbuddy"。
+    以前每一步工具调用都是一行灰色胶囊，一轮任务跑十几步 → 满屏灰条，把真正的
+    回答挤没了。现在：相邻的过程消息自动并成一组，只露一行
+    「⚙ 执行了 N 步 · 点击展开」，展开后才逐条看细节（参考 WorkBuddy 的折叠过程）。
+    """
+
+    collapsed_changed = pyqtSignal(bool)
+
+    # 和 MessageCard 对齐的最小接口：别的地方会遍历 `_cards` 读 `.role`、
+    # 或调用 `.refit()`，这里必须也有，否则一遇到过程组就 AttributeError。
+    role = "process"
+
+    def __init__(self, items=None, parent=None, collapsed=True):
+        super().__init__(parent)
+        t = themes.tokens()
+        self._items = list(items or [])
+        self._collapsed = bool(collapsed)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        bubble = QFrame()
+        bubble.setObjectName("ProcessGroup")
+        bubble.setStyleSheet(
+            f"#ProcessGroup{{background:{t['chip_bg']};border:none;"
+            "border-radius:8px;}}")
+        v = QVBoxLayout(bubble)
+        v.setContentsMargins(10, 6, 8, 6)
+        v.setSpacing(4)
+
+        self._head = QPushButton()
+        self._head.setObjectName("cardBtn")
+        self._head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._head.setStyleSheet(
+            "QPushButton{background:transparent;border:none;text-align:left;"
+            f"color:{t['text_muted']};font-size:12px;font-weight:bold;padding:2px 4px;}}"
+            f"QPushButton:hover{{color:{t['accent_text']};}}")
+        self._head.clicked.connect(self.toggle)
+        v.addWidget(self._head)
+
+        self._body = QWidget()
+        self._body_lay = QVBoxLayout(self._body)
+        self._body_lay.setContentsMargins(2, 2, 2, 2)
+        self._body_lay.setSpacing(4)
+        v.addWidget(self._body)
+
+        self._head.setText(self._head_text())
+        self._body.setVisible(not self._collapsed)
+
+        outer.addStretch(0)
+        outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addStretch(1)
+
+    def add_card(self, card):
+        self._items.append(card)
+        self._body_lay.addWidget(card)
+        self._head.setText(self._head_text())
+
+    def written_files(self):
+        """这一组里"写入文件"的步数 —— 折起来之后用户最关心的就是这个。"""
+        return sum(1 for c in self._items if getattr(c, "_label", "") == "写入文件")
+
+    def _head_text(self):
+        """组头一行摘要。
+
+        ★ 过程细节折起来之后，"用户最想知道的那点信息"必须留在这一行上 ——
+        否则折了等于丢了。所以这里除了步数，还补上"都干了哪几类事"和"写了几个文件"。
+        """
+        n = len(self._items)
+        arrow = "▸" if self._collapsed else "▾"
+        extra = ""
+        tags = self.lines()
+        if tags:
+            shown = "、".join(tags[:3]) + (" 等" if len(tags) > 3 else "")
+            extra += "　·　" + shown
+        wf = self.written_files()
+        if wf:
+            extra += f"　·　写入 {wf} 个文件"
+        return (f"⚙ {arrow} 过程 · {n} 步{extra}"
+                f"（点击{'展开' if self._collapsed else '收起'}）")
+
+    def toggle(self):
+        self._collapsed = not self._collapsed
+        self._body.setVisible(not self._collapsed)
+        self._head.setText(self._head_text())
+        self.collapsed_changed.emit(self._collapsed)
+
+    def is_collapsed(self):
+        return self._collapsed
+
+    def set_collapsed(self, collapsed):
+        self._collapsed = bool(collapsed)
+        self._body.setVisible(not self._collapsed)
+        self._head.setText(self._head_text())
+
+    def lines(self):
+        """这一组里出现过的工具标签，用于给用户一个粗略的"都干了啥"。"""
+        out = []
+        for c in self._items:
+            lab = getattr(c, "_label", "")
+            if lab and lab not in out:
+                out.append(lab)
+        return out
+
+    def refit(self):
+        """布局落定后把组内卡片的正文高度重新撑开（和 MessageCard.refit 对齐）。"""
+        for c in self._items:
+            f = getattr(c, "refit", None)
+            if callable(f):
+                try:
+                    f()
+                except Exception:
+                    pass
+
+
+class ReasoningCard(QWidget):
+    """「深度思考」**实时**卡片（v9.18.0，需求 17）。
+
+    用户原话：
+      「模型思考慢是不是因为我只看见了他思考后的结果，中间思考过程没呈现给我？
+        这个也可以加进来」
+
+    确实如此：带思维链的模型（DeepSeek-V4.x / Qwen3.x 等）在正式回答之前会先流式
+    吐一大段 `reasoning_content`。以前客户端只是**悄悄收着**，等整轮结束才折成一条
+    「深度思考」块 —— 用户对着转圈等十几秒，体感就是"很慢"。现在这段思考
+    **边来边显示**：默认折成一行「◈ 思考中 · N 字」，点开就是实时滚动的全文。
+
+    和 MessageCard 对齐的最小接口（`_cards` 会被别处遍历）：
+      `role` / `refit()` / `is_collapsed()` / `set_collapsed()` / `collapsed_changed`。
+    """
+
+    collapsed_changed = pyqtSignal(bool)
+    role = "reason"          # 用独立角色：不要被 ProcessGroup 收进去
+
+    # 「展开全文」时的高度上限。取一个远超任何真实思维链的值 ——
+    # 语义上等于"不限高"，但保留 setFixedHeight 这条路径（比动态切策略稳）。
+    FULL_H = 100_000
+
+    def __init__(self, text="", parent=None, collapsed=True, max_h=420):
+        super().__init__(parent)
+        t = themes.tokens()
+        self._text = str(text or "")
+        self._collapsed = bool(collapsed)
+        # 正文最高留多高。流式那张要小一点（别把正在长的正文挤出屏幕），
+        # 历史里折开来看的那张可以大一点。
+        self._max_h = int(max_h)
+        # ★★ v9.18.0（用户反馈「思维链过长会被截断」）：
+        #   光有 max_h + 内部滚动条仍然不好用 —— 一条两万字的推理塞进 420px 的框里，
+        #   要趴在那个小框里慢慢滚，用户体感就是"被截断了"。
+        #   所以加一个「展开全文」：点一下就把高度放开到 FULL_H，整段一次看完。
+        self._full = False
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 0)
+        outer.setSpacing(0)
+        bubble = QFrame()
+        bubble.setObjectName("ReasonCard")
+        bubble.setStyleSheet(
+            f"#ReasonCard{{background:{t['chip_bg']};border:none;"
+            "border-left:3px solid %s;border-radius:8px;}}"
+            % t.get("accent", t["chip_bg"]))
+        v = QVBoxLayout(bubble)
+        v.setContentsMargins(10, 6, 8, 6)
+        v.setSpacing(4)
+
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(6)
+
+        self._head = QPushButton()
+        self._head.setObjectName("cardBtn")
+        self._head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._head.setStyleSheet(
+            "QPushButton{background:transparent;border:none;text-align:left;"
+            f"color:{t['text_muted']};font-size:12px;font-weight:bold;padding:2px 4px;}}"
+            f"QPushButton:hover{{color:{t['accent_text']};}}")
+        self._head.clicked.connect(self.toggle)
+        head_row.addWidget(self._head, 0)
+
+        # ★★ v9.18.0（用户反馈「思维链过长会被截断」）：
+        #   高度封顶后，长思维链只能趴在框里慢慢滚 —— 体感就是"被截断了"。
+        #   于是并列给一个「展开全文」：一点就把高度上限放开，整段一次看完。
+        #   只在「真被截到」时才出现（内容没超上限就别多一个按钮晃眼）。
+        self._more = QPushButton()
+        self._more.setObjectName("cardBtn")
+        self._more.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._more.setStyleSheet(
+            "QPushButton{background:transparent;border:none;text-align:right;"
+            f"color:{t['accent_text']};font-size:12px;padding:2px 4px;}}"
+            f"QPushButton:hover{{color:{t['text_muted']};}}")
+        self._more.clicked.connect(self.toggle_full)
+        head_row.addStretch(1)
+        head_row.addWidget(self._more, 0)
+        # ⚠ 纪律：任何 setVisible 都放在 addWidget **之后**（先 addWidget 才有父窗口）
+        self._more.setVisible(False)
+
+        v.addLayout(head_row)
+
+        self._body = QTextEdit()
+        self._body.setReadOnly(True)
+        self._body.setFrameShape(QFrame.Shape.NoFrame)
+        # ★ 自适应换行 + 关掉横向滚动条（需求 5 的同一条纪律）
+        self._body.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # ⚠ 纵向滚动条必须是 AsNeeded：思维链经常长过这里的高度上限，
+        #    设成 AlwaysOff 的话超出部分**永远看不到**（内容被截断且没法滚）。
+        self._body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._body.setStyleSheet(
+            f"background:transparent;border:none;color:{t['text_muted']};"
+            f"font-size:{themes.fs(12)};")
+        self._body.document().setDocumentMargin(0)
+        v.addWidget(self._body)
+
+        self._head.setText(self._head_text())
+        self._more.setText(self._full_text())
+        self._body.setPlainText(self._text)
+        self._body.setVisible(not self._collapsed)
+        self._fit_body()
+        self._update_more()
+
+        outer.addStretch(0)
+        outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addStretch(1)
+
+    # ---------- 内容 ----------
+    def _head_text(self):
+        n = len(self._text)
+        arrow = "▸" if self._collapsed else "▾"
+        tail = "点击展开" if self._collapsed else "点击收起"
+        return f"◈ {arrow} 思考中 · {n} 字（{tail}）"
+
+    def _full_text(self):
+        return "⤡ 收起全文" if self._full else "⤢ 展开全文"
+
+    def _natural_h(self):
+        """这段思考**不封顶**时真实需要多高（用来判断要不要给「展开全文」）。"""
+        try:
+            doc = self._body.document()
+            doc.setTextWidth(max(BODY_WIDTH - 40, 120))
+            return int(doc.size().height()) + 8
+        except Exception:
+            return 0
+
+    def _update_more(self):
+        """只有「展开着 + 真的被高度截到」才亮出「展开全文」按钮。"""
+        show = (not self._collapsed) and self._natural_h() > self._max_h + 2
+        if show and not self._full:
+            self._more.setText(self._full_text())
+        elif self._full:
+            self._more.setText(self._full_text())
+        try:
+            self._more.setVisible(bool(show or self._full))
+        except Exception:
+            pass
+
+    def set_text(self, text):
+        """流式更新：只在内容真的变了时才动控件（和 MessageCard.update_live 同一纪律）。"""
+        text = str(text or "")
+        if text == self._text:
+            return False
+        self._text = text
+        self._head.setText(self._head_text())
+        self._body.setPlainText(text)
+        # 只在展开态才需要重新撑高（折叠时正文是隐藏的，算高度纯属浪费）
+        if not self._collapsed:
+            self._fit_body()
+            sb = self._body.verticalScrollBar()
+            sb.setValue(sb.maximum())        # 跟在最新那句思考后面
+        return True
+
+    def text(self):
+        return self._text
+
+    # ---------- 折叠 ----------
+    def toggle(self):
+        self.set_collapsed(not self._collapsed)
+        self.collapsed_changed.emit(self._collapsed)
+
+    def toggle_full(self):
+        """「展开全文 / 收起全文」：把高度上限放开 / 收回去（不动折叠态）。"""
+        self._full = not self._full
+        self._fit_body()
+        self._update_more()
+
+    def is_collapsed(self):
+        return self._collapsed
+
+    def set_collapsed(self, collapsed):
+        self._collapsed = bool(collapsed)
+        self._body.setVisible(not self._collapsed)
+        self._head.setText(self._head_text())
+        if not self._collapsed:
+            self._fit_body()
+            self._update_more()
+        else:
+            self._more.setVisible(False)
+
+    # ---------- 布局 ----------
+    def _fit_body(self):
+        """按文档真实渲染高度撑开（和 CodeBlockWidget 同款做法）。
+
+        ⚠ 别用"行数 × 行高"估：中文长句会自动换行，估出来的值和真实高度差很多，
+        表现为框下面留一大片空白（用户抱怨过）。
+
+        v9.18.0：上限取 `FULL_H`（≈不限高）还是 `_max_h`，取决于「展开全文」有没有点。
+        走的仍是同一条 `setFixedHeight` 路径 —— 比动态切策略稳。
+        """
+        try:
+            cap = self.FULL_H if self._full else self._max_h
+            doc = self._body.document()
+            doc.setTextWidth(max(BODY_WIDTH - 40, 120))
+            h = int(doc.size().height()) + 8
+            self._body.setFixedHeight(max(24, min(h, cap)))
+        except Exception:
+            self._body.setFixedHeight(min(120, self._max_h))
+
+    def refit(self):
+        if not self._collapsed:
+            self._fit_body()
+            self._update_more()
+
+
 class AskUserDialog(QDialog):
     """AI 主动向用户提问（v9.17.0，参考 WorkBuddy 的提问卡片）。
 
@@ -803,7 +1298,7 @@ class AskUserDialog(QDialog):
         lay.setSpacing(10)
 
         if header:
-            h = QLabel("❓ " + header)
+            h = QLabel("? " + header)
             h.setStyleSheet(f"color:{t['accent_text']};font-size:12px;font-weight:bold;")
             lay.addWidget(h)
 

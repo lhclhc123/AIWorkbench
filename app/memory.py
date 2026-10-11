@@ -9,7 +9,22 @@ import os
 import re
 import time
 
+from .workspace import internal_path
+
 DEFAULT_CATEGORIES = ["用户与身份", "偏好与习惯", "项目与约定", "重要结论", "待办与计划"]
+
+# 「待办与计划」这一类**不**自动注入 system 提示词（根因 B 修复，见 prompt_block）
+TODO_CATEGORY = "待办与计划"
+
+# 「未完成状态」类条目：跨分类也一律**不**自动注入（根因 B 修复）。
+#   实测真正把模型带偏的那条 ——「P1576 题目代码在 …p1576.py 中，但**只完成了
+#   一半**」—— 并不在「待办与计划」下，而在「项目与约定」下。这类"半成品 /
+#   没做完"的记录一旦每轮进 prompt，配合系统提示词里"做到底"的压力就会被当成
+#   这一轮的欠账。只挡注入：MEMORY.md 本身、recall/search 检索都不受影响。
+_UNFINISHED_RE = re.compile(
+    r"(只完成(?:了)?一半|未完成|未做完|没(?:有)?做完|"
+    r"还没(?:有)?(?:做|写|完成|改|补)|半成品|"
+    r"(?:待|需|尚需)(?:完成|补完|重写|重建|修复|继续))")
 
 _HEAD_RE = re.compile(r"^##\s+(.+?)\s*$")
 
@@ -43,7 +58,7 @@ class MemoryStore:
     def parse(self):
         """解析成 {分类: [条目, ...]}，保持顺序。
 
-        ⚠️ 必须跳过「文件前言」：dump() 写出的开头是
+        ⚠ 必须跳过「文件前言」：dump() 写出的开头是
         `# 长期记忆` + `> 由 AI 工作台自动维护，最后更新：<时间>`。
         这两行既不是 `## 分类` 标题、也不是空行，旧代码会把它们当成
         「用户与身份」的普通条目；下一次 dump() 又把它们写回成 `- ...`，
@@ -148,25 +163,83 @@ class MemoryStore:
 
     # ---------- 注入提示词 ----------
     def prompt_block(self, max_chars=1800):
-        """生成要拼进系统提示词的一段文字；没有记忆则返回空串。"""
+        """生成要拼进系统提示词的一段文字；没有记忆则返回空串。
+
+        ★ v9.18.0 行为修复（根因 B + 根因 C）：
+
+        B) 主记忆原来**整块**每轮注入 system 提示词。而真实工作区的 MEMORY.md
+           里堆着大量历史「未完成」状态（例：「P1576 代码在 D:\\工作\\files\\
+           p1576.py，**只完成了一半**」「用正确的 4 空格缩进重建文件」），
+           再乘上默认 system 提示词里「做到底，不许半途收尾」的强压力 ——
+           模型把记忆里的半成品当成**这一轮的欠账**，用户只是问了句「你是谁」，
+           助手却自作主张跑去补完旧任务（真实事故）。现在：
+             · 「待办与计划」这一类**不再自动注入**（改成只能用 recall 显式
+               检索时才可见；下方只留一行"有 N 条未列出、用户问起再说"的提示）；
+             · 稳定事实（用户与身份 / 偏好与习惯 / 项目与约定 / 重要结论）照常注入；
+             · 开头写死护栏：记忆只是历史背景，用户本轮没明确要求就**不许执行**。
+
+        C) 截断的 break 原来只跳出内层条目循环，外层分类循环继续跑，
+           于是**每个分类都补一行**「…（记忆较长，已截断）」。
+           现在用 truncated 标志干净退出两层，只留**一条**截断提示。
+        """
         data = self.parse()
-        if not any(data.values()):
+        # ① 「待办与计划」不自动注入（只在 recall 检索时才可见）
+        todo_n = len(data.get(TODO_CATEGORY) or [])
+        data = {k: v for k, v in data.items()
+                if v and k.strip() != TODO_CATEGORY}
+        # ② 记载"半成品/没做完"的条目，跨分类也不注入（见 _UNFINISHED_RE）
+        hidden = 0
+        filtered = {}
+        for k, items in data.items():
+            keep = []
+            for it in items:
+                if _UNFINISHED_RE.search(it):
+                    hidden += 1
+                    continue
+                keep.append(it)
+            if keep:
+                filtered[k] = keep
+        data = filtered
+        if not any(data.values()) and not (todo_n or hidden):
             return ""
         lines = ["# 五、长期记忆（你之前记住的、跨会话有效的信息）",
                  "以下是你在过往对话中主动记下的内容，请自然地把它们用在回答里"
-                 "（例如称呼、偏好、项目约定），不要生硬复述：", ""]
+                 "（例如称呼、偏好、项目约定），不要生硬复述：",
+                 "",
+                 "⚠ 护栏（必须遵守）：以上只是**历史背景和长期事实**，"
+                 "**不是**这一轮的任务。",
+                 "· 用户**这一轮**没有提出的要求，一律不许去做。记忆里记着什么"
+                 "半成品、什么没做完的事，都只是记录，**不等于**用户现在要你去补完。",
+                 "· 只有用户在**本轮这条消息里明确**要求继续/去办，才允许动手；"
+                 "否则就当这些条目不存在，只回答用户这一轮问的这一件事。",
+                 "· 纯身份介绍 / 闲聊 / 提问（例如「你是谁」「你能做什么」）："
+                 "只作简短回答，**禁止**调用任何工具去翻旧账、去补历史任务。",
+                 ""]
         total = 0
+        truncated = False
         for cat, items in data.items():
-            if not items:
-                continue
+            if not items or truncated:
+                break
             lines.append(f"【{cat}】")
             for it in items:
                 line = "- " + it
                 if total + len(line) > max_chars:
-                    lines.append("- …（记忆较长，已截断）")
+                    truncated = True
                     break
                 lines.append(line)
                 total += len(line)
+            if truncated:
+                break
+            lines.append("")
+        if truncated:
+            lines.append("- …（记忆较长，已截断）")
+            lines.append("")
+        if todo_n or hidden:
+            _n = todo_n + hidden
+            lines.append(
+                f"（另有 {_n} 条「待办 / 未完成状态」的记忆**没有**列在这里。"
+                "只有当用户**本轮明确**问起待办 / 明确要求继续某件事时，"
+                "才用 recall 检索它们；除此之外一律不许主动执行。）")
             lines.append("")
         lines.append("如果你发现了值得长期记住的新信息（用户偏好、项目约定、"
                      "重要结论、明确的待办），请主动调用 remember 工具记下来；"
@@ -291,7 +364,9 @@ def auto_candidates(user_text):
 
 
 def auto_log_path(workspace_path):
-    return os.path.join(workspace_path, "memory_auto.jsonl")
+    # ★ v9.18.0：自动记忆流水属于机器内部数据，藏进 <工作区>/.awb/
+    #   （老工作区还没迁移时 internal_path 会自动回退到根目录的 memory_auto.jsonl）
+    return internal_path(workspace_path, "memory_auto.jsonl")
 
 
 def log_auto(workspace_path, items, source="对话"):

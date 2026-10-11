@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QTextBrowser, QMessageBox, QListWidget, QListWidgetItem, QComboBox, QCheckBox,
     QLineEdit, QDialog, QDialogButtonBox, QTabWidget, QGroupBox, QFormLayout,
     QSpinBox, QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QDoubleSpinBox, QSplitter,
+    QHeaderView, QAbstractItemView, QDoubleSpinBox, QSplitter, QGridLayout,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
@@ -16,111 +16,146 @@ from PyQt6.QtGui import QGuiApplication
 from .. import (themes, plan as plan_mod, security, asr as asr_mod,
                 tts as tts_mod, dingtalk as dt_mod, config, version as ver,
                 skills as skills_mod, scheduler as sched_mod,
-                memory as memory_mod, worklog as worklog_mod)
+                memory as memory_mod, worklog as worklog_mod,
+                workspace as ws_mod, icons as icons_mod)
 
+# ★★ v9.18.0（需求 2）：QtWebEngine 有一条**硬规则** —— 必须在 `QApplication`
+#   建出来之前被导入，否则启动渲染进程时整个进程会被干掉（webengine.py 实测 exit 127），
+#   而且挂请求拦截器也会当场崩。
+#   时机正好：`main.py` 先 `import main_window` → 本模块，之后才建 `QApplication`。
+#   所以这一行导入**不能挪到函数里、也不能删** —— 想启用"抓包"就得靠它。
+#   （browser_page 内部会 import app.webengine，而后者在模块级就把内核导进来了。）
+from . import browser_page  # noqa: E402,F401
+
+# ★ v9.18.0（需求 16）：字形一律从 `app/icons.py` 取，别在这里写死。
+#   `ic()` 的名字见 icons.ICON；想换图标只改那张表，这里一行都不用动。
 PAGES = [
-    ("chat", "💬", "对话"),
-    ("assistant", "🤝", "助理"),
-    ("skills", "🧩", "技能"),
-    ("tasks", "⏰", "定时"),
-    ("memory", "🧠", "记忆"),
-    ("tools", "📊", "工具"),
-    ("bg", "⚡", "并行任务"),
-    ("team", "👥", "团队"),
-    ("integrations", "🔌", "集成"),
-    ("settings", "⚙", "设置"),
-    ("about", "ℹ", "关于"),
+    ("chat", icons_mod.ic("chat"), "对话"),
+    ("assistant", icons_mod.ic("assistant"), "助理"),
+    ("skills", icons_mod.ic("skills"), "技能"),
+    ("tasks", icons_mod.ic("schedule"), "定时"),
+    ("memory", icons_mod.ic("memory"), "记忆"),
+    ("tools", icons_mod.ic("tools"), "工具"),
+    ("bg", icons_mod.ic("parallel"), "并行任务"),
+    ("team", icons_mod.ic("team"), "团队"),
+    ("integrations", icons_mod.ic("integrations"), "集成"),
+    ("settings", icons_mod.ic("settings"), "设置"),
+    ("about", icons_mod.ic("info"), "关于"),
+    # ★ v9.18.0（需求 2）：内嵌浏览器页。
+    #   ⚠ 只能**追加在最后**：`main_window._open_page` 是拿本表的下标当
+    #     `QStackedWidget` 的下标用的，插在中间会把后面所有页面全部错位。
+    #     对应地，main_window 里 `self.stack.addWidget(self.page_browser)`
+    #     也必须排在所有页面之后。
+    ("browser", icons_mod.ic("web"), "浏览器"),
 ]
 
-# 侧栏「常显」的主项；其余页面收进「更多」折叠组。
-# 「工具」是要常看调用轨迹的核心页，所以放在一级；关于等收进「更多」。
-# 采用保守方案：PAGES 一项都不删（功能入口不丢），只是侧栏默认更清爽。
+# 侧栏「常显」的主项（v9.13 引入）。v9.18.0 起导航改成"几行小格子"，
+# 这个常量不再参与布局，但保留导出以免老代码 / 回归用例引用时炸掉。
 NAV_PRIMARY = ("chat", "assistant", "tools", "settings")
+
+# ---------------------------------------------------------------------------
+# 侧栏导航（v9.18.0 需求 10 重做）
+#
+# 用户原话：
+#   「界面优化，去掉左侧菜单栏，统一在对话列表上方弄出几行这样的选项，
+#     去掉工具选项，然后其余的再合并合并」
+#
+# 做法：原来那条 76px 宽、竖着一长溜图标的「菜单栏」整条拆掉，
+# 改成**几行小按钮**，由主窗口摆到「对话列表」的**正上方**
+# （见 main_window._build_shell 里的 SidePanel）。
+#
+# 两条约定：
+#   · 「工具」不再单独占一格 —— 调用轨迹现在已经按层级直接显示在对话流里
+#     （需求 9 的「过程」折叠组），老的轨迹页仍留在页面栈里，
+#     从侧栏最底部那行小字进去，功能不丢。
+#   · 「团队」（v9.18.0 需求 13）也不再占格子 —— 它已经搬进**对话里**
+#     （输入框上方那条 TeamBar：选团队 + 成员状态灯），这才是它该在的地方。
+#     老页面留在页面栈里只是用来回看历史运行，入口在 TeamBar 下拉菜单最底部。
+#   · PAGES 一项都不删：页面栈的下标跟 PAGES 顺序绑定
+#     （main_window._open_page 用 PAGES 的下标当 stack 下标），
+#     删一项会把后面所有页面全部错位。所以这里只是"不画那一格"。
+# ---------------------------------------------------------------------------
+NAV_SKIP = ("tools", "team")   # 不画格子的页面
+
+# 「对话」是主战场，单独占第一行；其余按这个顺序 3 列排布。
+# 9 项正好排满 3 行（3 列 × 3 行），不用再多一行半。
+NAV_CHIPS = ("assistant", "skills", "browser",
+             "tasks", "bg", "memory",
+             "integrations", "settings", "about")
+
+NAV_COLS = 3
 
 
 class NavRail(QWidget):
-    """左侧竖直导航栏：常显少数主项，其余收进「更多」折叠组。"""
+    """侧栏上方的导航区：第一行「对话」，下面 3 列小格子放其余功能页。"""
 
     changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("NavRail")
-        self.setFixedWidth(76)
         v = QVBoxLayout(self)
-        v.setContentsMargins(8, 14, 8, 14)
+        v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
-
-        logo = QLabel("AI\n工作台")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setStyleSheet(
-            f"color:{themes.tokens()['accent_text']};font-size:12px;font-weight:bold;"
-            "line-height:1.3;")
-        v.addWidget(logo)
-        v.addSpacing(10)
 
         self.buttons = {}
         self._current = "chat"
+        self._meta = {k: (i, n) for k, i, n in PAGES}
 
-        def _make_button(key, icon, name):
-            b = QPushButton(f"{icon}\n{name}")
-            b.setObjectName("NavBtn")
+        def _make(key, text, height=34):
+            b = QPushButton(text)
+            b.setObjectName("NavChip")
             b.setCheckable(True)
-            b.setFixedHeight(58)
+            b.setFixedHeight(height)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda _=False, k=key: self.select(k))
             self.buttons[key] = b
             return b
 
-        # 1) 主项（常显）
-        for key, icon, name in PAGES:
-            if key in NAV_PRIMARY:
-                v.addWidget(_make_button(key, icon, name))
+        # 第一行：对话（整行宽，最显眼）
+        icon, name = self._meta["chat"]
+        home = _make("chat", f"{icon} {name}", height=36)
+        home.setObjectName("NavHome")
+        v.addWidget(home)
 
-        v.addStretch(1)
+        # 其余：3 列网格
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(5)
+        n = 0
+        for key in NAV_CHIPS:
+            if key in NAV_SKIP or key not in self._meta:
+                continue
+            icon, name = self._meta[key]
+            grid.addWidget(_make(key, f"{icon} {name}"), n // NAV_COLS, n % NAV_COLS)
+            n += 1
+        for c in range(NAV_COLS):
+            grid.setColumnStretch(c, 1)
+        v.addLayout(grid)
 
-        # 2) 「更多」折叠组：技能 / 定时 / 记忆 / 工具 / 集成
-        self._secondary = [p for p in PAGES if p[0] not in NAV_PRIMARY]
-        self.more_btn = None
-        self.more_box = None
-        if self._secondary:
-            self.more_btn = QPushButton("⋯\n更多")
-            self.more_btn.setObjectName("NavBtn")
-            self.more_btn.setCheckable(True)
-            self.more_btn.setFixedHeight(58)
-            self.more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.more_btn.setToolTip("展开 / 收起更多功能")
-            self.more_btn.clicked.connect(self._toggle_more)
-            v.addWidget(self.more_btn)
-
-            self.more_box = QWidget()
-            mv = QVBoxLayout(self.more_box)
-            mv.setContentsMargins(0, 0, 0, 0)
-            mv.setSpacing(6)
-            for key, icon, name in self._secondary:
-                mv.addWidget(_make_button(key, icon, name))
-            self.more_box.setVisible(False)
-            v.addWidget(self.more_box)
-
+        self.chip_keys = [k for k in NAV_CHIPS if k in self.buttons]
         self.buttons["chat"].setChecked(True)
 
-    def _toggle_more(self, checked=None):
-        if self.more_box is None:
-            return
-        show = self.more_btn.isChecked() if checked is None else bool(checked)
-        self.more_box.setVisible(show)
-
     def select(self, key):
-        # 选中二级页面时自动展开「更多」，保证入口可见、按钮高亮正确
-        if self.more_box is not None and any(p[0] == key for p in self._secondary):
-            self.more_btn.setChecked(True)
-            self._toggle_more(True)
+        """切到某一页。`NAV_SKIP` 里的页（如「工具」）没有格子，照常派发切换。"""
+        if key not in self.buttons:
+            self.changed.emit(key)
+            return
         if key == self._current:
+            return
+        self.set_current(key)
+        self.changed.emit(key)
+
+    def set_current(self, key):
+        """只改高亮、不派发切换（供主窗口在代码里直接翻页后同步高亮）。
+
+        没有对应格子的页（如「工具」）不动高亮 —— 否则会变成"一个都没选中"。
+        """
+        if key not in self.buttons:
             return
         self._current = key
         for k, b in self.buttons.items():
             b.setChecked(k == key)
-        self.changed.emit(key)
 
     def current(self):
         return self._current
@@ -132,12 +167,12 @@ class WelcomeView(QWidget):
     quick = pyqtSignal(str)
 
     ACTIONS = [
-        ("📄 生成 Word 文档", "写一份《…》的 Word，保存到桌面"),
-        ("📊 做一张数据表", "把下面的数据做成 Excel 表格，每列带表头"),
-        ("🖼 看图/OCR", "识别我拖进来的图片里的文字"),
-        ("🔎 联网查资料", "上网查一下 … 的最新情况，附来源"),
-        ("🎙 语音输入", "点输入框左边的麦克风说话，自动转成文字"),
-        ("📈 画图表", "用这几组数据画一张柱状图，存成 PNG"),
+        ("▭ 生成 Word 文档", "写一份《…》的 Word，保存到桌面"),
+        ("▦ 做一张数据表", "把下面的数据做成 Excel 表格，每列带表头"),
+        ("▨ 看图/OCR", "识别我拖进来的图片里的文字"),
+        ("⊙ 联网查资料", "上网查一下 … 的最新情况，附来源"),
+        ("◍ 语音输入", "点输入框左边的麦克风说话，自动转成文字"),
+        ("▲ 画图表", "用这几组数据画一张柱状图，存成 PNG"),
     ]
 
     def __init__(self, parent=None):
@@ -204,7 +239,7 @@ class MemoryPage(QWidget):
         v.setSpacing(10)
 
         head = QHBoxLayout()
-        self.title = QLabel("🧠 长期记忆 · 工作总结")
+        self.title = QLabel("◈ 长期记忆 · 工作总结")
         self.title.setObjectName("PageTitle")
         head.addWidget(self.title)
         head.addStretch(1)
@@ -338,13 +373,24 @@ class MemoryPage(QWidget):
             self.log_hint.setText(
                 f"今天 {st.get('total', 0)} 件事（成功 {st.get('ok', 0)}）"
                 f"　|　共 {len(days)} 天记录　|　目录："
-                f"{os.path.join(self.ws, 'worklog')}")
+                f"{self._worklog_dir()}")
+
+    def _worklog_dir(self):
+        """工作总结目录（★ v9.18.0 需求 8：已收进工作区的隐藏内部目录）。
+
+        这里只拿得到工作区**路径**（`self.ws`），所以直接用模块级的
+        `workspace.internal_dir()` —— 它自带"新位置优先、老位置兜底"，
+        老工作区没迁移完也能看到文件。
+        """
+        if not self.ws:
+            return ""
+        return ws_mod.internal_dir(self.ws, "worklog")
 
     def _open_worklog(self):
         if not self.ws:
             return
         try:
-            d = os.path.join(self.ws, "worklog")
+            d = self._worklog_dir()
             os.makedirs(d, exist_ok=True)
             os.startfile(d)  # noqa: S606 (Windows)
         except Exception:
@@ -389,7 +435,7 @@ class TracePage(QWidget):
         v.setContentsMargins(18, 18, 18, 18)
         v.setSpacing(10)
         head = QHBoxLayout()
-        title = QLabel("📊 工具调用记录")
+        title = QLabel("▦ 工具调用记录")
         title.setObjectName("PageTitle")
         head.addWidget(title)
         head.addStretch(1)
@@ -424,7 +470,7 @@ class TracePage(QWidget):
         for r in recs:
             ts = time.strftime("%m-%d %H:%M:%S", time.localtime(r.get("t", 0)))
             ok = r.get("ok")
-            mark = "✅" if ok else "❌"
+            mark = "✓" if ok else "✕"
             args = ", ".join(f"{k}={_short(v)}" for k, v in (r.get("args") or {}).items())
             res = (r.get("result") or "").replace("\n", " ")[:180]
             html.append(
@@ -498,7 +544,7 @@ class AssistantPage(QWidget):
         v.setContentsMargins(18, 18, 18, 18)
         v.setSpacing(10)
 
-        title = QLabel("🤝 助理")
+        title = QLabel("⚑ 助理")
         title.setObjectName("PageTitle")
         v.addWidget(title)
         tip = QLabel("把消息发到钉钉（最省事：直接发给「你自己」），助理就会在这里显示，"
@@ -558,11 +604,11 @@ class AssistantPage(QWidget):
         lrow = QHBoxLayout()
         b1 = QPushButton("⚙ 处理选中")
         b1.clicked.connect(lambda: self.process_one.emit(self.selected_msgid()))
-        b2 = QPushButton("⚡ 全部处理")
+        b2 = QPushButton("⟳ 全部处理")
         b2.clicked.connect(self.process_all.emit)
-        b3 = QPushButton("📤 重发结果到钉钉")
+        b3 = QPushButton("⇧ 重发结果到钉钉")
         b3.clicked.connect(lambda: self.resend.emit(self.selected_msgid()))
-        b4 = QPushButton("🗑 清空列表")
+        b4 = QPushButton("⊘ 清空列表")
         b4.clicked.connect(self._clear)
         for b in (b1, b2, b3, b4):
             lrow.addWidget(b)
@@ -663,7 +709,7 @@ class AssistantPage(QWidget):
         for i in range(self.list.count()):
             it = self.list.item(i)
             if it.data(Qt.ItemDataRole.UserRole) == msgid:
-                icon = {"待处理": "🕐", "处理中": "⏳", "已回复": "✅", "失败": "❌"}.get(status, "•")
+                icon = {"待处理": "◔", "处理中": "◕", "已回复": "✓", "失败": "✕"}.get(status, "•")
                 it.setText(f"{icon} [{m.get('time','')}] {m.get('conv') or m.get('sender') or ''}：{_trim(m.get('text'), 70)}")
                 break
         if self.selected_msgid() == msgid:
@@ -744,7 +790,7 @@ class IntegrationPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(18, 18, 18, 18)
         outer.setSpacing(10)
-        title = QLabel("🔌 集成")
+        title = QLabel("⊕ 集成")
         title.setObjectName("PageTitle")
         outer.addWidget(title)
 
@@ -831,7 +877,7 @@ class IntegrationPage(QWidget):
         self.dt_find_users = QPushButton("自动查我的 userId")
         self.dt_find_users.setToolTip(
             "把 AppKey/AppSecret 填好并保存后点这里，程序会去通讯录查真实可用的 userId。\n"
-            "⚠️ 接收人必须填 userId，填昵称（如「张三」）会报 staffId 不存在。")
+            "⚠ 接收人必须填 userId，填昵称（如「张三」）会报 staffId 不存在。")
         self.dt_find_users.clicked.connect(self._find_dingtalk_users)
         self.dt_copy_uid = QPushButton("复制到接收人")
         self.dt_copy_uid.setEnabled(False)
@@ -870,15 +916,15 @@ class IntegrationPage(QWidget):
         f4.addWidget(tip4)
 
         brow = QHBoxLayout()
-        self.dt_selftest = QPushButton("🔍 一键接口自检")
+        self.dt_selftest = QPushButton("⊙ 一键接口自检")
         self.dt_selftest.setToolTip("逐项真实调用：凭据 / 通讯录 / 机器人 / 工作通知 / 群，把结果摊开")
         self.dt_selftest.clicked.connect(
             lambda: self.dingtalk_selftest.emit(self._collect_dingtalk()))
-        self.dt_contacts = QPushButton("📇 浏览通讯录")
+        self.dt_contacts = QPushButton("▩ 浏览通讯录")
         self.dt_contacts.setToolTip("列出部门与成员（真实姓名 + userId），可直接填成接收人")
         self.dt_contacts.clicked.connect(
             lambda: self.dingtalk_contacts.emit(self._collect_dingtalk()))
-        self.dt_login = QPushButton("🌐 扫码授权登录")
+        self.dt_login = QPushButton("◎ 扫码授权登录")
         self.dt_login.setToolTip(
             "打开浏览器让钉钉账号扫码授权（OAuth2），登录后能拿到你的钉钉用户信息。\n"
             "需要在钉钉开发者后台把 http://127.0.0.1:8765/callback 加进「登录与分享 → 回调域名」。")
@@ -922,13 +968,13 @@ class IntegrationPage(QWidget):
         f5.addWidget(tip5)
 
         lrow = QHBoxLayout()
-        self.dt_dws_login = QPushButton("🌐 用 dws 登录钉钉")
+        self.dt_dws_login = QPushButton("◎ 用 dws 登录钉钉")
         self.dt_dws_login.setToolTip("打开浏览器用你的钉钉账号 OAuth 授权；授权后可读写你的会话/消息")
         self.dt_dws_login.clicked.connect(lambda: self.dingtalk_dws_login.emit(False))
-        self.dt_dws_login_device = QPushButton("🔑 设备码登录")
+        self.dt_dws_login_device = QPushButton("⚿ 设备码登录")
         self.dt_dws_login_device.setToolTip("无法开浏览器时用：命令行输出授权链接+码，你去浏览器输入")
         self.dt_dws_login_device.clicked.connect(lambda: self.dingtalk_dws_login.emit(True))
-        self.dt_dws_convs = QPushButton("📋 查看我的会话列表")
+        self.dt_dws_convs = QPushButton("▥ 查看我的会话列表")
         self.dt_dws_convs.clicked.connect(lambda: self.dingtalk_dws_conversations.emit())
         lrow.addWidget(self.dt_dws_login)
         lrow.addWidget(self.dt_dws_login_device)
@@ -940,8 +986,8 @@ class IntegrationPage(QWidget):
         self.dt_dws_log.setWordWrap(True)
         self.dt_dws_log.setObjectName("PageSub")
         f5.addWidget(self.dt_dws_log)
-        hint5 = QLabel("💡 如果浏览器授权页面一直显示「出错」或打不开（本机代理/安全软件"
-                       "拦截了本地回调），请改点上面的「🔑 设备码登录」——它会给你一个"
+        hint5 = QLabel("☼ 如果浏览器授权页面一直显示「出错」或打不开（本机代理/安全软件"
+                       "拦截了本地回调），请改点上面的「⚿ 设备码登录」——它会给你一个"
                        "链接和一串码，在任意浏览器里打开输入即可，不走本地回调。")
         hint5.setWordWrap(True)
         hint5.setObjectName("PageSub")
@@ -1040,7 +1086,7 @@ class IntegrationPage(QWidget):
         rows.append("<table cellspacing='0' cellpadding='4' width='100%'>")
         for name, ok, msg in items:
             color = t["success"] if ok else t["danger"]
-            mark = "✅" if ok else "❌"
+            mark = "✓" if ok else "✕"
             rows.append(
                 f"<tr><td valign='top' style='white-space:nowrap;color:{color};'>"
                 f"{mark} <b>{_esc(name)}</b></td>"
@@ -1189,7 +1235,7 @@ class IntegrationPage(QWidget):
         save.clicked.connect(self._save_update)
         check = QPushButton("立即检查更新")
         check.clicked.connect(self.update_check.emit)
-        apply_btn = QPushButton("⬇️ 下载并自动安装更新")
+        apply_btn = QPushButton("⇩ 下载并自动安装更新")
         apply_btn.setToolTip("检查到新版本后点这个：自动下载 → 退出 → 替换文件 → 重启新版本")
         apply_btn.clicked.connect(self.update_apply.emit)
         row.addWidget(save)
@@ -1228,10 +1274,10 @@ class IntegrationPage(QWidget):
             return
         if info.get("has_update"):
             head = (f'<div style="font-size:16px;font-weight:bold;color:{t["success"]};">'
-                    f'🎉 发现新版本 {_esc(info.get("tag"))}（当前 {_esc(info.get("current"))}）</div>')
+                    f'✧ 发现新版本 {_esc(info.get("tag"))}（当前 {_esc(info.get("current"))}）</div>')
         else:
             head = (f'<div style="font-size:15px;font-weight:bold;color:{t["accent_text"]};">'
-                    f'✅ 已是最新版本（{_esc(info.get("current"))}）</div>')
+                    f'✓ 已是最新版本（{_esc(info.get("current"))}）</div>')
         notes = (info.get("notes") or "").strip()
         assets = info.get("assets") or []
         html = [head,
@@ -1568,7 +1614,7 @@ class SettingsPage(QWidget):
     def set_gh_status(self, ok, text):
         """主窗口回填 GitHub 检测结果（v9.15.0）。"""
         try:
-            self.gh_status.setText(("✅ " if ok else "⚠️ ") + str(text))
+            self.gh_status.setText(("✓ " if ok else "⚠ ") + str(text))
         except Exception:
             pass
 
@@ -1610,7 +1656,7 @@ class SettingsPage(QWidget):
         rows = ['<table style="font-size:13px;border-collapse:collapse;">']
         for item in results or []:
             ok = item.get("ok")
-            mark = "✅" if ok else "❌"
+            mark = "✓" if ok else "✕"
             color = "#2e7d32" if ok else "#c62828"
             rows.append(
                 f'<tr><td style="padding:4px 12px 4px 0;"><b>{_esc(item.get("name",""))}</b></td>'
@@ -1630,9 +1676,9 @@ class SettingsPage(QWidget):
             if ok is None:
                 color, mark = t["text_muted"], "—"
             elif ok:
-                color, mark = t["success"], "✅"
+                color, mark = t["success"], "✓"
             else:
-                color, mark = t["danger"], "❌"
+                color, mark = t["danger"], "✕"
             html.append(
                 f'<tr><td style="padding:5px 14px 5px 0;"><b>{_esc(label)}</b></td>'
                 f'<td style="color:{color};padding:5px 10px;">{mark}</td>'
@@ -2004,7 +2050,7 @@ class SkillsPage(QWidget):
         v.setSpacing(10)
 
         head = QHBoxLayout()
-        self.title = QLabel("🧩 技能库")
+        self.title = QLabel("✦ 技能库")
         self.title.setObjectName("PageTitle")
         head.addWidget(self.title)
         head.addStretch(1)
@@ -2218,7 +2264,7 @@ class TasksPage(QWidget):
         v.setSpacing(10)
 
         head = QHBoxLayout()
-        self.title = QLabel("⏰ 定时任务")
+        self.title = QLabel("◷ 定时任务")
         self.title.setObjectName("PageTitle")
         head.addWidget(self.title)
         head.addStretch(1)
@@ -2376,7 +2422,7 @@ _STATUS_COLOR = {
 
 
 class BgTasksPage(QWidget):
-    """⚡ 并行任务：所有后台链路一览（跑慢命令、后台 AI、团队子任务都在这里）。"""
+    """⟳ 并行任务：所有后台链路一览（跑慢命令、后台 AI、团队子任务都在这里）。"""
 
     cancel_one = pyqtSignal(str)      # 请求取消某个任务
     cancel_all = pyqtSignal()
@@ -2392,7 +2438,7 @@ class BgTasksPage(QWidget):
         v.setSpacing(10)
 
         head = QHBoxLayout()
-        self.title = QLabel("⚡ 并行任务")
+        self.title = QLabel("⟳ 并行任务")
         self.title.setObjectName("PageTitle")
         head.addWidget(self.title)
         head.addStretch(1)
@@ -2530,15 +2576,15 @@ class BgTasksPage(QWidget):
 
 
 class TeamPage(QWidget):
-    """👥 团队：一键起一支"产品经理 + 架构师 + 工程师 + 测试 + 组长"的小队。"""
+    """⬡ 团队：一键起一支"产品经理 + 架构师 + 工程师 + 测试 + 组长"的小队。"""
 
     start_run = pyqtSignal(str, list, int)     # goal, roles, max_steps
     cancel_run = pyqtSignal(str)
     refresh = pyqtSignal()
 
     ROLE_CHOICES = [
-        ("pm", "📋 产品经理"), ("arch", "🏗 架构师"), ("dev", "💻 工程师"),
-        ("qa", "🧪 测试工程师"), ("lead", "🧭 组长"),
+        ("pm", "▥ 产品经理"), ("arch", "⬢ 架构师"), ("dev", "⌨ 工程师"),
+        ("qa", "⚗ 测试工程师"), ("lead", "⌖ 组长"),
     ]
 
     def __init__(self, parent=None):
@@ -2550,7 +2596,7 @@ class TeamPage(QWidget):
         v.setSpacing(10)
 
         head = QHBoxLayout()
-        self.title = QLabel("👥 团队协作")
+        self.title = QLabel("⬡ 团队协作")
         self.title.setObjectName("PageTitle")
         head.addWidget(self.title)
         head.addStretch(1)
@@ -2585,7 +2631,7 @@ class TeamPage(QWidget):
         self.n_dev.setPrefix("工程师 ")
         self.n_dev.setSuffix(" 人")
         form.addWidget(self.n_dev)
-        self.go_btn = QPushButton("🚀 组建团队开工")
+        self.go_btn = QPushButton("➤ 组建团队开工")
         self.go_btn.clicked.connect(self._start)
         form.addWidget(self.go_btn)
         v.addLayout(form)
@@ -2635,8 +2681,8 @@ class TeamPage(QWidget):
         self.runs.clear()
         for r in runs:
             s = r.snapshot()
-            icon = {"running": "▶", "done": "✅", "failed": "❌",
-                    "cancelled": "⛔"}.get(s["status"], "·")
+            icon = {"running": "▶", "done": "✓", "failed": "✕",
+                    "cancelled": "⊘"}.get(s["status"], "·")
             it = QListWidgetItem(f"{icon} {s['goal'][:22]}\n   {s['id']}")
             it.setData(Qt.ItemDataRole.UserRole, s["id"])
             self.runs.addItem(it)
@@ -2681,3 +2727,89 @@ class TeamPage(QWidget):
             rep = ("<h3>组长汇总</h3><pre style='white-space:pre-wrap'>"
                    + _esc(s["report"][:8000]) + "</pre>")
         self.view.setHtml(head + "".join(cards) + rep)
+
+
+# ---------------------------------------------------------------------------
+# 内嵌浏览器页（v9.18.0 需求 2）
+# ---------------------------------------------------------------------------
+class BrowserPage(QWidget):
+    """内嵌浏览器：像浏览器一样访问网页、自由抓包，再一键交给 AI。
+
+    用户原话：
+        「增强网址解析的功能，不仅仅让模型只能通过工具查看网页返回的 json，
+          模型还可以想浏览器一样访问网页、自由抓取包，参考 workbuddy，
+          可以内嵌浏览器内核」
+
+    真正的实现在 :class:`app.gui.browser_page.BrowserPane`（地址栏 + Chromium 内核 +
+    请求嗅探），这里只负责"把它装成一个页面"并写清楚怎么用。
+    模型侧对应的是 `web_visit` 工具 —— 走的是同一个
+    :func:`app.webengine.fetch_rendered`，所以人工看到的和模型拿到的是一致的。
+
+    **懒加载**（v9.18.0）：Chromium 内核第一次实例化要几百毫秒 + 一百多 MB 内存，
+    绝大部分用户从头到尾都不会打开这一页 —— 所以真正的 `BrowserPane` 等到
+    **这一页第一次被显示**时才建（`showEvent`）。启动速度和内存占用不受影响。
+
+    ⚠ 本模块顶部就 import 了 `browser_page`：QtWebEngine 必须在 `QApplication`
+      之前导入，晚了不崩但会**自动关掉抓包**（见 webengine.py 的踩坑记录）。
+      注意"导入内核"与"创建控件"是两件事，这里只把前者提前。
+    """
+
+    fetched = pyqtSignal(dict)      # 转发 BrowserPane.fetched（主窗口直接连这个）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        t = themes.tokens()
+
+        self.pane = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        head = QLabel(f"{icons_mod.ic('web')} 内嵌浏览器")
+        head.setStyleSheet(f"font-size:15px;font-weight:bold;color:{t['accent_text']};")
+        v.addWidget(head)
+
+        # 占位（第一次显示时被真的 BrowserPane 顶掉）
+        self._placeholder = QLabel("浏览器内核尚未启动，切换到本页时会自动就绪。")
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Expanding)
+        self._placeholder.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
+        v.addWidget(self._placeholder, 1)
+
+        self.tip = QLabel(
+            "· 这里是**真实的浏览器内核**（Chromium）：JS 跑完的页面才拿得到正文，"
+            "各种后台 / 单页应用在这儿能正常显示，纯抓 HTML 只会得到一具空壳。\n"
+            "· 点「交给 AI 分析当前页」会把渲染后的正文 + 页面发出的数据接口整理好"
+            "填进输入框，你看一眼按回车就交给 AI。\n"
+            "· AI 自己也能调 web_visit 工具做同样的事（可选等多久、要不要抓包）。")
+        self.tip.setWordWrap(True)
+        self.tip.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
+        v.addWidget(self.tip)
+
+    # ------------------------------------------------------------------
+    def ensure_pane(self):
+        """建（并返回）真正的浏览器控件；已经建过就直接返回。
+
+        用 `insertWidget(1, ...)` 插到标题下面 —— 这样"先 addWidget 后显示"的
+        铁律天然满足（绝不会出现"控件还没父窗口就被 setVisible(True)"那种弹小窗）。
+        """
+        if self.pane is not None:
+            return self.pane
+        try:
+            self.pane = browser_page.BrowserPane()
+            self.pane.fetched.connect(self.fetched.emit)
+        except Exception as e:                       # noqa: BLE001
+            self._placeholder.setText(f"浏览器内核启动失败：{type(e).__name__}: {e}")
+            return None
+        lay = self.layout()
+        lay.insertWidget(1, self.pane, 1)
+        lay.removeWidget(self._placeholder)
+        self._placeholder.hide()
+        self._placeholder.deleteLater()
+        self._placeholder = None
+        return self.pane
+
+    def showEvent(self, ev):                          # noqa: N802 （Qt 回调命名）
+        super().showEvent(ev)
+        self.ensure_pane()

@@ -76,7 +76,7 @@ class VoiceInput(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        self.mic = QPushButton("🎙")
+        self.mic = QPushButton("◍")
         self.mic.setObjectName("MicBtn")
         self.mic.setCheckable(True)
         self.mic.setFixedSize(40, 40)
@@ -140,7 +140,7 @@ class VoiceInput(QWidget):
         self._timer.stop()
         self.meter.active = False
         self.mic.setChecked(False)
-        self.mic.setText("🎙")
+        self.mic.setText("◍")
         if rec is None:
             return
         try:
@@ -170,7 +170,7 @@ class VoiceInput(QWidget):
         self.meter.active = False
         self.meter.reset()
         self.mic.setChecked(False)
-        self.mic.setText("🎙")
+        self.mic.setText("◍")
         self.hint.setText("语音输入")
 
     def _tick(self):

@@ -95,7 +95,7 @@ def no_window_kwargs():
     si = startupinfo()
     if si is not None:
         kw["startupinfo"] = si
-    # ⚠️ 关键点：已经有（隐藏的）控制台时**不要**再传 CREATE_NO_WINDOW。
+    # ⚠ 关键点：已经有（隐藏的）控制台时**不要**再传 CREATE_NO_WINDOW。
     # 传了它 = 子进程「不继承控制台」，于是孙进程（控制台程序）又会新建可见窗口，
     # 闪窗就又回来了。有隐藏控制台时让它继承即可，整条进程链都不可见。
     if not _has_console():
@@ -145,7 +145,7 @@ def kill_tree(proc):
     "壳进程 + 真干活的孙进程"结构，只杀壳的话孙进程会变成孤儿继续跑，
     用户点了"取消"却发现磁盘还在转。Windows 上用 taskkill /T 才能连根拔。
 
-    ⚠️ 这里必须走 subprocess.run 而不是 self.run()，避免 taskkill 失败时
+    ⚠ 这里必须走 subprocess.run 而不是 self.run()，避免 taskkill 失败时
        又去记一条 spawn 日志、递归调用自己。
     """
     if proc is None:

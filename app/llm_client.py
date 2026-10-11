@@ -17,6 +17,39 @@ class LLMError(Exception):
     pass
 
 
+class _StreamGuard:
+    """包一层 on_token，并在"换端点/模型重试"前把已发出的半截内容作废。
+
+    ★ v9.18.0（需求 4「生成内容重复」）：
+      老代码的问题 —— 第 1 个端点吐了半句就断了，热备换第 2 个端点**从头**重新生成，
+      于是界面上会变成「半句 + 完整新回复」，用户看到的就是"内容重复"。
+      界面只会往后拼、不会撤回，所以需要一个显式的"作废重来"标记
+      （`config.STREAM_RESET`）让界面先把攒的那半截清掉。
+
+      为什么不在异常处理里直接清：因为「有没有真的吐出过字」只有包在 on_token
+      外面才知道 —— 断在第一个字节之前（连接失败）时不该发作废标记。
+    """
+
+    def __init__(self, on_token):
+        self._on_token = on_token
+        self.emitted = False        # 本轮尝试是否已经吐出过真实内容
+
+    def reset_if_needed(self):
+        """在开始**下一次**尝试前调用：上一轮吐过字就先让界面作废。"""
+        if self.emitted and self._on_token:
+            try:
+                self._on_token(config.STREAM_RESET)
+            except Exception:
+                pass
+        self.emitted = False
+
+    def __call__(self, delta):
+        self.emitted = True
+        if self._on_token:
+            return self._on_token(delta)
+        return None
+
+
 def _is_hard_err(e):
     """判断是不是「认证/额度/模型已下线」这类硬错误——本会话内不要再重试该模型。
 
@@ -81,6 +114,29 @@ class LLMClient:
         # None = 不启用闸门；返回 False 表示"网页版未就绪"，auto 模式静默跳过它
         # （绝不因为 auto 模式就主动拉起浏览器）。
         self.web_gate = None
+        # ★ v9.18.0（需求 15）：用户点"停止"用的取消开关 + 正在收流的响应句柄。
+        #   `cancel()` 会把句柄关掉，让正在读 SSE 的循环立刻退出，
+        #   从而把"点了停止还要等十几秒"压到几乎瞬时。
+        self._cancelled = False
+        self._active_resp = None
+
+    def cancel(self):
+        """用户点了停止：尽快掐断正在进行中的流式请求（需求 15）。
+
+        为什么要关响应而不是只置标志位：读 SSE 的循环阻塞在 `iter_lines()` 上，
+        模型还在吐字时它自己不会醒过来检查标志位 —— 必须把底层连接关掉才能立刻醒。
+        """
+        self._cancelled = True
+        resp = self._active_resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _reset_cancel(self):
+        """开始新的一轮对话前把取消开关复位（否则一次停止会让后面全发不出去）。"""
+        self._cancelled = False
 
     def set_web_gate(self, fn):
         """注入"网页通道是否就绪"的判断函数（供 chat_auto 使用）。"""
@@ -132,7 +188,7 @@ class LLMClient:
             else:  # dashscope
                 payload["enable_search"] = True
                 payload["search_options"] = {
-                    # ⚠️ forced_search 必须是 False！
+                    # ⚠ forced_search 必须是 False！
                     # 曾经是 True —— 那等于**每一轮请求都强制联网搜索**，
                     # 于是做本机诊断/写代码这类不需要外部信息的任务时，
                     # 每轮都被塞进一堆无关搜索结果（实测：本机钉钉诊断那轮，
@@ -214,39 +270,55 @@ class LLMClient:
             buf = b""
             full = []
             got_sse = False
-            for raw in resp.iter_lines(decode_unicode=False):
-                if raw is None:
-                    continue
-                if isinstance(raw, str):
-                    raw = raw.encode("utf-8")
-                buf += raw + b"\n"
-                # 按行解析 SSE
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    got_sse = True
-                    data = line[5:].strip()
-                    if data == b"[DONE]":
+            # ★ v9.18.0（需求 15「点停止后要等好久」）：把正在收流的响应挂到实例上，
+            #   这样用户点"停止"时 `cancel()` 能立刻把它掐掉 ——
+            #   否则要等这一轮流式**自然收完**才轮得到循环里那个 `if self._abort`，
+            #   模型还在滔滔不绝时就是"点了停止还要等十几秒"。
+            self._active_resp = resp
+            try:
+                for raw in resp.iter_lines(decode_unicode=False):
+                    # 用户已点停止：立刻收手，把已经收到的部分原样返回
+                    # （上层会丢掉它 —— 停止时不该把半截内容当最终答复）
+                    if self._cancelled:
                         return "".join(full)
-                    try:
-                        obj = json.loads(data)
-                    except Exception:
+                    if raw is None:
                         continue
-                    try:
-                        dl = obj["choices"][0]["delta"] or {}
-                    except Exception:
-                        dl = {}
-                    # 思维链（DeepSeek-V4.x / Qwen3.x 等）：单独回调，不算正文
-                    rc = dl.get("reasoning_content") or ""
-                    if rc and on_reasoning:
-                        on_reasoning(rc)
-                    delta = dl.get("content") or ""
-                    if delta:
-                        full.append(delta)
-                        if on_token:
-                            on_token(delta)
+                    if isinstance(raw, str):
+                        raw = raw.encode("utf-8")
+                    buf += raw + b"\n"
+                    # 按行解析 SSE
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        got_sse = True
+                        data = line[5:].strip()
+                        if data == b"[DONE]":
+                            return "".join(full)
+                        try:
+                            obj = json.loads(data)
+                        except Exception:
+                            continue
+                        try:
+                            dl = obj["choices"][0]["delta"] or {}
+                        except Exception:
+                            dl = {}
+                        # 思维链（DeepSeek-V4.x / Qwen3.x 等）：单独回调，不算正文
+                        rc = dl.get("reasoning_content") or ""
+                        if rc and on_reasoning:
+                            on_reasoning(rc)
+                        delta = dl.get("content") or ""
+                        if delta:
+                            full.append(delta)
+                            if on_token:
+                                on_token(delta)
+            finally:
+                self._active_resp = None
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             if not got_sse:
                 # 服务端未返回 SSE，尝试把整段当 JSON 解析（非流式兜底）
                 text = buf.decode("utf-8", "ignore")
@@ -279,6 +351,7 @@ class LLMClient:
         本会话内会记住「硬报错」的 (端点,模型)（401/403/404：额度用尽/已下线/无权限），
         后续不再白撞，直接跳到下一个还活着的模型。
         """
+        self._reset_cancel()      # ★ 需求 15：新的一轮，取消开关复位
         tried = []
         plan = []
         for pname in config.PROVIDER_PRIORITY:
@@ -301,10 +374,15 @@ class LLMClient:
                     continue      # 本会话已知坏模型，跳过
                 plan.append((p, m["id"]))
         last_err = None
+        # ★ v9.18.0（需求 4）：换端点前把上一轮吐出的半截作废，避免界面"内容重复"
+        guard = _StreamGuard(on_token) if on_token else None
         for provider, model in plan:
             tried.append(f"{provider['label']}/{model}")
+            if guard:
+                guard.reset_if_needed()
             try:
-                text = self._stream_once(provider, model, messages, enable_search, on_token, timeout,
+                text = self._stream_once(provider, model, messages, enable_search,
+                                         guard or on_token, timeout,
                                          on_reasoning)
                 if text:
                     return text
@@ -327,6 +405,7 @@ class LLMClient:
           而且回退后 self.notice 会写明"已从 X 切到 Y"，界面必须显示出来。
         """
         policy = policy or self.policy or config.MODEL_FAILURE_POLICY
+        self._reset_cancel()      # ★ 需求 15：新的一轮，取消开关复位
         if not model_sel or model_sel == "auto":
             return self.chat_auto(messages, enable_search, on_token, timeout, on_reasoning)
 
@@ -340,11 +419,15 @@ class LLMClient:
         self.asked_label = " / ".join(
             config.model_label(m, p["name"]) for p, m in choices)
         tried, last_err = [], None
+        # ★ v9.18.0（需求 4）：同一个模型有多个端点时，换端点也要先作废半截内容
+        guard = _StreamGuard(on_token) if on_token else None
         for provider, model in choices:
             tried.append(f"{provider['label']}/{model}")
+            if guard:
+                guard.reset_if_needed()
             try:
                 return self._stream_once(provider, model, messages, enable_search,
-                                         on_token, timeout, on_reasoning)
+                                         guard or on_token, timeout, on_reasoning)
             except Exception as e:
                 last_err = e
                 continue
@@ -355,6 +438,9 @@ class LLMClient:
             self.notice = (f"⚠ 你选择的模型不可用（{last_err}），已自动改用其它模型继续。"
                            f"如需严格只用指定模型，请在「设置 → 模型」里把"
                            f"「指定模型失败时」改为「严格模式」。")
+            # ★ v9.18.0（需求 4）：回退前也要作废掉指定模型已经吐出的半截内容
+            if guard:
+                guard.reset_if_needed()
             text = self.chat_auto(messages, enable_search, on_token, timeout, on_reasoning)
             self.switched = True
             self.notice = (f"⚠ 你选择的「{self.asked_label}」不可用（{last_err}），"

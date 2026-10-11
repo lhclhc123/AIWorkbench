@@ -85,7 +85,8 @@ def selftest():
         "agent", "asr", "assistant", "config", "dingtalk", "docread",
         "docwrite", "folders", "hotkey", "knowledge", "llm_client",
         "markdown_render", "mcp_client", "memory", "plan", "scheduler",
-        "security", "skills", "taskman", "team", "themes", "trace",
+        "security", "skills", "taskman", "team", "team_presets",
+        "themes", "trace",
         "tts", "updater", "version", "webcap", "winproc", "worklog",
         "workspace",
     ]

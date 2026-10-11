@@ -4,7 +4,7 @@
 职责边界：只讲"DeepSeek 网页"这件事——探测登录态、把提示词填进输入框、点发送、
 等生成结束、抓答复原文、新建对话、防重复发送。所有 JSON 解析与协议约束都在上层。
 
-⚠️ 本文件是**最易碎**的一层：DeepSeek 一改版，选择器就会失效。
+⚠ 本文件是**最易碎**的一层：DeepSeek 一改版，选择器就会失效。
    全部 DOM 选择器都写成"多候选 + 兜底"，并标注 `TODO(真机核对)`，
    真机验证工具见 `tests/probe_cdp_state.py`。
 """
@@ -13,6 +13,7 @@ import time
 
 from . import errors
 from .cdp_client import CDPClient, CDPError
+from .. import config
 
 
 class WebDriverError(Exception):
@@ -33,7 +34,7 @@ class WebDriverError(Exception):
 # ---------------------------------------------------------------------------
 # 注入脚本版本：页面会常驻旧的 __AWB__，改过选择器后必须靠版本号强制重注入，
 # 否则新代码不生效（真机踩过：只判断 'typeof __AWB__ === object' 会拿到旧脚本）。
-AGENT_VERSION = 8
+AGENT_VERSION = 9
 
 # ★ 版本号只写在这一处（AGENT_VERSION）。脚本里的 `__v` 由 agent_script() 注入，
 #   绝不在 JS 里再写一份字面量 —— 否则 `_ensure_agent()` 的版本校验会永远失败
@@ -219,6 +220,28 @@ JS_AGENT_TEMPLATE = r"""
     try { return document.activeElement === el; } catch (e) { return false; }
   };
 
+  // ★ v9.18.0（需求 1）：把输入框内容**全部选中**，方便紧接着用 CDP 的
+  //   Input.insertText 真实"重敲"一遍 —— 覆盖"JS 塞进去的值没同步进 React 内部
+  //   状态、于是发送键一直禁用、点它和按回车都没反应"这种最阴的情况。
+  AWB.selectAllComposer = () => {
+    const el = AWB.findComposer();
+    if (!el) { return false; }
+    try { el.focus(); } catch (e) {}
+    const tag = (el.tagName || '').toUpperCase();
+    try {
+      if (tag === 'TEXTAREA' || tag === 'INPUT') {
+        el.select();
+      } else {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      return true;
+    } catch (e) { return false; }
+  };
+
   // ↓↓↓ 停止按钮选择器候选（用于判断"正在生成"）
   // 策略：① 明确的停止按钮（aria-label/data-testid/class 含 stop）；
   //       ② 生成中发送位变成"停止"——圆形按钮里换成方形图标（<rect>）。
@@ -260,7 +283,7 @@ JS_AGENT_TEMPLATE = r"""
   // 真机核对(2026-10-01)：有真实回答时，助手正文容器 class 是
   //   div.ds-markdown.ds-assistant-message-main-content（末条 = 最新答复）；
   //   段落级子元素是 *.ds-markdown-paragraph（必须排除，否则只会取到其中一段）。
-  //   ⚠️ 页面底部的「智能搜索」是 ds-toggle-button（**不是**答复）；
+  //   ⚠ 页面底部的「智能搜索」是 ds-toggle-button（**不是**答复）；
   //   旧的结构兜底会把它当答复返回（"极短提示"那轮实测拿到 '智能搜索'），
   //   故这里：① 优先精确类名；② 结构兜底显式排除控件与 UI 文案。 ↓↓↓
   // DeepSeek 页面底部的免责声明。真机实测：整页 innerText 里确实有这句
@@ -497,6 +520,54 @@ def _looks_complete(text):
     return False
 
 
+# ---------------------------------------------------------------------------
+# ★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
+# 把"这一拍该发什么增量"抽成**纯函数**，方便单独测。
+#
+# 背景：客户端（界面）是边收增量边往后拼的，它没有"撤回"能力。
+#   正常情况网页的答复文本是**往后追加**的（新文本以旧文本开头），此时
+#   "新增的那一截" = 新文本去掉旧前缀 —— 直接切一刀就行。
+#   但网页偶尔会**把整段答复重写**（换了开头、或把前面替换掉）。这时如果还是
+#   把**整段新文本**当增量发出去，界面就会变成「旧的那半截 + 完整新文本」，
+#   用户看到的就是"内容重复两遍"。
+#   所以这种情况必须先发一个"作废重来"标记（`config.STREAM_RESET`）让界面清空，
+#   再把新全文当增量发；同时清掉 `emitted` 基线，保证收尾对账时
+#   "已发的所有增量拼起来 == 最终文本"这个不变式仍然成立
+#   （否则收尾时会把全文又补发一遍，又是一次重复）。
+# ---------------------------------------------------------------------------
+def compute_delta(text, last_text, emitted, on_progress=None):
+    """算这一拍的增量。
+
+    Args:
+        text: 网页当前看到的答复全文。
+        last_text: 上一次看到的答复全文。
+        emitted: **会被就地修改** —— 已下发增量的列表（供收尾对账用）。
+        on_progress: 回调 `on_progress(delta, reasoning)`；本函数会直接调它。
+
+    Returns:
+        (delta, new_last_text)：delta 为空串 = 这一拍没有新内容。
+    """
+    if not isinstance(text, str):
+        text = ""
+    if not isinstance(last_text, str):
+        last_text = ""
+    if text == last_text:
+        return "", last_text
+
+    if text.startswith(last_text):
+        delta = text[len(last_text):]
+    else:
+        if emitted and on_progress:
+            on_progress(config.STREAM_RESET, "")
+        emitted.clear()
+        delta = text
+
+    if delta and on_progress:
+        on_progress(delta, "")
+        emitted.append(delta)
+    return delta, text
+
+
 class WebDriver:
     """DeepSeek 网页的状态机与操作入口。"""
 
@@ -513,10 +584,13 @@ class WebDriver:
 
     # 点了发送之后，留给"发送键由禁用变可用"的时间上限（秒）。
     # React 状态更新是异步的，实测 setComposer 之后按钮会先保持禁用一小会儿。
-    SEND_READY_SECONDS = 3.0
+    # ★ v9.18.0：3.0 -> 6.0。机器忙 / 网页卡顿时 3 秒有时不够，导致误判"没就绪"
+    #   而走了补发路径（用户报的"有时候消息发不过去"）。
+    SEND_READY_SECONDS = 6.0
 
     # 触发发送后，验证"网页真的接受了"的时间上限（秒）。
-    # 超时未确认 -> 判定这次触发没生效 -> 才允许用真键盘 Enter 补一次（最多补一次）。
+    # 超时未确认 -> 判定这次触发没生效 -> 才允许继续换下一招（真键盘 Enter /
+    # CDP 真实输入重敲）。每一步都以"未确认"为前提，因此不会重复发送。
     SEND_CONFIRM_SECONDS = 5.0
 
     # 页面级防重发标记的"过期时间"（毫秒）。超过则视为陈旧标记，允许重新发送，
@@ -671,6 +745,50 @@ class WebDriver:
             raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED,
                                   f"无法新建网页对话：{exc}")
 
+    # ---------- 网页会话定位（v9.18.0：一个工作台对话 = 一个网页会话）----------
+    def session_url(self):
+        """当前所在的 DeepSeek 会话 URL（形如 .../a/chat/s/<id>）。
+
+        还在首页（没进任何会话）时返回 "" —— 首页不是一个可复用的会话。
+        """
+        if self.cdp is None:
+            return ""
+        try:
+            href = str(self._js("window.__AWB__.pageHref()") or "")
+        except Exception:
+            return ""
+        if "/a/chat/s/" not in href:
+            return ""
+        return href.split("#", 1)[0].split("?", 1)[0]
+
+    def resume_session(self, url, wait=15.0):
+        """导航回一个**已存在**的网页会话（**绝不新建**）。
+
+        DeepSeek 的会话是按 `/a/chat/s/<id>` 持久化的，直接导航回去就能拿到
+        完整历史 —— 这是"切回旧对话"时不新建会话的关键。
+
+        Returns: True 表示确实回到了该会话且输入框可用。
+        """
+        url = str(url or "").strip()
+        if not url or self.cdp is None:
+            return False
+        cur = self.session_url()
+        if cur and cur.rstrip("/") == url.rstrip("/"):
+            return True
+        try:
+            self.open_page(url, wait=wait)
+        except WebDriverError:
+            return False
+        # 校验：真的落在那个会话里，且输入框可用（否则让调用方去走新建兜底）
+        try:
+            st = self._read_state()
+        except Exception:
+            return False
+        if not st.get("composer"):
+            return False
+        now = self.session_url()
+        return bool(now) and now.rstrip("/") == url.rstrip("/")
+
     def stop_generation(self):
         """点「停止生成」（失败静默）。"""
         if self.cdp is None:
@@ -823,6 +941,35 @@ class WebDriver:
             self._logf("warn", f"真键盘 Enter 发送失败：{exc}")
             return False
 
+    def _retype_via_cdp(self, text):
+        """用 CDP 的真实输入管线把内容**重新敲**进输入框（v9.18.0，需求 1）。
+
+        为什么需要这一层：我们是用 JS 直接给 contenteditable 塞 innerHTML、再派发
+        一个**合成** input 事件，React **有时**不会把它同步进内部 state —— 表现就是
+        输入框里明明有字，但发送键一直停在 disabled，点它、按回车都没反应
+        （用户报的「有的时候还是消息发不过去，或者只是停留在对话框里」）。
+
+        `Input.insertText` 走的是浏览器真实输入管线（isTrusted=true），React 必然
+        收到 input 事件 —— 这是"字在框里却发不出去"最硬的一条兜底。
+        """
+        if self.cdp is None:
+            return False
+        try:
+            self._js("window.__AWB__.selectAllComposer()")
+        except WebDriverError:
+            pass
+        try:
+            # insertText 会替换当前选区；上面已全选，等于"清空重敲"
+            self.cdp.call("Input.insertText", {"text": str(text)}, timeout=20)
+            got = str(self._js("window.__AWB__.composerText()") or "")
+            if not got.strip():
+                return False
+            self._logf("info", f"真实输入重敲完成，输入框现有 {len(got)} 字")
+            return True
+        except (CDPError, WebDriverError) as exc:
+            self._logf("warn", f"真实输入重敲失败：{exc}")
+            return False
+
     # ---------- 主流程：提交一轮 ----------
     def submit(self, prompt_text, *, on_progress=None,
                ack_timeout=12.0, answer_timeout=300.0, dedupe_key=None):
@@ -898,16 +1045,27 @@ class WebDriver:
         #    这时候点它 = 空点击。旧版（v9.14.1）没等这一步，于是出现
         #    「字在输入框里、网页没发出去、12 秒后报超时」。
         base_cnt = int(baseline_count or 0)
-        send_state = "missing"
-        deadline = time.time() + float(self.SEND_READY_SECONDS)
-        while time.time() < deadline:
-            try:
-                send_state = str(self._js("window.__AWB__.sendState()") or "missing")
-            except WebDriverError:
-                send_state = "missing"
-            if send_state == "ready":
-                break
-            time.sleep(0.2)
+
+        def _wait_ready():
+            state = "missing"
+            deadline = time.time() + float(self.SEND_READY_SECONDS)
+            while time.time() < deadline:
+                try:
+                    state = str(self._js("window.__AWB__.sendState()") or "missing")
+                except WebDriverError:
+                    state = "missing"
+                if state == "ready":
+                    break
+                time.sleep(0.2)
+            return state
+
+        def _confirm():
+            return self._confirm_sent(self.SEND_CONFIRM_SECONDS,
+                                      baseline_count=base_cnt,
+                                      baseline_text=baseline_text,
+                                      baseline_href=baseline_href)
+
+        send_state = _wait_ready()
         if send_state == "no-composer":
             raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED, "找不到网页输入框")
 
@@ -919,17 +1077,27 @@ class WebDriver:
         # ③.2 发送确认：真发出去了一定会出现
         #      「输入框被清空 / 出现停止键 / 多出答复块 / 答复文本变了」之一。
         #      全都没出现 -> 上一次触发**确定没生效**（不存在"其实发出去了"的可能），
-        #      这时才用 CDP 真键盘事件补一次 Enter —— 所以不会造成重复提问。
-        confirmed = self._confirm_sent(self.SEND_CONFIRM_SECONDS,
-                                       baseline_count=base_cnt, baseline_text=baseline_text,
-                                       baseline_href=baseline_href)
+        #      这时才继续换下一招 —— 所以不会造成重复提问。
+        confirmed = _confirm()
+
+        # ★ v9.18.0（需求 1）：三道兜底，每一步都以"上一步确认失败"为**唯一前提**。
+        #   1) 真键盘 Enter；2) CDP 真实输入重敲（治 React 没同步）；
+        #   3) 重敲后再点一次 + 再回车。全程由 `_confirm_sent` 把重复发送挡死。
         if not confirmed:
             self._logf("warn", "点击发送未生效（网页没反应），改用真键盘 Enter 补发一次")
             if self._press_enter_real():
-                confirmed = self._confirm_sent(self.SEND_CONFIRM_SECONDS,
-                                               baseline_count=base_cnt,
-                                               baseline_text=baseline_text,
-                                               baseline_href=baseline_href)
+                confirmed = _confirm()
+        if not confirmed:
+            self._logf("warn", "真键盘 Enter 也没生效 —— 判定 JS 写入未同步进 React，"
+                               "改用 CDP 真实输入重敲输入框内容")
+            if self._retype_via_cdp(prompt_text):
+                st2 = _wait_ready()
+                self._logf("info", f"重敲后发送键状态={st2}")
+                self._js("window.__AWB__.clickSend()")
+                confirmed = _confirm()
+                if not confirmed:
+                    self._press_enter_real()
+                    confirmed = _confirm()
         if not confirmed:
             # ★ 绝不假成功：如实上报"字还在输入框里"，并给用户可执行的出路。
             raise WebDriverError(
@@ -1007,14 +1175,8 @@ class WebDriver:
 
             # ---- 活动检测：答复文本 / 答复块数 / 页面正文长度 任一变化 = 有增量 ----
             if text != last_text:
-                if isinstance(text, str) and isinstance(last_text, str) and text.startswith(last_text):
-                    delta = text[len(last_text):]
-                else:
-                    delta = text if isinstance(text, str) else ""
+                compute_delta(text, last_text, emitted, on_progress)
                 last_text = text if isinstance(text, str) else ""
-                if on_progress and delta:
-                    on_progress(delta, "")
-                    emitted.append(delta)
                 last_text_change = time.time()
                 last_activity = time.time()
             if cnt != last_cnt:

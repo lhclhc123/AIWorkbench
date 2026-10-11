@@ -648,7 +648,7 @@ def form_batch(url, field, values=None, values_from=None, extra=None,
     if saved:
         lines.append(f"结果已保存：{saved}（{size} 字节）")
     else:
-        lines.append("⚠️ 没有落盘文件（未指定 save_path）")
+        lines.append("⚠ 没有落盘文件（未指定 save_path）")
 
     # 结果表（给模型看前 60 行）
     cols = [label] + keys
@@ -662,7 +662,7 @@ def form_batch(url, field, values=None, values_from=None, extra=None,
         lines.append(f"…（共 {len(rows)} 行，完整内容在落盘文件里）")
     if blocked:
         lines.append("")
-        lines.append("⚠️ " + blocked)
+        lines.append("⚠ " + blocked)
     if fails:
         lines.append("")
         lines.append("失败明细（前 15 条）：")
@@ -929,7 +929,7 @@ def _fmt_gh_search(data, kind):
     lines = [f"[成功] 搜索到 {len(data)} 条（{kind}）："]
     for it in data[:20]:
         if kind == "repos":
-            lines.append(f"· {it.get('fullName')}  ⭐{it.get('stargazersCount')}  "
+            lines.append(f"· {it.get('fullName')}  ★{it.get('stargazersCount')}  "
                          f"[{it.get('language') or '?'}]  {it.get('url')}")
             if it.get("description"):
                 lines.append(f"    {it['description'][:120]}")
@@ -949,7 +949,7 @@ def _fmt_gh_contents(repo, data, path, ref):
         lines = [f"[成功] {repo}/{(path or '')}（{ref or '默认分支'}）共 "
                  f"{len(data)} 项："]
         for it in data:
-            icon = "📁" if it.get("type") == "dir" else "📄"
+            icon = "▰" if it.get("type") == "dir" else "▭"
             size = it.get("size") or 0
             lines.append(f"{icon} {it.get('name')}"
                          + (f"  （{size} B）" if it.get("type") == "file" else ""))
@@ -1033,3 +1033,226 @@ def _http_github_search(query, kind, limit, token, timeout, prev_err):
 def _urlq(s):
     from urllib.parse import quote
     return quote(s, safe="")
+
+
+# --------------------------------------------------------------------------
+# 工具三：web_search —— 关键词定向网页搜索（v9.18.0）
+# --------------------------------------------------------------------------
+# 为什么模型自己搜不了：它只能看到工具返回的**文本**。所以这里必须自己抓搜索引擎
+# 结果页、自己解析，再拼成**结构化中文**喂回去（绝不要甩原始 JSON / HTML 回去）。
+# Bing / 百度 / DuckDuckGo 三个引擎互为备份：一个挂了自动换下一个；全挂了就老实说
+# "搜不到"，**不抛异常**。
+_SEARCH_ENGINES = ("bing", "baidu", "duckduckgo")
+
+_SEARCH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _search_fetch(url, timeout=20):
+    """抓搜索结果页的 HTML。
+
+    刻意抽成一个**独立函数**：回归用例把它替换掉，就能在不联网的情况下断言
+    "site: 有没有真的拼进请求 URL"。
+    """
+    from urllib.parse import urlparse as _up
+    name = "web_search_" + (_up(str(url)).netloc or "x")
+    s = _session(name, headers={"User-Agent": _SEARCH_UA,
+                                "Accept-Language": "zh-CN,zh;q=0.9"})
+    r = s.get(url, timeout=int(timeout), allow_redirects=True)
+    return _text_of(r)
+
+
+def _search_url(engine, query, limit):
+    """把关键词拼成对应引擎的结果页 URL。"""
+    from urllib.parse import urlencode
+    if engine == "baidu":
+        return "https://www.baidu.com/s?" + urlencode(
+            {"wd": query, "rn": int(limit)})
+    if engine == "duckduckgo":
+        return "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
+    return "https://www.bing.com/search?" + urlencode(
+        {"q": query, "count": int(limit)})
+
+
+def _with_site(query, site):
+    """把 ``site:域名`` 拼进查询（已经有了就不重复拼）。"""
+    q = _clean(query)
+    if not site:
+        return q
+    dom = _clean(site).replace("http://", "").replace("https://", "").strip("/")
+    if dom and not re.search(r"\bsite:", q, re.I):
+        q = f"site:{dom} {q}"
+    return q
+
+
+def _parse_search(engine, html, limit):
+    """从搜索结果页抠出 [{title, url, snippet}]。解析不稳时用正则兜底。"""
+    items = []
+    if not html:
+        return items
+    try:
+        soup = _soup(html)
+        if engine == "baidu":
+            for h3 in soup.select("h3"):
+                a = h3.find("a", href=True)
+                if not a:
+                    continue
+                title, href = _clean(a.get_text(" ")), a["href"]
+                if not title or not href.startswith("http"):
+                    continue
+                snip = ""
+                box = h3.find_parent()
+                if box is not None:
+                    node = box.find(class_=re.compile(
+                        "c-abstract|content-right|abstract|summary"))
+                    if node is not None:
+                        snip = _clean(node.get_text(" "))
+                items.append({"title": title, "url": href, "snippet": snip})
+        elif engine == "duckduckgo":
+            for a in soup.select("a.result__a"):
+                title, href = _clean(a.get_text(" ")), (a.get("href") or "")
+                if title and href:
+                    items.append({"title": title, "url": href, "snippet": ""})
+            snips = [_clean(x.get_text(" "))
+                     for x in soup.select(".result__snippet")]
+            for i, it in enumerate(items):
+                if i < len(snips) and snips[i]:
+                    it["snippet"] = snips[i]
+        else:                                   # bing
+            for li in soup.select("li.b_algo"):
+                # 注意：li 里第一个 <a> 是左上角那个 favicon 链接（class="tilk"，
+                # 文本只有域名），真正的标题在 <h2><a> 里 —— 这一点踩过坑。
+                a = li.select_one("h2 a") or li.find("a", href=True)
+                if not a:
+                    continue
+                title, href = _clean(a.get_text(" ")), a["href"]
+                if not title or not href.startswith("http"):
+                    continue
+                p = li.find("p")
+                items.append({"title": title, "url": href,
+                              "snippet": _clean(p.get_text(" ")) if p else ""})
+    except Exception:
+        items = []
+
+    if not items:                               # 兜底：直接抓所有像结果的 <a>
+        for m in re.finditer(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                             html, re.I | re.S):
+            title = _clean(re.sub(r"<[^>]+>", "", m.group(2)))
+            if len(title) < 4:
+                continue
+            items.append({"title": title, "url": m.group(1), "snippet": ""})
+            if len(items) >= int(limit) * 3:
+                break
+
+    out, seen = [], set()
+    for it in items:
+        u, t = (it.get("url") or ""), (it.get("title") or "")
+        if not u.startswith("http") or not t:
+            continue
+        if (u, t) in seen:
+            continue
+        seen.add((u, t))
+        out.append(it)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def _format_results(query, engine, items):
+    lines = [f"搜索「{query}」——引擎：{engine}，共 {len(items)} 条", ""]
+    for i, it in enumerate(items, 1):
+        lines.append(f"第 {i} 条：")
+        lines.append(f"标题：{it.get('title') or '(无标题)'}")
+        lines.append(f"链接：{it.get('url') or ''}")
+        lines.append(f"摘要：{it.get('snippet') or '(无摘要)'}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def web_search(query, *, site=None, engine="auto", limit=10, timeout=20):
+    """关键词定向网页搜索，返回**结构化中文文本**（不是 JSON）。
+
+    · ``site="zhihu.com"`` 会把 ``site:zhihu.com`` 拼进查询，做站内定向搜索；
+    · ``engine`` 可指定 ``bing`` / ``baidu`` / ``duckduckgo``，默认 ``auto``（依次试）；
+    · 单引擎失败自动换下一个；全失败返回中文说明，**不抛异常**。
+    """
+    q = _with_site(query, site)
+    if not q:
+        return "[错误] 搜索关键词为空。"
+    eng = (engine or "auto").strip().lower()
+    order = _SEARCH_ENGINES if eng in ("auto", "", "any") else (eng,)
+    limit = max(1, min(int(limit or 10), 30))
+
+    tried = []
+    for e in order:
+        try:
+            url = _search_url(e, q, limit)
+        except Exception as ex:
+            tried.append(f"{e}（拼接 URL 失败：{ex}）")
+            continue
+        try:
+            html = _search_fetch(url, timeout)
+        except Exception as ex:
+            tried.append(f"{e}（请求失败：{type(ex).__name__}: {ex}）")
+            continue
+        items = _parse_search(e, html, limit)
+        if items:
+            return _format_results(q, e, items)
+        tried.append(f"{e}（没解析到结果，可能被反爬或页面改版）")
+
+    return ("搜索失败：所有引擎都没拿到结果。\n"
+            + "\n".join("· " + t for t in tried)
+            + "\n（可换个关键词、或稍后重试；也可用 web_scrape 直接抓具体网址。）")
+
+
+def web_search_multi(queries, *, site=None, limit=6):
+    """多关键词批量搜索：逐个搜、按「域名 + 标题」去重后合并成一份结果。"""
+    if isinstance(queries, str):
+        qs = [x for x in re.split(r"[\n,，、;；]+", queries) if x.strip()]
+    else:
+        qs = [str(x) for x in (queries or []) if str(x).strip()]
+    if not qs:
+        return "[错误] 没有可搜索的关键词。"
+    limit = max(1, min(int(limit or 6), 20))
+
+    merged, seen, notes = [], set(), []
+    for q in qs:
+        full = _with_site(q, site)
+        got = None
+        for e in _SEARCH_ENGINES:
+            try:
+                html = _search_fetch(_search_url(e, full, limit), 20)
+            except Exception:
+                continue
+            items = _parse_search(e, html, limit)
+            if items:
+                got = (e, items)
+                break
+        if not got:
+            notes.append(f"「{q}」没搜到")
+            continue
+        eng, items = got
+        for it in items:
+            dom = urlparse(it.get("url") or "").netloc.lower()
+            key = (dom, _clean(it.get("title")))
+            if key in seen:
+                continue
+            seen.add(key)
+            row = dict(it)
+            row["_query"], row["_engine"] = q, eng
+            merged.append(row)
+
+    if not merged:
+        return "多关键词搜索：一条结果都没拿到。" + (
+            "（" + "；".join(notes) + "）" if notes else "")
+
+    lines = [f"多关键词搜索：共 {len(merged)} 条（已按域名+标题去重）", ""]
+    for i, it in enumerate(merged, 1):
+        lines.append(f"第 {i} 条：（关键词：{it['_query']}｜引擎：{it['_engine']}）")
+        lines.append(f"标题：{it.get('title') or '(无标题)'}")
+        lines.append(f"链接：{it.get('url') or ''}")
+        lines.append(f"摘要：{it.get('snippet') or '(无摘要)'}")
+        lines.append("")
+    if notes:
+        lines.append("未命中：" + "；".join(notes))
+    return "\n".join(lines).strip()
