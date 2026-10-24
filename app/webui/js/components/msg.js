@@ -73,6 +73,10 @@ class MsgBubble extends HTMLElement {
     this._timeEl.textContent = this._time;
     this._metaEl.textContent = this._meta;
     if (this._text) this._body.textContent = this._text;
+    // ★ v9.21.1 修复：assistant 历史消息用 html setter 存了 markdown 渲染结果，
+    //   但 connect 前 _built=false，setter 直接 return 没写进 body；这里必须补写，
+    //   否则历史 assistant 消息正文永远是空的（空壳 bug 的一环）。
+    if (this._html) this._body.innerHTML = this._html;
   }
 
   get role() { return this._role; }

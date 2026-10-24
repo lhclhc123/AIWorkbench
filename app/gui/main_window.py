@@ -1355,6 +1355,7 @@ class MainWindow(QMainWindow):
         bridge.cmd_set_theme.connect(self._web_set_theme)
         bridge.cmd_new_conv.connect(self._new_conversation)
         bridge.cmd_select_conv.connect(self._web_select_conv)
+        bridge.cmd_ready.connect(self._web_push_init)   # 前端连接成功后才推 init
         return view
 
     def _swap_in_web_page(self):
@@ -1381,7 +1382,8 @@ class MainWindow(QMainWindow):
         """
         if self._web_bridge is not None:
             self._web_bridge.attach(view.page())
-            self._web_push_init()
+            # ★ v9.21.1：不再在这里 push init —— 前端连接成功后会上行 ready，
+            #   由 cmd_ready 触发 _web_push_init。否则前端还没 onEvent 就丢了 init。
 
     def _web_push_init(self):
         """把初始状态推给网页：主题 / 会话列表 / 模型列表。"""
@@ -1397,11 +1399,23 @@ class MainWindow(QMainWindow):
                     "preview": c.get("preview", ""),
                     "time": c.get("time", ""),
                 })
+            # ★ v9.21.0 修复：模型列表必须推给网页，否则「换模型」菜单是空的。
+            #   前端 renderModelMenu 读 {label, choice}；这里对齐 _fill_model_combo 的
+            #   顺序：先 [自动] 免费优先，再按 all_models_sorted 逐个（含 免费/付费 徽标）。
+            models = [{"label": "[自动] 免费优先", "choice": "auto"}]
+            for m in config.all_models_sorted():
+                badge = "[免费]" if m.get("free") else "[付费]"
+                vision = " · 看图" if m.get("vision") else ""
+                models.append({
+                    "label": f"{badge} {m['name']}{vision}",
+                    "choice": m.get("choice", m.get("id", "")),
+                })
             self._web_bridge.send_init({
                 "theme": theme,
                 "convs": convs,
                 "currentConvId": self._conv_cid(),
                 "selectedModel": str(self.settings.get("selected_model", "auto")),
+                "models": models,
             })
         except Exception:
             pass
@@ -1439,12 +1453,30 @@ class MainWindow(QMainWindow):
         conv_id = (conv_id or "").strip()
         if not conv_id:
             return
-        # 在会话列表里找到对应 item，复用 _on_conv_selected 选中逻辑
+        # 优先复用 Qt 列表项选中逻辑（会顺带做 sanitize / set_current / 团队同步等）
         for i in range(self.conv_list.count()):
             item = self.conv_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == conv_id:
                 self._on_conv_selected(item)
                 return
+        # 兜底：列表里没找到（例如刚新建还没刷新）→ 直接按 id 加载并切过去
+        conv = self.workspace.load_conversation(conv_id)
+        if not conv:
+            return
+        self.conv = conv
+        try:
+            self.workspace.set_current(conv_id)
+        except Exception:
+            pass
+        self._sync_team_bar()
+        self._refresh_run_ui()
+        self._update_page_title()
+        self._load_conversations()
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_messages({
+                "convId": conv_id,
+                "messages": self._web_conv_messages(conv_id),
+            })
 
     def _web_conv_messages(self, cid=None):
         """把 cid 对话的消息列表转成网页渲染用的格式。

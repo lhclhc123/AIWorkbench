@@ -42,11 +42,7 @@ function wireShell() {
   });
 
   newConvBtn.addEventListener('click', () => {
-    // 新建对话上行命令暂不在契约内，预留：call('new_conv')
-    const toast = $('#toast');
-    toast.textContent = '新建对话暂未接入';
-    toast.classList.add('show');
-    setTimeout(() => toast.classList.remove('show'), 1500);
+    call('new_conv', {});
   });
 }
 

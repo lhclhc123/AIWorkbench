@@ -15,43 +15,54 @@
 'use strict';
 
 const OBJECT_NAME = 'awb';
-const READY_TIMEOUT = 3000;
+// 等待 transport 就绪的最大时长（毫秒）。后端 attach 在 loadFinished 后，
+// 正常几十 ms；软件渲染下 loadFinished 更慢，留足余量。
+const WAIT_TIMEOUT = 5000;
 
 export function connect() {
   return new Promise((resolve) => {
-    if (!window.qt || !window.qt.webChannelTransport || !window.QWebChannel) {
-      console.warn('[transport] 未检测到 QWebChannel，进入离线演示模式');
-      resolve(null);
-      return;
-    }
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      console.error('[transport] QWebChannel 连接超时（%dms）', READY_TIMEOUT);
-      resolve(null);
-    }, READY_TIMEOUT);
+    // ★ v9.21.1 修复：后端在 loadFinished 之后才 setWebChannel，
+    //   但前端 module 脚本往往更早执行 —— 此刻 window.qt / webChannelTransport
+    //   可能还不存在。老代码一上来就 resolve(null) 进离线模式，且 bridge.start()
+    //   的 started 标志一旦置位就再也不重连 → 网页永远收不到下行事件（空壳）。
+    //   现在改成「轮询等待 transport 就绪」，最多等 WAIT_TIMEOUT 毫秒，期间
+    //   每 50ms 探测一次；等到就连接，等不到才放弃进离线模式。
+    const startTs = Date.now();
 
-    try {
-      new window.QWebChannel(window.qt.webChannelTransport, (channel) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const remote = pickRemote(channel);
-        if (!remote) {
-          console.error('[transport] QWebChannel 未注册任何桥对象');
+    function attempt() {
+      if (window.qt && window.qt.webChannelTransport && window.QWebChannel) {
+        try {
+          new window.QWebChannel(window.qt.webChannelTransport, (channel) => {
+            const remote = pickRemote(channel);
+            if (!remote) {
+              // 对象还没注册（attach 未完成）：等 50ms 再试，直到超时
+              if (Date.now() - startTs >= WAIT_TIMEOUT) {
+                console.error('[transport] QWebChannel 未注册任何桥对象');
+                resolve(null);
+                return;
+              }
+              setTimeout(attempt, 50);
+              return;
+            }
+            resolve(createTransport(remote));
+          });
+          return;
+        } catch (e) {
+          console.error('[transport] QWebChannel 初始化失败', e);
           resolve(null);
           return;
         }
-        resolve(createTransport(remote));
-      });
-    } catch (e) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      console.error('[transport] QWebChannel 初始化失败', e);
-      resolve(null);
+      }
+      // transport 还没就绪：等 50ms 再试
+      if (Date.now() - startTs >= WAIT_TIMEOUT) {
+        console.warn('[transport] 未检测到 QWebChannel，进入离线演示模式');
+        resolve(null);
+        return;
+      }
+      setTimeout(attempt, 50);
     }
+
+    attempt();
   });
 }
 

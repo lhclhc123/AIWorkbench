@@ -32,7 +32,13 @@ export async function start() {
   if (started) return;
   started = true;
   const t = await ensure();
-  if (t) t.onEvent(dispatch);
+  if (t) {
+    t.onEvent(dispatch);
+    // ★ v9.21.1 修复：连接成功后主动向上行发 ready，让后端在收到 ready 后
+    //   再 push init（含模型/会话列表）。否则后端在 loadFinished 时盲推 init，
+    //   前端还没 onEvent 就丢掉了 → 网页拿不到初始状态（空壳）。
+    t.invoke('ready', {});
+  }
   return t;
 }
 

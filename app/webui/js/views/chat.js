@@ -220,7 +220,7 @@ function renderConvList() {
       convList.querySelectorAll('.conv').forEach((x) => x.classList.remove('is-active'));
       btn.classList.add('is-active');
       patch({ currentConvId: c.id });
-      // 会话切换上行命令暂不在契约内，预留：call('select_conv', { id: c.id })
+      call('select_conv', { convId: c.id });
     });
     convList.appendChild(btn);
   }

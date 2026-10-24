@@ -58,6 +58,7 @@ class WebUIBridge(QObject):
     cmd_set_theme = pyqtSignal(str)     # set_theme("light"/"dark")
     cmd_new_conv = pyqtSignal()         # new_conv()
     cmd_select_conv = pyqtSignal(str)   # select_conv(convId)
+    cmd_ready = pyqtSignal()            # ready() —— 前端连接成功后主动上报
 
     def __init__(self, view):
         super().__init__()
@@ -105,6 +106,8 @@ class WebUIBridge(QObject):
             self.cmd_new_conv.emit()
         elif name == "select_conv":
             self.cmd_select_conv.emit(str(args.get("convId", "")))
+        elif name == "ready":
+            self.cmd_ready.emit()
 
     # ------------------------------------------------------------------
     # 下行：Python -> 网页。
@@ -140,21 +143,21 @@ class WebUIBridge(QObject):
             self._ensure_flush()
 
     def send_tool_start(self, text):
-        self.emit_event("tool_start", text)
+        self.emit_event("tool_start", {"text": text})
 
     def send_tool_result(self, text):
-        self.emit_event("tool_result", text)
+        self.emit_event("tool_result", {"text": text})
 
     def send_phase(self, kind, detail):
         self.emit_event("phase", {"kind": kind, "detail": detail})
 
     def send_finished(self, messages):
         self._flush()                       # 先清空缓冲，保证 token 不丢
-        self.emit_event("finished", messages)
+        self.emit_event("finished", {"messages": messages})
 
     def send_error(self, msg):
         self._flush()
-        self.emit_event("error", msg)
+        self.emit_event("error", {"message": msg})
 
     def send_attachments(self, files):
         self.emit_event("attachments", files)
@@ -173,10 +176,10 @@ class WebUIBridge(QObject):
         """把累计的 token / reason 一次性派发，并停掉定时器。"""
         try:
             if self._token_buf:
-                self.emit_event("token", "".join(self._token_buf))
+                self.emit_event("token", {"delta": "".join(self._token_buf)})
                 self._token_buf = []
             if self._reason_buf:
-                self.emit_event("reason", "".join(self._reason_buf))
+                self.emit_event("reason", {"delta": "".join(self._reason_buf)})
                 self._reason_buf = []
         finally:
             self._flush_timer.stop()
