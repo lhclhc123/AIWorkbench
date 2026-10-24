@@ -31,6 +31,9 @@
     主程序若想启用抓包，需保证 ``app.webengine`` / ``app.gui.browser_page`` 在
     ``QApplication(...)`` 之前被导入。
   · ``QApplication([])``（空参数）之后装拦截器同样会崩，必须给个占位 ``argv[0]``。
+    ★ v9.19 又定位到它的另一半：**空 argv 连"建 QWebEngineProfile"都会静默 exit 127**
+    （无栈、无 stderr、无任何提示，最容易误判成"命名 profile 不能用"）。凡是脚本 /
+    自检路径自建 QApplication，一律写 ``QApplication([sys.argv[0] or "AIWorkbench"])``。
   · 不能用无痕 Profile ``QWebEngineProfile()``（一建就崩），拦截器只能挂默认 Profile。
   · 拦截器必须**先装、后建 view**；默认 Profile 上一旦有页面在跑，再挂就崩。
   · Chromium 渲染沙箱在本机起不来，不加 ``--no-sandbox`` 则所有页面 ``loadFinished``
@@ -48,8 +51,50 @@ import threading
 #   · --no-sandbox         Chromium 的渲染沙箱在本机环境起不来，不加则每个页面
 #                          loadFinished 都是 False（渲染进程一启动就被干掉）。
 #   · --disable-gpu        离屏渲染不需要 GPU，关掉能少一堆显卡驱动相关的白屏/崩溃。
+# 另外三个是 v9.18.0 内嵌 DeepSeek 宿主加的：内嵌页面以
+# WA_DontShowOnScreen 的形式常驻后台，默认会被 Chromium 判为"被遮挡/后台"而降频，
+# 定时器被节流后输入框的防抖、流式回答的轮询都会变慢，所以全部关掉。
 # 用户可用环境变量 QTWEBENGINE_CHROMIUM_FLAGS 覆盖这里的默认值。
-os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox")
+os.environ.setdefault(
+    "QTWEBENGINE_CHROMIUM_FLAGS",
+    "--disable-gpu --no-sandbox "
+    "--disable-background-timer-throttling "
+    "--disable-renderer-backgrounding "
+    "--disable-backgrounding-occluded-windows")
+
+# --------------------------------------------------------------------------
+# CDP 远程调试口（v9.18.0 内嵌浏览器宿主）
+# --------------------------------------------------------------------------
+# ★ 端口常量的**唯一来源**就是这里。main.py 在导入任何 GUI 模块之前调用
+#   ``enable_remote_debugging()``；QtWebEngine 只在 QApplication 创建时才启动
+#   Chromium，所以只要在那之前设好环境变量，``http://127.0.0.1:<port>/json``
+#   就会暴露标准 CDP，``deepseek_web/embedded.py`` 直接拿这个端口去连。
+REMOTE_DEBUG_PORT = 9333
+
+
+def enable_remote_debugging(port=None):
+    """打开 QtWebEngine 的 CDP 调试口；返回最终生效的端口。
+
+    必须在 QApplication / Chromium 启动**之前**调用（main.py 顶部已调用）。
+    若外部已用 ``QTWEBENGINE_REMOTE_DEBUGGING`` 指定了别的端口，以外部为准。
+    """
+    global REMOTE_DEBUG_PORT
+    if port is not None:
+        REMOTE_DEBUG_PORT = int(port)
+    os.environ.setdefault("QTWEBENGINE_REMOTE_DEBUGGING", str(int(REMOTE_DEBUG_PORT)))
+    try:
+        REMOTE_DEBUG_PORT = int(os.environ["QTWEBENGINE_REMOTE_DEBUGGING"])
+    except Exception:
+        pass
+    return REMOTE_DEBUG_PORT
+
+
+def remote_debug_port():
+    """当前生效的 CDP 端口（供 deepseek_web 使用）。"""
+    try:
+        return int(os.environ.get("QTWEBENGINE_REMOTE_DEBUGGING") or REMOTE_DEBUG_PORT)
+    except Exception:
+        return int(REMOTE_DEBUG_PORT)
 
 # 记录"导入本模块时是不是已经有 QApplication 了"。QtWebEngine 有一条硬规则：
 # 它必须在 QApplication **之前**导入。若已经晚了，渲染还能用，但再往默认 Profile

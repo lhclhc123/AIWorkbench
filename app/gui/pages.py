@@ -527,236 +527,877 @@ def _key_hint(provider_name):
 # ===========================================================================
 # 助理（钉钉消息 -> AI 处理 -> 结果发回钉钉）
 # ===========================================================================
-class AssistantPage(QWidget):
-    """盯住钉钉里发过来的消息：显示、交给 AI 处理、把最终结果发回钉钉。"""
+# 「删除」按钮一律红色（跟主题无关，用户要求显眼）
+DEL_BTN_QSS = (
+    "QPushButton{background:#d93025;color:#ffffff;border:none;border-radius:4px;"
+    "padding:6px 14px;font-weight:600;}"
+    "QPushButton:hover{background:#b3261e;}"
+    "QPushButton:pressed{background:#8c1d18;}"
+    "QPushButton:disabled{background:#9aa0a6;color:#f1f3f4;}")
 
+DEFAULT_UNCERTAIN_TEXT = "消息已纳入收件箱，加急处理中，主人正在赶来的路上，此消息由AI代回"
+
+# 消息状态只可能是这五种
+_IM_STATUS = ("待处理", "处理中", "已回复", "失败", "需人工")
+_IM_STATUS_COLORS = {
+    "处理中": "#d98200",
+    "失败": "#d93025",
+    "需人工": "#8250df",
+    "已回复": "#1a7f37",
+}
+
+
+def _tok():
+    """主题 token（补一个 card 别名，老主题里叫 card_bg）。"""
+    t = dict(themes.tokens())
+    t.setdefault("card", t.get("card_bg") or t.get("panel_bg") or "#ffffff")
+    return t
+
+
+def _spin_set(sp, value, lo, hi):
+    try:
+        sp.setValue(max(int(lo), min(int(hi), int(value))))
+    except Exception:
+        pass
+
+
+class AssistantPage(QWidget):
+    """钉钉助手主界面：左边待回、右边已处理，三标签（消息 / 设置 / 标签）。
+
+    ★ 只负责界面与本地消息表；真正的收发、模型调用、落盘都在 AssistantService
+      和 app/im 里。对外一律走信号，主窗口按信号接线。
+    """
+
+    # —— 老接口（main_window 已在用，签名不能变）——
     toggle = pyqtSignal(bool)          # True=启动，False=停止
-    cfg_saved = pyqtSignal(dict)       # {"interval":int,"scope":str,"auto_reply":bool}
+    cfg_saved = pyqtSignal(dict)       # {"interval":int,"auto_reply":bool}
     process_one = pyqtSignal(str)      # msgid
     process_all = pyqtSignal()
     resend = pyqtSignal(str)           # msgid
     cleared = pyqtSignal()
+    # —— 新接口 ——
+    msgs_deleted = pyqtSignal(list)        # [msgid, ...]
+    im_settings_saved = pyqtSignal(dict)
+    tag_scan = pyqtSignal()
+    tag_saved = pyqtSignal(str, str)       # (cid, tag)
+    manage_requested = pyqtSignal()
+    whitelist_added = pyqtSignal(dict)     # {"id","name","kind"}
+    whitelist_removed = pyqtSignal(str)
+    # ★ v9.20.0：钉钉连接（CLI / 账号 / 会话）—— 用户要求都收进助理的配置里
+    ding_login = pyqtSignal(bool)          # True=设备码登录，False=浏览器扫码
+    ding_refresh_convs = pyqtSignal()
+    ding_test_send = pyqtSignal(str, str)  # (cid, text)
+    # —— IMDialog 原样转发 ——
+    thread_saved = pyqtSignal(dict)
+    task_added = pyqtSignal(dict)
+    task_deleted = pyqtSignal(str)
+    task_toggled = pyqtSignal(str, bool)
+    memory_saved = pyqtSignal(str)
+    refresh_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.msgs = {}                 # msgid -> dict
+        self.msgs = {}                 # msgid -> dict（见 add_message）
+        self._checked = set()          # 勾选中的 msgid
+        self._last_checked = ""        # 最后被勾选的那条
+        self._sig = None               # 上次重建时的指纹（避免白重建）
+        self._log_open = False
+        self._dlg = None
+        self._tag_by_id = {}
+        self._im_extra = {"threads": None, "tasks": None,
+                          "logs": None, "memory": None, "review_fn": None}
+
         v = QVBoxLayout(self)
         v.setContentsMargins(18, 18, 18, 18)
         v.setSpacing(10)
 
-        title = QLabel("⚑ 助理")
+        # ---------- 顶部：标题 + 启停 ----------
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title = QLabel("⚑ 钉钉助手")
         title.setObjectName("PageTitle")
-        v.addWidget(title)
-        tip = QLabel("把消息发到钉钉（最省事：直接发给「你自己」），助理就会在这里显示，"
-                     "自动或手动交给 AI 处理，处理完把<b>最终结果那句话</b>发回钉钉；"
-                     "如果有产出文件（Word / exe / 压缩包），也会直接作为文件发给你。")
-        tip.setWordWrap(True)
-        tip.setObjectName("PageSub")
-        v.addWidget(tip)
-
-        row = QHBoxLayout()
+        head.addWidget(title)
+        head.addStretch(1)
         self.btn_run = QPushButton("▶ 启动助理")
         self.btn_run.setMinimumHeight(34)
         self.btn_run.clicked.connect(self._on_toggle)
         self.lb_state = QLabel("未运行")
         self.lb_state.setObjectName("PageSub")
-        row.addWidget(self.btn_run)
-        row.addWidget(self.lb_state)
+        head.addWidget(self.btn_run)
+        head.addWidget(self.lb_state)
+        v.addLayout(head)
+
+        self.tabs = QTabWidget()
+        v.addWidget(self.tabs, 1)
+        self.tabs.addTab(self._build_msgs_tab(), "消息")
+        self.tabs.addTab(self._build_settings_tab(), "设置")
+        self.tabs.addTab(self._build_tags_tab(), "标签")
+
+        self._rebuild()
+
+    # ==================================================================
+    # 标签①「消息」
+    # ==================================================================
+    def _build_msgs_tab(self):
+        w = QWidget()
+        mv = QVBoxLayout(w)
+        mv.setContentsMargins(10, 10, 10, 10)
+        mv.setSpacing(8)
+
+        sub = QLabel("左边是还没回的消息，右边是已经回过的。勾上左边的方框，"
+                     "再点下面的红色删除键就能删掉。")
+        sub.setObjectName("PageSub")
+        sub.setWordWrap(True)
+        mv.addWidget(sub)
+
+        cols = QHBoxLayout()
+        cols.setSpacing(10)
+        col_l, self._lay_left, self.lb_left = self._make_col("新消息（未回复） 0")
+        col_r, self._lay_right, self.lb_right = self._make_col("已处理 0")
+        cols.addWidget(col_l, 1)
+        cols.addWidget(col_r, 1)
+        mv.addLayout(cols, 1)
+
+        brow = QHBoxLayout()
+        brow.setSpacing(8)
+        self.btn_del = QPushButton("🗑 删除选中")
+        self.btn_del.setStyleSheet(DEL_BTN_QSS)
+        self.btn_del.setEnabled(False)
+        self.btn_del.clicked.connect(self._delete_checked)
+        brow.addWidget(self.btn_del)
+
+        b_all = QPushButton("⟳ 全部交给 AI")
+        b_all.clicked.connect(self.process_all.emit)
+        brow.addWidget(b_all)
+
+        b_more = QPushButton("🗂 更多管理")
+        b_more.clicked.connect(self._on_more)
+        brow.addWidget(b_more)
+
+        brow.addStretch(1)
+        self.btn_log = QPushButton("▸ 运行日志")
+        self.btn_log.setObjectName("cardBtn")
+        self.btn_log.setFixedHeight(28)
+        self.btn_log.clicked.connect(self._toggle_log)
+        brow.addWidget(self.btn_log)
+        mv.addLayout(brow)
+
+        self.logv = QPlainTextEdit()
+        self.logv.setReadOnly(True)
+        self.logv.setMaximumHeight(140)
+        mv.addWidget(self.logv)        # ★ 先 addWidget，再隐藏（否则会弹小窗）
+        self.logv.setVisible(False)
+        return w
+
+    def _make_col(self, title):
+        """一个栏：标题 + 可滚动的卡片容器。"""
+        box = QWidget()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(6)
+
+        lb = QLabel(title)
+        f = lb.font()
+        f.setBold(True)
+        lb.setFont(f)
+        lb.setStyleSheet("color:%s;" % _tok()["text"])
+        bl.addWidget(lb)
+
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(2, 2, 6, 2)
+        il.setSpacing(8)
+        il.addStretch(1)
+        sa.setWidget(inner)
+        bl.addWidget(sa, 1)
+        return box, il, lb
+
+    # ==================================================================
+    # 标签②「设置」—— 最上面是钉钉连接（用户要求 CLI 配置也收进这里）
+    # ==================================================================
+    def _build_ding_group(self):
+        g = QGroupBox("钉钉连接（CLI / 账号 / 会话都在这儿配）")
+        v = QVBoxLayout(g)
+        v.setSpacing(6)
+
+        self.lb_ding = QLabel("正在读取钉钉登录状态…")
+        self.lb_ding.setWordWrap(True)
+        self.lb_ding.setObjectName("PageSub")
+        v.addWidget(self.lb_ding)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        b1 = QPushButton("◎ 扫码授权登录")
+        b1.setToolTip("打开浏览器让钉钉账号授权（dws 个人授权）。")
+        b1.clicked.connect(lambda: self.ding_login.emit(False))
+        b2 = QPushButton("⌨ 设备码登录")
+        b2.setToolTip("浏览器回调被拦时用这个：给一串码，在钉钉里确认即可。")
+        b2.clicked.connect(lambda: self.ding_login.emit(True))
+        b3 = QPushButton("⟳ 刷新会话")
+        b3.setToolTip("重新读一遍钉钉会话列表，填进右边的下拉框")
+        b3.clicked.connect(lambda: self.ding_refresh_convs.emit())
+        for b in (b1, b2, b3):
+            row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
 
-        # 「设置」区做成可折叠，默认收起 —— 把纵向空间让给消息列表。
-        self.settings_toggle = QPushButton("⚙ 设置 ▸")
-        self.settings_toggle.setObjectName("cardBtn")
-        self.settings_toggle.setFixedHeight(28)
-        self.settings_toggle.setCheckable(True)
-        self.settings_toggle.setChecked(False)
-        self.settings_toggle.clicked.connect(self._toggle_settings)
-        srow = QHBoxLayout()
-        srow.addWidget(self.settings_toggle)
-        srow.addStretch(1)
-        v.addLayout(srow)
+        trow = QHBoxLayout()
+        trow.setSpacing(6)
+        trow.addWidget(QLabel("发到："))
+        self.cb_ding_conv = QComboBox()
+        self.cb_ding_conv.setMinimumWidth(200)
+        trow.addWidget(self.cb_ding_conv, 1)
+        self.ed_ding_test = QLineEdit("测试一下，这条是助理发的")
+        trow.addWidget(self.ed_ding_test, 2)
+        b4 = QPushButton("✉ 发测试消息")
+        b4.clicked.connect(self._send_ding_test)
+        trow.addWidget(b4)
+        v.addLayout(trow)
 
-        box = QGroupBox("设置")
-        form = QFormLayout(box)
+        hint = QLabel("换电脑 / 换账号后，先在这里登录 + 刷新会话，助理才读得到消息。"
+                      "更多接口自检和通讯录在「集成 → 钉钉」。")
+        hint.setObjectName("PageSub")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        return g
+
+    def _send_ding_test(self):
+        cid = self.cb_ding_conv.currentData()
+        if not cid:
+            self.log("先点「刷新会话」，选一个会话再发")
+            return
+        text = self.ed_ding_test.text().strip() or "测试消息"
+        self.ding_test_send.emit(str(cid), text)
+        self.log("已请求发送测试消息")
+
+    def set_ding_status(self, text, convs=None):
+        """主窗口回填钉钉登录状态；`convs` 不为 None 时顺便重建会话下拉。"""
+        try:
+            self.lb_ding.setText(str(text or ""))
+        except Exception:
+            pass
+        if convs is None:
+            return
+        try:
+            keep = self.cb_ding_conv.currentData()
+            self.cb_ding_conv.clear()
+            for c in (convs or []):
+                if not isinstance(c, dict):
+                    continue
+                cid = str(c.get("id") or c.get("openConversationId") or "").strip()
+                if not cid:
+                    continue
+                kind = str(c.get("kind") or "group")
+                prefix = "群 · " if kind == "group" else "人 · "
+                self.cb_ding_conv.addItem(prefix + str(c.get("name") or cid), cid)
+            if keep:
+                for i in range(self.cb_ding_conv.count()):
+                    if self.cb_ding_conv.itemData(i) == keep:
+                        self.cb_ding_conv.setCurrentIndex(i)
+                        break
+        except Exception:
+            pass
+
+    def _build_settings_tab(self):
+        inner = QWidget()
+        sv = QVBoxLayout(inner)
+        sv.setContentsMargins(10, 10, 10, 10)
+        sv.setSpacing(10)
+
+        # 0) ★ v9.20.0：钉钉连接（原来散在「集成」页，用户要求都收进助理的配置里）
+        sv.addWidget(self._build_ding_group())
+
+        # 1) 自动回复范围
+        g1 = QGroupBox("自动回复范围")
+        g1v = QVBoxLayout(g1)
+        g1v.setSpacing(6)
+        self.ck_scope_group = QCheckBox("群聊")
+        self.ck_scope_p2p = QCheckBox("单聊")
+        self.ck_scope_at_me = QCheckBox("群里只有 @我 的消息才回")
+        for ck in (self.ck_scope_group, self.ck_scope_p2p, self.ck_scope_at_me):
+            ck.setChecked(True)
+            g1v.addWidget(ck)
+        hint1 = QLabel("不勾的话，群里每一条消息都算")
+        hint1.setObjectName("PageSub")
+        hint1.setWordWrap(True)
+        g1v.addWidget(hint1)
+        sv.addWidget(g1)
+
+        # 2) 白名单
+        g2 = QGroupBox("白名单（这些会话每条消息都回，不受上面的范围限制）")
+        g2v = QVBoxLayout(g2)
+        g2v.setSpacing(6)
+        self.list_wl = QListWidget()
+        self.list_wl.setMaximumHeight(120)
+        g2v.addWidget(self.list_wl)
+        wl_row = QHBoxLayout()
+        wl_row.setSpacing(6)
+        self.ed_wl_name = QLineEdit()
+        self.ed_wl_name.setPlaceholderText("群名 或 对方姓名")
+        wl_row.addWidget(self.ed_wl_name, 1)
+        self.cb_wl_kind = QComboBox()
+        self.cb_wl_kind.addItem("群聊", "group")
+        self.cb_wl_kind.addItem("单聊", "p2p")
+        wl_row.addWidget(self.cb_wl_kind)
+        b_wl_add = QPushButton("＋ 添加")
+        b_wl_add.clicked.connect(self._add_whitelist)
+        wl_row.addWidget(b_wl_add)
+        b_wl_del = QPushButton("🗑 移除选中")
+        b_wl_del.clicked.connect(self._remove_whitelist)
+        wl_row.addWidget(b_wl_del)
+        g2v.addLayout(wl_row)
+        sv.addWidget(g2)
+
+        # 3) 什么时候代我回
+        g3 = QGroupBox("什么时候代我回")
+        g3v = QVBoxLayout(g3)
+        g3v.setSpacing(6)
+        drow = QHBoxLayout()
+        drow.setSpacing(8)
+        self.sp_delay = QSpinBox()
+        self.sp_delay.setRange(0, 3600)
+        self.sp_delay.setSuffix(" 秒")
+        self.sp_delay.setValue(60)
+        drow.addWidget(self.sp_delay)
+        drow.addWidget(QLabel("我多少秒内没自己回，才由 AI 代回；填 0 = 收到就回"))
+        drow.addStretch(1)
+        g3v.addLayout(drow)
+        sv.addWidget(g3)
+
+        # 4) 拿不准的时候
+        g4 = QGroupBox("AI 拿不准的时候")
+        g4v = QVBoxLayout(g4)
+        g4v.setSpacing(6)
+        self.ck_uncertain = QCheckBox("拿不准也要回（回下面这句话）")
+        self.ck_uncertain.setChecked(True)
+        g4v.addWidget(self.ck_uncertain)
+        self.ed_uncertain = QLineEdit(DEFAULT_UNCERTAIN_TEXT)
+        g4v.addWidget(self.ed_uncertain)
+        hint4 = QLabel("不勾就不会瞎猜，那条消息会留在左边并标成「需人工」，等你自己回")
+        hint4.setObjectName("PageSub")
+        hint4.setWordWrap(True)
+        g4v.addWidget(hint4)
+        sv.addWidget(g4)
+
+        # 5) 身份背景
+        g5 = QGroupBox("我的身份背景（AI 替你回消息时会以它为准）")
+        g5v = QVBoxLayout(g5)
+        self.tx_identity = QPlainTextEdit()
+        self.tx_identity.setMinimumHeight(160)
+        self.tx_identity.setPlaceholderText(
+            "例：\n"
+            "我是刘浩辰，初三（2）班班长，荣成三中。\n"
+            "别人一般叫我「浩辰」，不喜欢被叫全名。\n"
+            "最近在准备信息学奥赛，周三下午有课，那会儿回不了消息。\n"
+            "我和张老师关系不错，说话可以随意点；跟班主任要客气。")
+        g5v.addWidget(self.tx_identity)
+        sv.addWidget(g5)
+
+        # 6) 其它
+        g6 = QGroupBox("其它")
+        g6v = QVBoxLayout(g6)
+        g6v.setSpacing(6)
+        irow = QHBoxLayout()
+        irow.setSpacing(8)
+        irow.addWidget(QLabel("检查钉钉新消息的间隔"))
         self.sp_interval = QSpinBox()
         self.sp_interval.setRange(10, 600)
         self.sp_interval.setSuffix(" 秒")
         self.sp_interval.setValue(25)
-        form.addRow("检查间隔：", self.sp_interval)
-
-        self.cb_scope = QComboBox()
-        self.cb_scope.addItem("只听「自己发给自己」的会话（推荐）", "self")
-        self.cb_scope.addItem("群里 @我 的消息", "at_me")
-        self.cb_scope.addItem("所有会话（消息多，慎用）", "all")
-        form.addRow("监听范围：", self.cb_scope)
-
-        self.ck_auto = QCheckBox("处理完自动把结果发回钉钉")
+        irow.addWidget(self.sp_interval)
+        irow.addStretch(1)
+        g6v.addLayout(irow)
+        self.ck_auto = QCheckBox("启用自动回复（关掉只收消息，等你手动点处理）")
         self.ck_auto.setChecked(True)
-        form.addRow(self.ck_auto)
-        save = QPushButton("保存设置")
-        save.clicked.connect(self._save_cfg)
-        form.addRow(save)
-        box.setVisible(False)
-        self.cfg_box = box
-        v.addWidget(box)
+        g6v.addWidget(self.ck_auto)
+        sv.addWidget(g6)
 
-        lrow = QHBoxLayout()
-        b1 = QPushButton("⚙ 处理选中")
-        b1.clicked.connect(lambda: self.process_one.emit(self.selected_msgid()))
-        b2 = QPushButton("⟳ 全部处理")
-        b2.clicked.connect(self.process_all.emit)
-        b3 = QPushButton("⇧ 重发结果到钉钉")
-        b3.clicked.connect(lambda: self.resend.emit(self.selected_msgid()))
-        b4 = QPushButton("⊘ 清空列表")
-        b4.clicked.connect(self._clear)
-        for b in (b1, b2, b3, b4):
-            lrow.addWidget(b)
-        lrow.addStretch(1)
-        v.addLayout(lrow)
+        b_save = QPushButton("💾 保存设置")
+        b_save.clicked.connect(self._emit_settings)
+        sv.addWidget(b_save)
+        sv.addStretch(1)
 
-        # 三段（列表 / 详情 / 日志）用竖向 QSplitter：可拖拽、互不挤压。
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setWidget(inner)
+        return sa
 
-        list_wrap = QWidget()
-        lv = QVBoxLayout(list_wrap)
-        lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(4)
-        lv.addWidget(QLabel("消息列表："))
-        self.list = QListWidget()
-        self.list.setMinimumHeight(200)      # 至少能看全 8 条
-        self.list.itemClicked.connect(self._show_detail)
-        lv.addWidget(self.list, 1)
-        splitter.addWidget(list_wrap)
+    # ==================================================================
+    # 标签③「标签」
+    # ==================================================================
+    def _build_tags_tab(self):
+        w = QWidget()
+        tv = QVBoxLayout(w)
+        tv.setContentsMargins(10, 10, 10, 10)
+        tv.setSpacing(8)
 
-        detail_wrap = QWidget()
-        dv = QVBoxLayout(detail_wrap)
-        dv.setContentsMargins(0, 0, 0, 0)
-        dv.setSpacing(4)
-        dv.addWidget(QLabel("AI 处理结果："))
-        self.detail = QTextBrowser()
-        self.detail.setMinimumHeight(120)
-        dv.addWidget(self.detail, 1)
-        splitter.addWidget(detail_wrap)
+        trow = QHBoxLayout()
+        trow.setSpacing(8)
+        self.lb_scan = QLabel("还没扫描过")
+        self.lb_scan.setObjectName("PageSub")
+        trow.addWidget(self.lb_scan)
+        trow.addStretch(1)
+        b_scan = QPushButton("⟳ 扫描并打标签")
+        b_scan.clicked.connect(self.tag_scan.emit)
+        trow.addWidget(b_scan)
+        tv.addLayout(trow)
 
-        log_wrap = QWidget()
-        gv = QVBoxLayout(log_wrap)
-        gv.setContentsMargins(0, 0, 0, 0)
-        gv.setSpacing(4)
-        gv.addWidget(QLabel("运行日志："))
-        self.logv = QPlainTextEdit()
-        self.logv.setReadOnly(True)
-        self.logv.setMinimumHeight(80)
-        self.logv.setMaximumHeight(180)
-        gv.addWidget(self.logv, 1)
-        splitter.addWidget(log_wrap)
+        hint = QLabel("第一次配好钉钉时点一次，AI 会把你的会话按「群聊 → 单聊 → 最近聊天」"
+                      "过一遍，尽量标出每个人和你的关系。拿不准的会空着，你也可以自己改。")
+        hint.setObjectName("PageSub")
+        hint.setWordWrap(True)
+        tv.addWidget(hint)
 
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 2)
-        splitter.setSizes([300, 240, 140])
-        v.addWidget(splitter, 1)
+        self.list_tags = QListWidget()
+        self.list_tags.currentItemChanged.connect(self._on_tag_selected)
+        tv.addWidget(self.list_tags, 1)
 
-    def _toggle_settings(self, checked=None):
-        """折叠 / 展开「设置」区（默认收起）。"""
-        show = self.settings_toggle.isChecked() if checked is None else bool(checked)
-        self.cfg_box.setVisible(show)
-        self.settings_toggle.setText("⚙ 设置 ▾" if show else "⚙ 设置 ▸")
+        brow = QHBoxLayout()
+        brow.setSpacing(6)
+        self.ed_tag = QLineEdit()
+        self.ed_tag.setPlaceholderText("比如：同班同学 / 班主任 / 妈妈 / 家长群")
+        brow.addWidget(self.ed_tag, 1)
+        b_save = QPushButton("💾 保存标签")
+        b_save.clicked.connect(self._save_tag)
+        brow.addWidget(b_save)
+        tv.addLayout(brow)
+        return w
 
-    # ---------- 对外接口 ----------
+    # ==================================================================
+    # 对外接口
+    # ==================================================================
     def set_running(self, running):
+        running = bool(running)
         self.btn_run.setText("⏹ 停止助理" if running else "▶ 启动助理")
         self.lb_state.setText("运行中…" if running else "未运行")
 
     def load_cfg(self, cfg):
-        self.sp_interval.setValue(int(cfg.get("interval") or 25))
-        want = cfg.get("scope") or "self"
-        for i in range(self.cb_scope.count()):
-            if self.cb_scope.itemData(i) == want:
-                self.cb_scope.setCurrentIndex(i)
-        self.ck_auto.setChecked(bool(cfg.get("auto_reply", True)))
-        self.set_running(bool(cfg.get("enabled")))
+        """老接口：设置项已搬到「设置」标签，这里只同步启停状态。"""
+        try:
+            self.set_running(bool((cfg or {}).get("enabled")))
+        except Exception:
+            pass
 
     def add_message(self, msg):
-        mid = msg.get("msgid") or ""
-        # 插入新消息会打乱行号，先记住当前选中的 msgid，插入后按 msgid 恢复选中
-        prev = self.selected_msgid()
-        self.msgs[mid] = dict(msg, status="待处理", result="")
-        txt = f"[{msg.get('time','')}] {msg.get('conv') or msg.get('sender') or '钉钉'}：{_trim(msg.get('text'), 70)}"
-        it = QListWidgetItem(txt)
-        it.setData(Qt.ItemDataRole.UserRole, mid)
-        self.list.insertItem(0, it)
-        self._select_msgid(prev)
+        msg = dict(msg or {})
+        mid = str(msg.get("msgid") or "").strip()
+        if not mid:
+            mid = "local-%d" % int(time.time() * 1000)
+        now = time.time()
+        msg["recv_ts"] = now               # ★ 主窗口要用它算「我多久没回」
+        msg["msgid"] = mid
+        self.msgs[mid] = {
+            "msgid": mid,
+            "cid": str(msg.get("cid") or ""),
+            "name": str(msg.get("conv") or msg.get("sender") or "钉钉"),
+            "kind": str(msg.get("kind") or "group"),
+            "text": str(msg.get("text") or ""),
+            "time": time.strftime("%m-%d %H:%M"),
+            "status": "待处理",
+            "result": "",
+            "recv_ts": now,
+            "sender": str(msg.get("sender") or ""),
+        }
+        self._rebuild()
         return mid
 
-    def _select_msgid(self, mid):
-        """按 msgid 选中对应行（刷新 / 插入后恢复选中项，不靠行号）。"""
-        if not mid:
-            return
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == mid:
-                self.list.setCurrentItem(it)
-                return
-
     def update_status(self, msgid, status, result=None):
-        m = self.msgs.get(msgid)
+        m = self.msgs.get(str(msgid or ""))
         if not m:
             return
-        m["status"] = status
+        st = str(status or "待处理")
+        m["status"] = st if st in _IM_STATUS else "待处理"
         if result is not None:
-            m["result"] = result
-        for i in range(self.list.count()):
-            it = self.list.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == msgid:
-                icon = {"待处理": "◔", "处理中": "◕", "已回复": "✓", "失败": "✕"}.get(status, "•")
-                it.setText(f"{icon} [{m.get('time','')}] {m.get('conv') or m.get('sender') or ''}：{_trim(m.get('text'), 70)}")
-                break
-        if self.selected_msgid() == msgid:
-            self._render(msgid)
+            m["result"] = str(result)
+        self._rebuild()
 
     def log(self, line):
-        self.logv.appendPlainText(f"{time.strftime('%H:%M:%S')}  {line}")
+        try:
+            self.logv.appendPlainText("%s  %s" % (time.strftime("%H:%M:%S"), line))
+        except Exception:
+            pass
 
     def selected_msgid(self):
-        it = self.list.currentItem()
-        return it.data(Qt.ItemDataRole.UserRole) if it else ""
+        if self._last_checked and self._last_checked in self._checked \
+                and self._last_checked in self.msgs:
+            return self._last_checked
+        if self._checked:
+            cand = [m for m in self.msgs.values()
+                    if m.get("msgid") in self._checked]
+            if cand:
+                return max(cand, key=lambda m: float(m.get("recv_ts") or 0))["msgid"]
+        if self.msgs:
+            return max(self.msgs.values(),
+                       key=lambda m: float(m.get("recv_ts") or 0))["msgid"]
+        return ""
 
     def row_msgids(self):
-        return [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())]
+        return [m.get("msgid") for m in self.msgs.values()]
 
-    # ---------- 内部 ----------
+    def set_im_data(self, rows=None, settings=None, tags=None, threads=None,
+                    tasks=None, logs=None, memory=None, review_fn=None):
+        if rows is not None:
+            self._merge_rows(rows)
+        if settings is not None:
+            self._fill_settings(settings)
+        if tags is not None:
+            self._set_tags(tags)
+        # threads / tasks / logs / memory / review_fn 原样暂存，等「更多管理」再喂给 IMDialog
+        if threads is not None:
+            self._im_extra["threads"] = threads
+        if tasks is not None:
+            self._im_extra["tasks"] = tasks
+        if logs is not None:
+            self._im_extra["logs"] = logs
+        if memory is not None:
+            self._im_extra["memory"] = memory
+        if review_fn is not None:
+            self._im_extra["review_fn"] = review_fn
+        self._rebuild()
+
+    def set_scan_state(self, text):
+        try:
+            self.lb_scan.setText(str(text))
+        except Exception:
+            pass
+
+    def show_manager(self):
+        try:
+            if self._dlg is None:
+                self._dlg = IMDialog(self)
+                self._dlg.thread_saved.connect(self.thread_saved.emit)
+                self._dlg.task_added.connect(self.task_added.emit)
+                self._dlg.task_deleted.connect(self.task_deleted.emit)
+                self._dlg.task_toggled.connect(self.task_toggled.emit)
+                self._dlg.memory_saved.connect(self.memory_saved.emit)
+                self._dlg.refresh_requested.connect(self.refresh_requested.emit)
+            e = self._im_extra
+            self._dlg.set_data(threads=e.get("threads"), tasks=e.get("tasks"),
+                               logs=e.get("logs"), memory=e.get("memory"),
+                               review_fn=e.get("review_fn"))
+            self._dlg.show()
+            self._dlg.raise_()
+            self._dlg.activateWindow()
+        except Exception as exc:
+            self.log("打开管理面板失败：%s: %s" % (type(exc).__name__, exc))
+
+    # ==================================================================
+    # 内部：消息表 / 渲染
+    # ==================================================================
+    def _merge_rows(self, rows):
+        now = time.time()
+        for row in (rows or []):
+            if not isinstance(row, dict):
+                continue
+            mid = str(row.get("msgid") or "").strip()
+            if not mid:
+                continue
+            old = self.msgs.get(mid)
+            # 本地正在处理的条目不被盘上的旧状态覆盖（否则界面会倒退）
+            if old is not None and old.get("status") == "处理中":
+                continue
+            try:
+                ts = float(row.get("ts") or 0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0:
+                ts = float((old or {}).get("recv_ts") or now)
+            st = str(row.get("status") or "待处理")
+            self.msgs[mid] = {
+                "msgid": mid,
+                "cid": str(row.get("cid") or (old or {}).get("cid") or ""),
+                "name": str(row.get("name") or (old or {}).get("name") or "钉钉"),
+                "kind": str(row.get("kind") or (old or {}).get("kind") or "group"),
+                "text": str(row.get("text") or ""),
+                "time": str(row.get("time") or time.strftime("%m-%d %H:%M",
+                                                             time.localtime(ts))),
+                "status": st if st in _IM_STATUS else "待处理",
+                "result": str(row.get("reply") or ""),
+                "recv_ts": ts,
+                "sender": str(row.get("sender") or ""),
+            }
+
+    def _fill_settings(self, s):
+        if not isinstance(s, dict):
+            return
+        if "scope_group" in s:
+            self.ck_scope_group.setChecked(bool(s.get("scope_group")))
+        if "scope_p2p" in s:
+            self.ck_scope_p2p.setChecked(bool(s.get("scope_p2p")))
+        if "scope_at_me" in s:
+            self.ck_scope_at_me.setChecked(bool(s.get("scope_at_me")))
+        if "delay_seconds" in s:
+            _spin_set(self.sp_delay, s.get("delay_seconds"), 0, 3600)
+        if "reply_uncertain" in s:
+            self.ck_uncertain.setChecked(bool(s.get("reply_uncertain")))
+        if "uncertain_text" in s:
+            self.ed_uncertain.setText(str(s.get("uncertain_text") or ""))
+        # ★ 用户正在打身份背景时不覆盖，避免把字冲掉
+        if "identity" in s and not self.tx_identity.hasFocus():
+            self.tx_identity.setPlainText(str(s.get("identity") or ""))
+        if "interval" in s:
+            _spin_set(self.sp_interval, s.get("interval"), 10, 600)
+        if "whitelist" in s:
+            self._set_whitelist(s.get("whitelist"))
+
+    def _set_whitelist(self, items):
+        self.list_wl.clear()
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            cid = str(it.get("id") or "").strip()
+            if not cid:
+                continue
+            kind = "p2p" if str(it.get("kind") or "") == "p2p" else "group"
+            name = str(it.get("name") or cid)
+            row = QListWidgetItem(("单聊 · " if kind == "p2p" else "群聊 · ") + name)
+            row.setData(Qt.ItemDataRole.UserRole, cid)
+            row.setData(Qt.ItemDataRole.UserRole + 1, kind)
+            self.list_wl.addItem(row)
+
+    def _rebuild(self):
+        self._checked &= set(self.msgs)
+        items = sorted(self.msgs.values(),
+                       key=lambda m: float(m.get("recv_ts") or 0), reverse=True)
+        sig = tuple((m.get("msgid"), m.get("status"), m.get("result", ""),
+                     m.get("name", ""), m.get("text", "")) for m in items)
+        if self._sig == sig:
+            self._sync_del_btn()
+            return
+        self._sig = sig
+        left = [m for m in items if m.get("status") != "已回复"]
+        right = [m for m in items if m.get("status") == "已回复"]
+        self._fill(self._lay_left, left, False)
+        self._fill(self._lay_right, right, True)
+        self.lb_left.setText("新消息（未回复） %d" % len(left))
+        self.lb_right.setText("已处理 %d" % len(right))
+        self._sync_del_btn()
+
+    def _fill(self, lay, msgs, done):
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        for m in msgs:
+            card = _MsgCard(m, checked=(m.get("msgid") in self._checked), done=done)
+            card.toggled.connect(self._on_card_toggled)
+            lay.addWidget(card)
+        lay.addStretch(1)
+
+    def _on_card_toggled(self, msgid, checked):
+        if checked:
+            self._checked.add(msgid)
+            self._last_checked = msgid
+        else:
+            self._checked.discard(msgid)
+        self._sync_del_btn()
+
+    def _sync_del_btn(self):
+        try:
+            self.btn_del.setEnabled(bool(self._checked & set(self.msgs)))
+        except Exception:
+            pass
+
+    def _delete_checked(self):
+        ids = [i for i in self._checked if i in self.msgs]
+        if not ids:
+            return
+        # ★ 先发信号再删本地：主窗口要靠 msgs[mid]["cid"] 把「已删」写回盘上，
+        #   删早了它拿不到 cid，下次刷新这些消息又会冒出来。
+        self.msgs_deleted.emit(ids)
+        for mid in ids:
+            self.msgs.pop(mid, None)
+        self._checked -= set(ids)
+        self._last_checked = ""
+        self._rebuild()
+        self.log("已删除 %d 条消息" % len(ids))
+
     def _on_toggle(self):
         self.toggle.emit(self.btn_run.text().startswith("▶"))
 
-    def _save_cfg(self):
-        self.cfg_saved.emit({
+    def _toggle_log(self):
+        self._log_open = not self._log_open
+        self.logv.setVisible(self._log_open)
+        self.btn_log.setText("▾ 运行日志" if self._log_open else "▸ 运行日志")
+
+    def _on_more(self):
+        # 主窗口收到 manage_requested 会自己调 show_manager() 并刷一遍数据；
+        # 这里兜底（页面单独用、没人接线时也能打开），已经开出来了就不再重复弹。
+        self.manage_requested.emit()
+        if self._dlg is None or not self._dlg.isVisible():
+            self.show_manager()
+
+    def _emit_settings(self):
+        d = {
+            "scope_group": self.ck_scope_group.isChecked(),
+            "scope_p2p": self.ck_scope_p2p.isChecked(),
+            "scope_at_me": self.ck_scope_at_me.isChecked(),
+            "delay_seconds": self.sp_delay.value(),
+            "reply_uncertain": self.ck_uncertain.isChecked(),
+            "uncertain_text": (self.ed_uncertain.text().strip()
+                               or DEFAULT_UNCERTAIN_TEXT),
+            "identity": self.tx_identity.toPlainText(),
             "interval": self.sp_interval.value(),
-            "scope": self.cb_scope.currentData(),
             "auto_reply": self.ck_auto.isChecked(),
-        })
+        }
+        self.im_settings_saved.emit(d)
+        # 兼容老接线
+        self.cfg_saved.emit({"interval": self.sp_interval.value(),
+                             "auto_reply": self.ck_auto.isChecked()})
+        self.log("设置已保存")
 
-    def _clear(self):
-        self.list.clear()
-        self.msgs.clear()
-        self.detail.clear()
-        self.cleared.emit()
-
-    def _show_detail(self, _item=None):
-        self._render(self.selected_msgid())
-
-    def _render(self, msgid):
-        m = self.msgs.get(msgid)
-        if not m:
+    # ---------- 白名单 ----------
+    def _add_whitelist(self):
+        txt = self.ed_wl_name.text().strip()
+        if not txt:
             return
-        t = themes.tokens()
-        html = [f'<div style="color:{t["text_muted"]};font-size:12px;">'
-                f'来自 {_esc(m.get("conv") or m.get("sender"))}　{m.get("time","")}　'
-                f'状态：{_esc(m.get("status"))}</div>',
-                f'<div style="margin-top:6px;"><b>收到：</b><br>{_esc(m.get("text"))}</div>']
-        if m.get("result"):
-            html.append(f'<hr><div><b>AI 结果：</b><br>{_esc(m["result"])}</div>')
-        self.detail.setHtml("".join(html))
+        kind = "p2p" if self.cb_wl_kind.currentData() == "p2p" else "group"
+        row = QListWidgetItem(("单聊 · " if kind == "p2p" else "群聊 · ") + txt)
+        row.setData(Qt.ItemDataRole.UserRole, txt)
+        row.setData(Qt.ItemDataRole.UserRole + 1, kind)
+        self.list_wl.addItem(row)
+        self.ed_wl_name.clear()
+        self.whitelist_added.emit({"id": txt, "name": txt, "kind": kind})
+
+    def _remove_whitelist(self):
+        for it in list(self.list_wl.selectedItems()):
+            cid = str(it.data(Qt.ItemDataRole.UserRole) or "")
+            self.list_wl.takeItem(self.list_wl.row(it))
+            if cid:
+                self.whitelist_removed.emit(cid)
+
+    # ---------- 标签 ----------
+    def _set_tags(self, tags):
+        rows = []
+        if isinstance(tags, dict):
+            for cid, v in tags.items():
+                rec = dict(v or {})
+                rec["id"] = rec.get("id") or cid
+                rows.append(rec)
+        else:
+            for v in (tags or []):
+                if isinstance(v, dict):
+                    rows.append(dict(v))
+        self.list_tags.clear()
+        self._tag_by_id = {}
+        for r in rows:
+            cid = str(r.get("id") or r.get("cid") or "")
+            if not cid:
+                continue
+            name = str(r.get("name") or cid)
+            kind = str(r.get("kind") or "group")
+            tag = str(r.get("tag") or "")
+            self._tag_by_id[cid] = {"id": cid, "name": name, "kind": kind, "tag": tag}
+            self.list_tags.addItem(self._tag_item(cid, name, kind, tag))
+
+    def _tag_item(self, cid, name, kind, tag):
+        label = "单聊" if str(kind) in ("p2p", "single", "friend") else "群聊"
+        it = QListWidgetItem("【%s】%s · %s" % (label, name, tag or "（未标注）"))
+        it.setData(Qt.ItemDataRole.UserRole, cid)
+        it.setData(Qt.ItemDataRole.UserRole + 1, tag)
+        return it
+
+    def _on_tag_selected(self, cur, _prev=None):
+        if cur is None:
+            return
+        self.ed_tag.setText(str(cur.data(Qt.ItemDataRole.UserRole + 1) or ""))
+
+    def _save_tag(self):
+        cur = self.list_tags.currentItem()
+        if cur is None:
+            return
+        cid = str(cur.data(Qt.ItemDataRole.UserRole) or "")
+        if not cid:
+            return
+        tag = self.ed_tag.text().strip()
+        cur.setData(Qt.ItemDataRole.UserRole + 1, tag)
+        info = self._tag_by_id.get(cid) or {"id": cid, "name": cid, "kind": "group"}
+        info["tag"] = tag
+        self._tag_by_id[cid] = info
+        cur.setText(self._tag_item(cid, info.get("name") or cid,
+                                   info.get("kind") or "group", tag).text())
+        self.tag_saved.emit(cid, tag)
+
+
+class _MsgCard(QFrame):
+    """一条消息卡片：勾选框 + 名称/时间/状态 + 正文（已处理的还带 AI 回复）。"""
+
+    toggled = pyqtSignal(str, bool)
+
+    def __init__(self, msg, checked=False, done=False, parent=None):
+        super().__init__(parent)
+        self.msgid = str(msg.get("msgid") or "")
+        t = _tok()
+        self.setObjectName("msgCard")
+        self.setStyleSheet("QFrame#msgCard{background:%s;border:1px solid %s;"
+                           "border-radius:6px;}" % (t["card"], t["border"]))
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.ck = QCheckBox()
+        self.ck.setChecked(bool(checked))
+        self.ck.toggled.connect(lambda on: self.toggled.emit(self.msgid, bool(on)))
+        head.addWidget(self.ck)
+
+        lb_name = QLabel(str(msg.get("name") or "钉钉"))
+        f = lb_name.font()
+        f.setBold(True)
+        lb_name.setFont(f)
+        lb_name.setStyleSheet("color:%s;" % t["text"])
+        head.addWidget(lb_name)
+
+        lb_time = QLabel(str(msg.get("time") or ""))
+        lb_time.setStyleSheet("color:%s;font-size:12px;" % t["text_muted"])
+        head.addWidget(lb_time)
+        head.addStretch(1)
+
+        st = str(msg.get("status") or "待处理")
+        lb_st = QLabel(st)
+        color = _IM_STATUS_COLORS.get(st) or t["text_muted"]
+        lb_st.setStyleSheet("color:%s;font-size:12px;" % color)
+        head.addWidget(lb_st)
+        v.addLayout(head)
+
+        lb_text = QLabel(str(msg.get("text") or ""))
+        lb_text.setWordWrap(True)
+        lb_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lb_text.setStyleSheet("color:%s;" % t["text"])
+        v.addWidget(lb_text)
+
+        if done:
+            line = QFrame()
+            line.setFixedHeight(1)
+            line.setStyleSheet("background:%s;border:none;" % t["border"])
+            v.addWidget(line)
+            cap = QLabel("AI 回复")
+            cap.setStyleSheet("color:%s;font-size:12px;" % t["text_muted"])
+            v.addWidget(cap)
+            lb_rep = QLabel(str(msg.get("result") or "") or "（暂无回复）")
+            lb_rep.setWordWrap(True)
+            lb_rep.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            lb_rep.setStyleSheet("color:%s;" % t["text"])
+            v.addWidget(lb_rep)
+
+    def mousePressEvent(self, ev):
+        # 点卡片空白处也能勾选（点勾选框本身时事件不会冒泡到这里）
+        try:
+            self.ck.setChecked(not self.ck.isChecked())
+        except Exception:
+            pass
+        super().mousePressEvent(ev)
 
 
 def _trim(s, n):
@@ -2813,3 +3454,348 @@ class BrowserPage(QWidget):
     def showEvent(self, ev):                          # noqa: N802 （Qt 回调命名）
         super().showEvent(ev)
         self.ensure_pane()
+
+
+# ============================================================================
+# ★ v9.20.0：IM 助手「消息管理」对话框
+#   会话上下文 / 定时任务 / 日志本 / 记忆 —— 全部可查看、可改、可删。
+#   做成对话框而不是塞进主页，是为了不挤压「新消息 / AI处理结果」这两栏。
+# ============================================================================
+class IMDialog(QDialog):
+    """IM 助手的管理面板：审查上下文、管定时任务、看日志、编辑记忆。"""
+
+    thread_saved = pyqtSignal(dict)        # {id, mode, persona, rules, ctx_limit, memory_on}
+    task_added = pyqtSignal(dict)
+    task_deleted = pyqtSignal(str)
+    task_toggled = pyqtSignal(str, bool)
+    memory_saved = pyqtSignal(str)         # 共享记忆全文
+    refresh_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🗂 钉钉助手 · 消息管理")
+        self.resize(980, 660)
+        self._threads = {}
+        self._tasks = []
+        self._review_fn = None
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 14, 14, 14)
+        v.setSpacing(8)
+
+        head = QHBoxLayout()
+        lb = QLabel("消息、上下文、定时任务、日志都在这里——改完点保存即生效。")
+        lb.setObjectName("PageSub")
+        head.addWidget(lb, 1)
+        b_ref = QPushButton("⟳ 刷新")
+        b_ref.clicked.connect(self.refresh_requested.emit)
+        head.addWidget(b_ref)
+        v.addLayout(head)
+
+        self.tabs = QTabWidget()
+        v.addWidget(self.tabs, 1)
+        self._build_threads_tab()
+        self._build_tasks_tab()
+        self._build_log_tab()
+        self._build_memory_tab()
+
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close)
+        v.addLayout(row)
+
+    # ---------------- 会话 / 上下文 ----------------
+    def _build_threads_tab(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        self.list_threads = QListWidget()
+        self.list_threads.setMinimumWidth(240)
+        self.list_threads.currentItemChanged.connect(self._on_thread_pick)
+        h.addWidget(self.list_threads, 1)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+        form = QFormLayout()
+        self.lb_thread = QLabel("（左边选一个会话）")
+        form.addRow("会话：", self.lb_thread)
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItem("秘书模式（群里不闲聊，只接指令/@）", "secretary")
+        self.cb_mode.addItem("同事模式（被叫到才接话）", "colleague")
+        self.cb_mode.addItem("群助手模式（按指令/关键词回）", "group_bot")
+        form.addRow("模式：", self.cb_mode)
+        self.sp_ctx = QSpinBox()
+        self.sp_ctx.setRange(2, 200)
+        self.sp_ctx.setValue(20)
+        form.addRow("带多少条上下文：", self.sp_ctx)
+        self.ck_mem = QCheckBox("回复时带上这个会话自己的记忆")
+        self.ck_mem.setChecked(True)
+        form.addRow(self.ck_mem)
+        self.ed_persona = QLineEdit()
+        self.ed_persona.setPlaceholderText("比如：这是家长群，说话客气点；别用表情")
+        form.addRow("人设补充：", self.ed_persona)
+        self.ed_rules = QLineEdit()
+        self.ed_rules.setPlaceholderText("比如：只回答学习相关；不要发广告")
+        form.addRow("额外规则：", self.ed_rules)
+        rv.addLayout(form)
+
+        btns = QHBoxLayout()
+        b_save = QPushButton("保存这个会话")
+        b_save.clicked.connect(self._save_thread)
+        btns.addWidget(b_save)
+        btns.addStretch(1)
+        rv.addLayout(btns)
+
+        rv.addWidget(QLabel("上下文审查（模型实际看到的东西）："))
+        self.tx_review = QPlainTextEdit()
+        self.tx_review.setReadOnly(True)
+        rv.addWidget(self.tx_review, 1)
+        h.addWidget(right, 2)
+        self.tabs.addTab(w, "会话 / 上下文")
+
+    def _on_thread_pick(self, cur, _prev=None):
+        if cur is None:
+            return
+        tid = cur.data(Qt.ItemDataRole.UserRole)
+        t = self._threads.get(tid) or {}
+        self.lb_thread.setText(f"{t.get('name') or tid}（{tid}）")
+        want = t.get("mode") or "group_bot"
+        for i in range(self.cb_mode.count()):
+            if self.cb_mode.itemData(i) == want:
+                self.cb_mode.setCurrentIndex(i)
+        self.sp_ctx.setValue(int(t.get("ctx_limit") or 20))
+        self.ck_mem.setChecked(bool(t.get("memory_on", True)))
+        self.ed_persona.setText(str(t.get("persona") or ""))
+        self.ed_rules.setText(str(t.get("rules") or ""))
+        if self._review_fn:
+            try:
+                self.tx_review.setPlainText(str(self._review_fn(tid) or ""))
+            except Exception as e:
+                self.tx_review.setPlainText(f"读取失败：{e}")
+        else:
+            self.tx_review.setPlainText("（暂无数据）")
+
+    def _save_thread(self):
+        cur = self.list_threads.currentItem()
+        if cur is None:
+            return
+        tid = cur.data(Qt.ItemDataRole.UserRole)
+        self.thread_saved.emit({
+            "id": tid,
+            "mode": self.cb_mode.currentData(),
+            "ctx_limit": self.sp_ctx.value(),
+            "memory_on": self.ck_mem.isChecked(),
+            "persona": self.ed_persona.text().strip(),
+            "rules": self.ed_rules.text().strip(),
+        })
+
+    # ---------------- 定时任务 ----------------
+    def _build_tasks_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        self.list_tasks = QListWidget()
+        v.addWidget(self.list_tasks, 1)
+
+        form = QFormLayout()
+        self.ed_t_title = QLineEdit()
+        self.ed_t_title.setPlaceholderText("比如：每周值日提醒")
+        form.addRow("名称：", self.ed_t_title)
+        self.ed_t_text = QLineEdit()
+        self.ed_t_text.setPlaceholderText("到点要发出去的那句话")
+        form.addRow("内容：", self.ed_t_text)
+        self.cb_t_thread = QComboBox()
+        form.addRow("发到：", self.cb_t_thread)
+        self.cb_t_freq = QComboBox()
+        self.cb_t_freq.addItem("每天", "daily")
+        self.cb_t_freq.addItem("每周", "weekly")
+        self.cb_t_freq.addItem("每月", "monthly")
+        self.cb_t_freq.currentIndexChanged.connect(self._sync_freq_row)
+        form.addRow("频率：", self.cb_t_freq)
+        self.cb_t_wd = QComboBox()
+        for i, n in enumerate(["一", "二", "三", "四", "五", "六", "日"]):
+            self.cb_t_wd.addItem(f"周{n}", i)
+        form.addRow("星期几：", self.cb_t_wd)
+        self.sp_t_day = QSpinBox()
+        self.sp_t_day.setRange(1, 31)
+        form.addRow("每月几号：", self.sp_t_day)
+        self.ed_t_at = QLineEdit("08:30")
+        self.ed_t_at.setPlaceholderText("HH:MM，比如 08:30")
+        form.addRow("时间：", self.ed_t_at)
+        v.addLayout(form)
+
+        row = QHBoxLayout()
+        b_add = QPushButton("＋ 添加定时消息")
+        b_add.clicked.connect(self._add_task)
+        b_del = QPushButton("🗑 删除选中")
+        b_del.clicked.connect(self._del_task)
+        b_tog = QPushButton("⏸ 启用/停用")
+        b_tog.clicked.connect(self._toggle_task)
+        for b in (b_add, b_del, b_tog):
+            row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        self._sync_freq_row()
+        self.tabs.addTab(w, "定时消息")
+
+    def _sync_freq_row(self, *_):
+        freq = self.cb_t_freq.currentData()
+        self.cb_t_wd.setEnabled(freq == "weekly")
+        self.sp_t_day.setEnabled(freq == "monthly")
+
+    def _add_task(self):
+        tid = self.cb_t_thread.currentData()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选一个要发到哪个会话")
+            return
+        text = self.ed_t_text.text().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "消息内容不能为空")
+            return
+        self.task_added.emit({
+            "title": self.ed_t_title.text().strip() or text[:12],
+            "text": text,
+            "thread": tid,
+            "freq": self.cb_t_freq.currentData(),
+            "at": self.ed_t_at.text().strip() or "08:30",
+            "weekday": self.cb_t_wd.currentData(),
+            "day": self.sp_t_day.value(),
+            "enabled": True,
+        })
+        self.ed_t_title.clear()
+        self.ed_t_text.clear()
+
+    def _task_id(self):
+        cur = self.list_tasks.currentItem()
+        return cur.data(Qt.ItemDataRole.UserRole) if cur else ""
+
+    def _del_task(self):
+        tid = self._task_id()
+        if tid:
+            self.task_deleted.emit(str(tid))
+
+    def _toggle_task(self):
+        tid = self._task_id()
+        if not tid:
+            return
+        cur = self.list_tasks.currentItem()
+        on = not bool(cur.data(Qt.ItemDataRole.UserRole + 1))
+        self.task_toggled.emit(str(tid), on)
+
+    # ---------------- 日志本 ----------------
+    def _build_log_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("按日期查（YYYY-MM-DD，留空=全部）："))
+        self.ed_log_day = QLineEdit()
+        row.addWidget(self.ed_log_day, 1)
+        row.addWidget(QLabel("按人查："))
+        self.ed_log_who = QLineEdit()
+        row.addWidget(self.ed_log_who, 1)
+        b = QPushButton("🔍 查询")
+        b.clicked.connect(self.refresh_requested.emit)
+        row.addWidget(b)
+        v.addLayout(row)
+        self.tx_log = QPlainTextEdit()
+        self.tx_log.setReadOnly(True)
+        v.addWidget(self.tx_log, 1)
+        self.tabs.addTab(w, "日志本")
+
+    # ---------------- 记忆 ----------------
+    def _build_memory_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        lb = QLabel("这份记忆**所有会话共用**（身份背景、最近发生的事、称呼习惯…）。"
+                    "越具体，AI 回得越像你本人。")
+        lb.setWordWrap(True)
+        lb.setObjectName("PageSub")
+        v.addWidget(lb)
+        self.tx_mem = QPlainTextEdit()
+        self.tx_mem.setPlaceholderText(
+            "例：\n我叫刘浩辰，初三，班长。\n别人一般叫我「浩辰」。\n"
+            "我不喜欢别人叫我全名。\n最近在准备信息学奥赛，周三下午有课。")
+        v.addWidget(self.tx_mem, 1)
+        row = QHBoxLayout()
+        b = QPushButton("💾 保存共享记忆")
+        b.clicked.connect(lambda: self.memory_saved.emit(self.tx_mem.toPlainText()))
+        row.addWidget(b)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.tabs.addTab(w, "记忆")
+
+    # ---------------- 数据填充 ----------------
+    def set_data(self, threads=None, tasks=None, logs=None, memory=None,
+                 review_fn=None, log_text=None):
+        self._threads = dict(threads or {})
+        self._review_fn = review_fn
+        if threads is not None:
+            prev = None
+            cur = self.list_threads.currentItem()
+            if cur is not None:
+                prev = cur.data(Qt.ItemDataRole.UserRole)
+            self.list_threads.clear()
+            for tid, t in sorted(self._threads.items(),
+                                 key=lambda kv: -(float(kv[1].get("last_ts") or 0))):
+                n = int(t.get("msg_count") or 0)
+                it = QListWidgetItem(
+                    f"{t.get('name') or tid}　·{t.get('mode') or 'group_bot'}"
+                    f"　·{n} 条")
+                it.setData(Qt.ItemDataRole.UserRole, tid)
+                self.list_threads.addItem(it)
+                if tid == prev:
+                    self.list_threads.setCurrentItem(it)
+
+        if tasks is not None:
+            self._tasks = list(tasks)
+            self.list_tasks.clear()
+            for t in self._tasks:
+                on = "✅" if t.get("enabled", True) else "⏸"
+                it = QListWidgetItem(
+                    f"{on} {t.get('title')}　·{_im_desc(t)}　→ "
+                    f"{(self._threads.get(t.get('thread')) or {}).get('name') or t.get('thread')}")
+                it.setData(Qt.ItemDataRole.UserRole, t.get("id"))
+                it.setData(Qt.ItemDataRole.UserRole + 1, bool(t.get("enabled", True)))
+                self.list_tasks.addItem(it)
+            # 同步"发到"下拉
+            keep = self.cb_t_thread.currentData()
+            self.cb_t_thread.clear()
+            for tid, t in self._threads.items():
+                self.cb_t_thread.addItem(t.get("name") or tid, tid)
+            if keep:
+                for i in range(self.cb_t_thread.count()):
+                    if self.cb_t_thread.itemData(i) == keep:
+                        self.cb_t_thread.setCurrentIndex(i)
+
+        if memory is not None and not self.tx_mem.hasFocus():
+            self.tx_mem.setPlainText(str(memory))
+        if log_text is not None:
+            self.tx_log.setPlainText(str(log_text))
+
+
+def _im_desc(t):
+    """定时任务的频率描述（页面内小工具，避免 import 循环）。"""
+    freq = str(t.get("freq") or "daily")
+    at = t.get("at") or "08:30"
+    if freq == "weekly":
+        wd = ["一", "二", "三", "四", "五", "六", "日"]
+        try:
+            i = int(t.get("weekday") or 0)
+        except Exception:
+            i = 0
+        return f"每周{wd[max(0, min(6, i))]} {at}"
+    if freq == "monthly":
+        return f"每月 {t.get('day') or 1} 号 {at}"
+    return f"每天 {at}"

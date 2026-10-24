@@ -203,7 +203,21 @@ def pick_asset(info, prefer=(".zip", ".exe")):
 
 
 def download(url, dest, progress=None, timeout=30):
-    """下载更新包，progress(done, total) 可用于显示进度。"""
+    """下载更新包（多通道测速 + 镜像加速 + 断点续传）。"""
+    # ★ v9.19：GitHub Release 直连实测被限速到 ~24KB/s，镜像可快几十倍；
+    #   先走 downloader 选最快通道，失败再落回下面的直连兜底。
+    try:
+        from app import downloader as _dl
+    except Exception:
+        _dl = None
+    if _dl is not None:
+        try:
+            best, _lat = _dl.pick_fastest(url, timeout=min(6, timeout))
+            _dl.download(url, dest, progress=progress,
+                         timeout=(10, timeout), prefer=best)
+            return dest
+        except Exception:
+            pass
     try:
         import requests
     except ImportError:

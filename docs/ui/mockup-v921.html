@@ -1,0 +1,1953 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 工作台 · v9.21 界面原型</title>
+<script>
+  /* 首屏前定主题，避免闪白：默认跟随系统 */
+  (function () {
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  })();
+</script>
+<style>
+/* ============================================================
+   1. tokens —— 只在这里改颜色
+   ============================================================ */
+:root{
+  --font: "Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  --mono: "Cascadia Mono","Consolas","Courier New",monospace;
+
+  --bg:#f5f6f8;
+  --surface:#ffffff;
+  --surface-2:#eef0f3;
+  --sidebar:#fafbfc;
+  --border:#e4e7eb;
+  --border-strong:#d5dae0;
+
+  --text:#191c1f;
+  --text-2:#5b6470;
+  --text-3:#8b95a1;
+
+  --accent:#2f6feb;
+  --accent-hover:#255ed1;
+  --accent-weak:#e8f0fe;
+  --accent-ring:rgba(47,111,235,.16);
+  --user:#2f6feb;
+
+  --ok:#17864a;
+  --warn:#b4741a;
+  --danger:#d13b3b;
+  --danger-weak:#fdecec;
+
+  --shadow-1:0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.04);
+  --shadow-2:0 10px 28px -12px rgba(16,24,40,.22), 0 2px 6px rgba(16,24,40,.05);
+
+  --scroll:#cfd5dc;
+  --row-hover:#f2f5f9;
+  --desk:#e9ecf1;
+  --code-bg:#f7f8fa;
+
+  --r-sm:6px;
+  --r-md:9px;
+  --r-lg:14px;
+
+  color-scheme: light;
+}
+
+html[data-theme="dark"]{
+  --bg:#16181c;
+  --surface:#1f2329;
+  --surface-2:#262b32;
+  --sidebar:#1a1d22;
+  --border:#2b3138;
+  --border-strong:#3a414a;
+
+  --text:#e7ebf0;
+  --text-2:#a3adb9;
+  --text-3:#77818d;
+
+  --accent:#5b8ef7;
+  --accent-hover:#6f9cff;
+  --accent-weak:rgba(91,142,247,.14);
+  --accent-ring:rgba(91,142,247,.22);
+  --user:#3468cf;
+
+  --ok:#3fb950;
+  --warn:#d29922;
+  --danger:#f85149;
+  --danger-weak:rgba(248,81,73,.12);
+
+  --shadow-1:0 1px 2px rgba(0,0,0,.45);
+  --shadow-2:0 12px 32px -14px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.35);
+
+  --scroll:#3a414a;
+  --row-hover:#232830;
+  --desk:#0d0f12;
+  --code-bg:#171a1f;
+
+  color-scheme: dark;
+}
+
+/* ============================================================
+   2. base
+   ============================================================ */
+*,*::before,*::after{box-sizing:border-box;}
+html,body{height:100%;}
+body{
+  margin:0;
+  font-family:var(--font);
+  font-size:13.5px;
+  line-height:1.6;
+  color:var(--text);
+  background:var(--desk);
+  overflow:hidden;
+}
+[hidden]{display:none !important;}
+button{font-family:inherit;font-size:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer;}
+input,textarea,select{font-family:inherit;font-size:inherit;color:inherit;}
+p{margin:0 0 10px;}
+p:last-child{margin-bottom:0;}
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);padding:1px 5px;border-radius:4px;white-space:nowrap;}
+b,strong{font-weight:600;}
+
+::-webkit-scrollbar{width:10px;height:10px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{
+  background:var(--scroll);
+  border:3px solid transparent;
+  background-clip:padding-box;
+  border-radius:8px;
+}
+::-webkit-scrollbar-thumb:hover{background:var(--border-strong);background-clip:padding-box;}
+
+body,.app,.sidebar,.titlebar,.composer,.im-col,.im-row,.form-card{
+  transition:background-color .18s ease, border-color .18s ease, color .18s ease;
+}
+
+/* ============================================================
+   3. 窗口
+   ============================================================ */
+.stage{
+  height:100%;
+  padding:16px 16px 30px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+.app{
+  width:min(1320px,100%);
+  height:min(860px,100%);
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  background:var(--bg);
+  border:1px solid var(--border);
+  border-radius:12px;
+  overflow:hidden;
+  box-shadow:var(--shadow-2);
+}
+
+/* —— 标题条 —— */
+.titlebar{
+  flex:0 0 40px;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:0 6px 0 14px;
+  background:var(--sidebar);
+  border-bottom:1px solid var(--border);
+}
+.brand{display:flex;align-items:center;gap:8px;}
+.brand-mark{
+  width:18px;height:18px;border-radius:5px;
+  display:grid;place-items:center;
+  background:linear-gradient(150deg,#4b86ff,#2f6feb);
+  color:#fff;
+  box-shadow:0 1px 3px rgba(47,111,235,.45);
+}
+.brand-name{font-size:12.5px;font-weight:600;letter-spacing:.01em;}
+.brand-ver{
+  font-size:10px;color:var(--text-3);
+  padding:1px 6px;border:1px solid var(--border);border-radius:999px;
+}
+.tb-spacer{flex:1;}
+.tb-note{font-size:10.5px;color:var(--text-3);letter-spacing:.02em;}
+.win-btns{display:flex;align-items:center;gap:2px;margin-left:6px;}
+.win-btn{
+  width:30px;height:24px;border-radius:5px;
+  display:grid;place-items:center;color:var(--text-3);
+}
+.win-btn:hover{background:var(--surface-2);color:var(--text);}
+.win-btn.is-close:hover{background:#e5484d;color:#fff;}
+
+/* —— 三栏骨架 —— */
+.shell{flex:1;min-height:0;display:flex;}
+.sidebar{
+  flex:0 0 252px;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  background:var(--sidebar);
+  border-right:1px solid var(--border);
+}
+
+/* ============================================================
+   4. 侧栏
+   ============================================================ */
+.nav{padding:10px 10px 4px;display:flex;flex-direction:column;gap:2px;}
+.nav-item{
+  height:32px;
+  display:flex;align-items:center;gap:9px;
+  padding:0 10px;
+  border-radius:var(--r-md);
+  color:var(--text-2);
+  font-size:13px;
+}
+.nav-item svg{color:var(--text-3);flex:0 0 auto;}
+.nav-item:hover{background:var(--surface-2);color:var(--text);}
+.nav-item.is-active{background:var(--accent-weak);color:var(--accent);font-weight:600;}
+.nav-item.is-active svg{color:var(--accent);}
+.nav-badge{
+  margin-left:auto;min-width:17px;height:17px;padding:0 5px;
+  display:grid;place-items:center;
+  font-size:10px;font-weight:600;line-height:1;
+  color:#fff;background:var(--accent);border-radius:999px;
+}
+
+.side-sec{
+  flex:1;min-height:0;
+  display:flex;flex-direction:column;
+  padding:6px 8px 0;
+}
+.side-head{
+  display:flex;align-items:center;
+  padding:10px 8px 6px;
+  font-size:11px;font-weight:600;color:var(--text-3);
+  letter-spacing:.04em;
+}
+.side-head .spacer{flex:1;}
+.side-add{
+  width:20px;height:20px;border-radius:5px;
+  display:grid;place-items:center;color:var(--text-3);
+}
+.side-add:hover{background:var(--surface-2);color:var(--text);}
+
+.conv-list{flex:1;min-height:0;overflow-y:auto;padding:0 2px 8px;}
+.conv-group{
+  padding:8px 8px 4px;
+  font-size:10.5px;color:var(--text-3);letter-spacing:.03em;
+}
+.conv{
+  width:100%;display:block;text-align:left;
+  padding:7px 9px;border-radius:8px;
+  border:1px solid transparent;
+  margin-bottom:1px;
+}
+.conv:hover{background:var(--surface-2);}
+.conv.is-active{
+  background:var(--surface);
+  border-color:var(--border);
+  box-shadow:var(--shadow-1);
+}
+.conv-title{
+  display:block;font-size:12.5px;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.conv.is-active .conv-title{font-weight:600;}
+.conv-preview{
+  display:block;margin-top:1px;
+  font-size:11px;color:var(--text-3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+
+.side-foot{
+  flex:0 0 auto;
+  padding:8px 10px 10px;
+  border-top:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;
+}
+.ws-dot{width:6px;height:6px;border-radius:50%;background:var(--ok);flex:0 0 auto;}
+.ws-name{font-size:11.5px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ws-size{margin-left:auto;font-size:10px;color:var(--text-3);}
+
+/* ============================================================
+   5. 主区域 / 对话页
+   ============================================================ */
+.main{flex:1;min-width:0;min-height:0;display:flex;background:var(--bg);}
+.page{flex:1;min-height:0;display:flex;flex-direction:column;}
+
+.page-head{
+  flex:0 0 auto;
+  height:58px;
+  padding:0 24px;
+  display:flex;align-items:center;gap:12px;
+  border-bottom:1px solid var(--border);
+}
+.page-head h1{margin:0;font-size:14.5px;font-weight:600;letter-spacing:.01em;}
+.page-sub{margin:1px 0 0;font-size:11px;color:var(--text-3);}
+.head-spacer{flex:1;}
+.head-chip{
+  display:inline-flex;align-items:center;gap:5px;
+  height:26px;padding:0 9px;
+  font-size:11.5px;color:var(--text-2);
+  border:1px solid var(--border);border-radius:var(--r-sm);
+}
+.head-chip:hover{background:var(--surface);border-color:var(--border-strong);color:var(--text);}
+
+/* —— 消息流 —— */
+.thread-wrap{flex:1;min-height:0;overflow-y:auto;scroll-behavior:smooth;}
+.thread{
+  max-width:768px;
+  margin:0 auto;
+  padding:20px 28px 12px;
+  display:flex;flex-direction:column;gap:24px;
+}
+.thread-start{
+  text-align:center;font-size:10.5px;color:var(--text-3);
+  letter-spacing:.05em;
+}
+
+.msg{display:flex;flex-direction:column;gap:9px;animation:msgIn .22s ease both;}
+@keyframes msgIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+
+.msg-role{display:flex;align-items:center;gap:7px;margin-bottom:-2px;}
+.avatar{
+  width:20px;height:20px;border-radius:6px;
+  display:grid;place-items:center;
+  background:linear-gradient(150deg,#4b86ff,#2f6feb);
+  color:#fff;flex:0 0 auto;
+}
+.role-name{font-size:12px;font-weight:600;color:var(--text);}
+.role-time{font-size:10.5px;color:var(--text-3);}
+.msg-time{font-size:10.5px;color:var(--text-3);align-self:flex-end;margin-top:-4px;}
+
+.msg-user{align-items:flex-end;}
+.bubble{
+  max-width:76%;
+  padding:9px 13px;
+  background:var(--user);
+  color:#fff;
+  font-size:13.5px;line-height:1.6;
+  border-radius:13px 13px 5px 13px;
+  box-shadow:0 1px 2px rgba(16,24,40,.12);
+  white-space:pre-wrap;word-break:break-word;
+}
+
+/* 助手正文：无气泡，直接排在底色上 */
+.md{font-size:13.8px;line-height:1.78;color:var(--text);}
+.md.live{white-space:pre-wrap;word-break:break-word;}
+.md p{margin:0 0 10px;}
+.md ul{margin:0 0 10px;padding-left:18px;}
+.md li{margin:2px 0;}
+.md li::marker{color:var(--text-3);}
+
+/* —— 思维链卡片 —— */
+.think-card{
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  background:var(--surface);
+  box-shadow:var(--shadow-1);
+  overflow:hidden;
+}
+.think-head{
+  width:100%;height:34px;
+  display:flex;align-items:center;gap:8px;
+  padding:0 10px 0 11px;
+  color:var(--text-2);
+  font-size:12px;
+}
+.think-head:hover{background:var(--surface-2);}
+.think-ico{color:var(--accent);display:grid;place-items:center;}
+.think-title{font-weight:600;color:var(--text);}
+.think-meta{color:var(--text-3);font-size:11px;}
+.think-head .spacer{flex:1;}
+.chev{color:var(--text-3);transition:transform .16s ease;flex:0 0 auto;}
+.open > .think-head .chev,.tool.open .chev{transform:rotate(180deg);}
+
+.think-body{
+  display:grid;grid-template-rows:0fr;
+  transition:grid-template-rows .18s ease;
+}
+.think-card.open .think-body{grid-template-rows:1fr;}
+.think-body > div{overflow:hidden;}
+.steps{
+  margin:0;padding:4px 14px 12px 14px;
+  list-style:none;counter-reset:s;
+  border-top:1px solid var(--border);
+}
+.steps li{
+  counter-increment:s;
+  position:relative;
+  padding:7px 0 7px 24px;
+  font-size:12.5px;color:var(--text-2);line-height:1.65;
+}
+.steps li::before{
+  content:counter(s);
+  position:absolute;left:0;top:9px;
+  width:16px;height:16px;border-radius:50%;
+  display:grid;place-items:center;
+  font-size:9.5px;font-weight:600;
+  color:var(--text-3);
+  background:var(--surface-2);
+}
+.steps b{display:block;color:var(--text);font-weight:600;font-size:12.5px;}
+
+/* —— 工具胶囊 —— */
+.tool{display:flex;flex-direction:column;gap:0;align-items:flex-start;}
+.tool-pill{
+  display:inline-flex;align-items:center;gap:7px;
+  max-width:100%;height:29px;
+  padding:0 9px;
+  background:var(--surface-2);
+  border:1px solid var(--border);
+  border-radius:8px;
+  font-size:11.8px;color:var(--text-2);
+  transition:border-color .16s ease,background-color .16s ease;
+}
+.tool-pill:hover{border-color:var(--border-strong);background:var(--surface);}
+.tool-ico{color:var(--text-3);display:grid;place-items:center;}
+.tool-name{font-weight:600;color:var(--text);}
+.tool-arg{
+  color:var(--text-3);
+  max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.tool-ok{color:var(--ok);display:grid;place-items:center;}
+.tool-dur{color:var(--text-3);font-variant-numeric:tabular-nums;}
+.tool-body{width:100%;display:grid;grid-template-rows:0fr;transition:grid-template-rows .18s ease;}
+.tool.open .tool-body{grid-template-rows:1fr;}
+.tool-body > div{overflow:hidden;}
+.tool-body pre{
+  margin:6px 0 0;
+  padding:10px 12px;
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:8px;
+  font-family:var(--mono);font-size:11.2px;line-height:1.75;
+  color:var(--text-2);
+  max-height:220px;overflow:auto;
+}
+.tool-body .ok{color:var(--ok);}
+
+/* —— 文件卡片 —— */
+.files{
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  background:var(--surface);
+  box-shadow:var(--shadow-1);
+  overflow:hidden;
+  margin:2px 0 10px;
+}
+.file-row{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 10px;
+  border-top:1px solid var(--border);
+}
+.file-row:first-child{border-top:none;}
+.file-row:hover{background:var(--row-hover);}
+.file-ico{
+  width:26px;height:26px;border-radius:6px;flex:0 0 auto;
+  display:grid;place-items:center;
+  background:var(--accent-weak);color:var(--accent);
+}
+.file-name{font-size:12.5px;color:var(--text);}
+.file-meta{font-size:10.5px;color:var(--text-3);}
+.file-row .spacer{flex:1;}
+.file-open{
+  font-size:11.5px;color:var(--accent);
+  padding:3px 8px;border-radius:6px;
+}
+.file-open:hover{background:var(--accent-weak);}
+
+/* —— 消息底部操作 —— */
+.msg-actions{
+  display:flex;align-items:center;gap:2px;
+  margin-top:-4px;
+  opacity:.7;transition:opacity .16s ease;
+}
+.msg:hover .msg-actions{opacity:1;}
+.act{
+  font-size:11.5px;color:var(--text-3);
+  padding:3px 7px;border-radius:6px;
+}
+.act:hover{background:var(--surface-2);color:var(--text);}
+.msg-actions .spacer{flex:1;}
+.msg-meta{font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums;}
+
+/* —— 流式光标 —— */
+.caret{
+  display:inline-block;width:2px;height:1.05em;
+  margin-left:1px;vertical-align:-2px;
+  background:var(--accent);border-radius:1px;
+  animation:blink 1.05s steps(1) infinite;
+}
+@keyframes blink{0%,49%{opacity:1;}50%,100%{opacity:0;}}
+.typing-hint{font-size:11px;color:var(--text-3);}
+
+.thread-fade{
+  flex:0 0 auto;height:20px;margin-top:-20px;
+  background:linear-gradient(to bottom,transparent,var(--bg));
+  position:relative;z-index:1;pointer-events:none;
+}
+
+/* —— 输入区 —— */
+.composer-wrap{flex:0 0 auto;padding:4px 24px 16px;}
+.composer-inner{max-width:768px;margin:0 auto;}
+
+.state-line{
+  display:flex;align-items:center;gap:6px;
+  height:20px;padding:0 4px;
+  font-size:11px;color:var(--text-3);
+}
+.pulse{
+  width:6px;height:6px;border-radius:50%;
+  background:var(--accent);
+  animation:pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse{0%,100%{opacity:.35;transform:scale(.9);}50%{opacity:1;transform:scale(1.15);}}
+
+.team-row{
+  display:flex;align-items:center;gap:6px;
+  height:26px;padding:0 4px 4px;
+}
+.team-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  height:22px;padding:0 8px;
+  font-size:11px;color:var(--text-3);
+  border-radius:6px;
+}
+.team-chip:hover{background:var(--surface-2);color:var(--text-2);}
+.team-chip .dot{width:5px;height:5px;border-radius:50%;background:var(--text-3);}
+
+.composer{
+  background:var(--surface);
+  border:1px solid var(--border-strong);
+  border-radius:var(--r-lg);
+  box-shadow:var(--shadow-2);
+  padding:7px 8px 7px 12px;
+  transition:border-color .16s ease, box-shadow .16s ease;
+}
+.composer:focus-within{
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-ring), var(--shadow-1);
+}
+#input{
+  display:block;width:100%;
+  min-height:22px;max-height:132px;
+  padding:3px 2px;
+  border:none;outline:none;resize:none;
+  background:transparent;
+  font-size:13.5px;line-height:1.6;
+  color:var(--text);
+}
+#input::placeholder{color:var(--text-3);}
+.composer-bar{display:flex;align-items:center;gap:4px;height:30px;margin-top:2px;}
+.ibtn{
+  width:28px;height:28px;border-radius:7px;
+  display:grid;place-items:center;color:var(--text-3);
+}
+.ibtn:hover{background:var(--surface-2);color:var(--text);}
+.composer-bar .spacer{flex:1;}
+.model-pill{
+  display:inline-flex;align-items:center;gap:4px;
+  height:24px;padding:0 7px;border-radius:6px;
+  font-size:11.5px;color:var(--text-3);
+}
+.model-pill:hover{background:var(--surface-2);color:var(--text-2);}
+.send{
+  width:30px;height:30px;border-radius:8px;
+  display:grid;place-items:center;
+  background:var(--accent);color:#fff;
+  box-shadow:0 1px 2px rgba(47,111,235,.35);
+  transition:background-color .16s ease,transform .1s ease;
+}
+.send:hover{background:var(--accent-hover);}
+.send:active{transform:scale(.96);}
+.send:disabled{background:var(--surface-2);color:var(--text-3);box-shadow:none;cursor:default;}
+.send .ico-stop{display:none;}
+.composer.is-busy .send .ico-send{display:none;}
+.composer.is-busy .send .ico-stop{display:block;}
+.composer-hint{
+  padding:6px 4px 0;
+  font-size:10.5px;color:var(--text-3);
+  text-align:center;
+}
+
+/* ============================================================
+   7. 钉钉助手
+   ============================================================ */
+.im-title{display:flex;align-items:center;gap:9px;}
+.pill-live{
+  display:inline-flex;align-items:center;gap:5px;
+  height:21px;padding:0 8px;border-radius:999px;
+  font-size:10.5px;color:var(--ok);
+  background:color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.pill-live i{width:5px;height:5px;border-radius:50%;background:var(--ok);}
+.im-head-extra{font-size:11px;color:var(--text-3);}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  height:30px;padding:0 12px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:var(--surface);
+  font-size:12px;color:var(--text-2);
+  box-shadow:var(--shadow-1);
+  transition:background-color .16s ease,border-color .16s ease,color .16s ease;
+}
+.btn:hover{background:var(--surface-2);border-color:var(--border-strong);color:var(--text);}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(47,111,235,.3);}
+.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff;}
+.btn-ghost{background:transparent;border-color:transparent;box-shadow:none;color:var(--text-3);}
+.btn-ghost:hover{background:var(--surface-2);}
+.btn-danger{
+  background:var(--danger);border-color:var(--danger);color:#fff;
+  box-shadow:0 1px 2px rgba(209,59,59,.28);
+}
+.btn-danger:hover{background:#b93434;border-color:#b93434;color:#fff;}
+.btn-danger:disabled{
+  background:var(--surface-2);border-color:var(--border);
+  color:var(--text-3);box-shadow:none;cursor:default;
+}
+.btn-danger:disabled:hover{background:var(--surface-2);border-color:var(--border);color:var(--text-3);}
+
+.tabs{
+  flex:0 0 auto;
+  display:flex;align-items:center;gap:2px;
+  margin:12px 24px 0;
+  padding:3px;
+  background:var(--surface-2);
+  border-radius:9px;
+  align-self:flex-start;
+}
+.tab{
+  height:26px;padding:0 13px;border-radius:7px;
+  font-size:12px;color:var(--text-2);
+  display:flex;align-items:center;gap:6px;
+  transition:background-color .16s ease,color .16s ease;
+}
+.tab:hover{color:var(--text);}
+.tab.is-active{
+  background:var(--surface);color:var(--text);font-weight:600;
+  box-shadow:var(--shadow-1);
+}
+.tab-count{
+  font-size:10px;font-weight:600;color:var(--accent);
+  background:var(--accent-weak);border-radius:999px;
+  padding:0 5px;line-height:15px;
+}
+
+.tab-panels{flex:1;min-height:0;padding:12px 24px 18px;display:flex;}
+.panel{display:none;flex:1;min-height:0;}
+.panel.is-active{display:flex;flex-direction:column;animation:fadeIn .16s ease;}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+
+/* —— 消息双栏 —— */
+.im-cols{flex:1;min-height:0;display:flex;gap:14px;}
+.im-col{
+  flex:1;min-width:0;min-height:0;
+  display:flex;flex-direction:column;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  overflow:hidden;
+}
+.col-head{
+  flex:0 0 34px;
+  display:flex;align-items:center;gap:7px;
+  padding:0 12px;
+  border-bottom:1px solid var(--border);
+  font-size:11.5px;font-weight:600;color:var(--text-2);
+}
+.count{
+  font-size:10px;font-weight:600;color:var(--text-3);
+  background:var(--surface-2);border-radius:999px;padding:0 6px;line-height:16px;
+}
+.col-scroll{flex:1;min-height:0;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:7px;}
+
+.im-row{
+  position:relative;
+  display:flex;align-items:flex-start;gap:8px;
+  padding:9px 10px 9px 8px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:var(--surface);
+  cursor:pointer;
+  transition:background-color .14s ease,border-color .14s ease,opacity .18s ease,transform .18s ease;
+  animation:msgIn .2s ease both;
+}
+.im-row:hover{background:var(--row-hover);border-color:var(--border-strong);}
+.im-row:has(.cb:checked){background:var(--accent-weak);border-color:color-mix(in srgb,var(--accent) 40%,var(--border));}
+.im-row.removing{opacity:0;transform:translateX(-8px);}
+
+.cb{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none;}
+.cbx{
+  flex:0 0 auto;margin-top:1px;
+  width:15px;height:15px;border-radius:4px;
+  border:1.5px solid var(--border-strong);
+  background:var(--surface);
+  display:grid;place-items:center;
+  color:#fff;
+  transition:background-color .14s ease,border-color .14s ease;
+}
+.cbx svg{opacity:0;transform:scale(.7);transition:opacity .12s ease,transform .12s ease;}
+.cb:checked + .cbx{background:var(--accent);border-color:var(--accent);}
+.cb:checked + .cbx svg{opacity:1;transform:none;}
+
+.im-card{flex:1;min-width:0;}
+.im-top{display:flex;align-items:center;gap:6px;}
+.who{font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap;}
+.kind{
+  font-size:9.5px;color:var(--text-3);
+  border:1px solid var(--border);border-radius:4px;
+  padding:0 4px;line-height:14px;
+}
+.im-time{margin-left:auto;font-size:10px;color:var(--text-3);font-variant-numeric:tabular-nums;}
+.im-text{
+  margin:3px 0 0;
+  font-size:12px;line-height:1.6;color:var(--text-2);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+}
+.im-sub{display:flex;align-items:center;gap:6px;margin-top:5px;}
+.conv-name{font-size:10px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.st{
+  margin-left:auto;flex:0 0 auto;
+  font-size:9.5px;line-height:15px;padding:0 5px;border-radius:4px;
+}
+.st-wait{color:var(--warn);background:color-mix(in srgb,var(--warn) 13%,transparent);}
+.st-work{color:var(--accent);background:var(--accent-weak);}
+.st-manual{color:var(--text-2);background:var(--surface-2);}
+.st-fail{color:var(--danger);background:var(--danger-weak);}
+.st-done{color:var(--ok);background:color-mix(in srgb,var(--ok) 12%,transparent);}
+
+.ai-reply{
+  margin-top:7px;
+  padding:6px 8px 7px;
+  background:var(--accent-weak);
+  border-left:2px solid var(--accent);
+  border-radius:0 5px 5px 0;
+}
+.ai-badge{
+  display:inline-flex;align-items:center;gap:4px;
+  font-size:9.5px;font-weight:600;color:var(--accent);
+  letter-spacing:.02em;
+}
+.ai-reply p{margin:2px 0 0;font-size:11.5px;line-height:1.6;color:var(--text-2);}
+
+.im-foot{
+  flex:0 0 auto;
+  display:flex;align-items:center;gap:8px;
+  padding:12px 0 0;
+}
+.im-foot .spacer{flex:1;}
+.sel-info{font-size:11px;color:var(--text-3);}
+
+/* —— 设置 —— */
+.panel-scroll{flex:1;min-height:0;overflow-y:auto;padding:2px 4px 4px 0;}
+.form{max-width:720px;display:flex;flex-direction:column;gap:12px;}
+.form-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  box-shadow:var(--shadow-1);
+  overflow:hidden;
+}
+.form-head{
+  padding:10px 14px 0;
+  font-size:12.5px;font-weight:600;color:var(--text);
+}
+.form-head span{display:block;font-size:10.5px;font-weight:400;color:var(--text-3);margin-top:2px;}
+.form-body{padding:8px 14px 12px;display:flex;flex-direction:column;gap:8px;}
+
+.check-row{
+  position:relative;
+  display:flex;align-items:flex-start;gap:9px;
+  padding:6px 8px;border-radius:7px;cursor:pointer;
+}
+.check-row:hover{background:var(--row-hover);}
+.check-row .cbx{margin-top:2px;border-radius:4px;}
+.check-row .cb:checked + .cbx{background:var(--accent);border-color:var(--accent);}
+.check-main{flex:1;min-width:0;}
+.check-title{display:block;font-size:12.5px;color:var(--text);}
+.check-desc{display:block;font-size:10.5px;color:var(--text-3);margin-top:1px;}
+
+.wl-list{
+  border:1px solid var(--border);border-radius:7px;
+  overflow:hidden;
+}
+.wl-row{
+  display:flex;align-items:center;gap:8px;
+  padding:6px 9px;
+  border-top:1px solid var(--border);
+  font-size:12px;
+}
+.wl-row:first-child{border-top:none;}
+.wl-row:hover{background:var(--row-hover);}
+.wl-kind{font-size:9.5px;color:var(--text-3);border:1px solid var(--border);border-radius:4px;padding:0 4px;}
+.wl-row .spacer{flex:1;}
+.wl-del{width:20px;height:20px;border-radius:5px;display:grid;place-items:center;color:var(--text-3);}
+.wl-del:hover{background:var(--danger-weak);color:var(--danger);}
+
+.inline-form{display:flex;gap:7px;align-items:center;}
+.input{
+  height:30px;padding:0 9px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:7px;
+  font-size:12px;color:var(--text);
+  outline:none;
+  transition:border-color .14s ease,box-shadow .14s ease;
+}
+.input::placeholder{color:var(--text-3);}
+.input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-ring);}
+.input.grow{flex:1;min-width:0;}
+
+.num-row{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2);padding:4px 2px;}
+.num{width:62px;text-align:center;font-variant-numeric:tabular-nums;}
+.unit{font-size:12px;color:var(--text-3);}
+
+.switch-row{display:flex;align-items:center;gap:10px;padding:4px 2px;}
+.switch{position:relative;width:34px;height:20px;flex:0 0 auto;}
+.switch input{position:absolute;opacity:0;width:0;height:0;}
+.track{
+  position:absolute;inset:0;border-radius:999px;
+  background:var(--border-strong);
+  transition:background-color .16s ease;
+}
+.track::after{
+  content:"";position:absolute;top:2px;left:2px;
+  width:16px;height:16px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2);
+  transition:transform .16s ease;
+}
+.switch input:checked + .track{background:var(--accent);}
+.switch input:checked + .track::after{transform:translateX(14px);}
+.switch-label{font-size:12.5px;color:var(--text);}
+
+.textarea{
+  width:100%;min-height:104px;resize:vertical;
+  padding:8px 10px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:7px;
+  font-size:12.5px;line-height:1.7;color:var(--text);
+  outline:none;
+  transition:border-color .14s ease,box-shadow .14s ease;
+}
+.textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-ring);}
+.textarea::placeholder{color:var(--text-3);}
+.hint{font-size:10.5px;color:var(--text-3);line-height:1.6;}
+
+.form-foot{display:flex;align-items:center;gap:10px;padding:2px 2px 6px;}
+.form-foot .spacer{flex:1;}
+
+/* —— 标签 —— */
+.tags-head{flex:0 0 auto;display:flex;align-items:flex-start;gap:12px;padding-bottom:10px;}
+.scan-state{font-size:11px;color:var(--text-3);margin-top:3px;}
+.tags-list{
+  flex:1;min-height:0;overflow-y:auto;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-md);
+  box-shadow:var(--shadow-1);
+  overflow-x:hidden;
+}
+.tag-row{
+  width:100%;text-align:left;
+  display:flex;align-items:center;gap:9px;
+  padding:9px 12px;
+  border-top:1px solid var(--border);
+  transition:background-color .14s ease;
+}
+.tag-row:first-child{border-top:none;}
+.tag-row:hover{background:var(--row-hover);}
+.tag-row.is-active{background:var(--accent-weak);}
+.tag-kind{font-size:10px;color:var(--text-3);flex:0 0 auto;}
+.tag-conv{font-size:12.5px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tag-value{
+  margin-left:auto;flex:0 0 auto;
+  font-size:10.5px;color:var(--accent);
+  background:var(--accent-weak);
+  border-radius:5px;padding:1px 7px;
+}
+.tag-value.is-empty{color:var(--text-3);background:var(--surface-2);}
+.tag-row .spacer{flex:1;}
+.tag-hint{font-size:10px;color:var(--text-3);}
+.tags-foot{flex:0 0 auto;display:flex;gap:7px;padding-top:12px;}
+
+/* —— toast —— */
+.toast{
+  position:fixed;left:50%;bottom:44px;
+  transform:translate(-50%,8px);
+  padding:7px 14px;border-radius:8px;
+  background:var(--text);color:var(--bg);
+  font-size:12px;
+  opacity:0;pointer-events:none;
+  transition:opacity .18s ease,transform .18s ease;
+  box-shadow:var(--shadow-2);
+  z-index:50;
+}
+.toast.show{opacity:.96;transform:translate(-50%,0);}
+
+/* —— 角标 —— */
+.watermark{
+  position:fixed;right:16px;bottom:9px;
+  font-size:10px;color:var(--text-3);opacity:.72;
+  letter-spacing:.02em;pointer-events:none;
+  user-select:none;
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation-duration:.001ms !important;transition-duration:.001ms !important;}
+}
+@media (max-width:1100px){
+  .sidebar{flex-basis:214px;}
+  .thread{padding:18px 18px 10px;}
+  .composer-wrap{padding:4px 16px 14px;}
+  .page-head{padding:0 16px;}
+  .tabs{margin:10px 16px 0;}
+  .tab-panels{padding:10px 16px 14px;}
+}
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <div class="app">
+
+    <!-- ================= 标题条 ================= -->
+    <header class="titlebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 1.6l1.5 4.1 4.1 1.5-4.1 1.5L8 12.8 6.5 8.7 2.4 7.2l4.1-1.5L8 1.6z"/>
+          </svg>
+        </span>
+        <span class="brand-name">AI 工作台</span>
+        <span class="brand-ver">v9.21</span>
+      </div>
+      <div class="tb-spacer"></div>
+      <span class="tb-note">本地模型 · 桌面 Agent</span>
+      <button class="win-btn" id="themeBtn" title="切换深色 / 浅色">
+        <svg class="ico-moon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13.2 9.4A5.6 5.6 0 0 1 6.6 2.8a5.6 5.6 0 1 0 6.6 6.6z"/>
+        </svg>
+        <svg class="ico-sun" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+          <circle cx="8" cy="8" r="2.9"/>
+          <path d="M8 1.6v1.5M8 12.9v1.5M1.6 8h1.5M12.9 8h1.5M3.5 3.5l1 1M11.5 11.5l1 1M12.5 3.5l-1 1M4.5 11.5l-1 1"/>
+        </svg>
+      </button>
+      <div class="win-btns" aria-hidden="true">
+        <span class="win-btn"><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2"><path d="M2 5h6"/></svg></span>
+        <span class="win-btn"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.2" y="2.2" width="5.6" height="5.6" rx="1"/></svg></span>
+        <span class="win-btn is-close"><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2"><path d="M2.4 2.4l5.2 5.2M7.6 2.4L2.4 7.6"/></svg></span>
+      </div>
+    </header>
+
+    <div class="shell">
+
+      <!-- ================= 侧栏 ================= -->
+      <aside class="sidebar">
+        <nav class="nav">
+          <button class="nav-item is-active" data-page="chat">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13.4 7.8a5.4 5.4 0 0 1-8 4.7l-2.8.8.8-2.7A5.4 5.4 0 1 1 13.4 7.8z"/>
+            </svg>
+            <span>对话</span>
+          </button>
+          <button class="nav-item" data-page="im">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4.6" width="10" height="7.9" rx="2.4"/>
+              <path d="M8 2.4v2.2M6 7.4h.01M10 7.4h.01M6.2 9.8h3.6"/>
+            </svg>
+            <span>钉钉助手</span>
+            <span class="nav-badge">5</span>
+          </button>
+        </nav>
+
+        <div class="side-sec">
+          <div class="side-head">
+            <span>对话列表</span>
+            <span class="spacer"></span>
+            <button class="side-add" title="新建对话">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></svg>
+            </button>
+          </div>
+          <div class="conv-list">
+            <div class="conv-group">今天</div>
+            <button class="conv is-active">
+              <span class="conv-title">整理初三(2)班家长会材料</span>
+              <span class="conv-preview">已经把 8 份名单拆好了</span>
+            </button>
+            <button class="conv">
+              <span class="conv-title">信息学奥赛报名表核对</span>
+              <span class="conv-preview">缺 2 个人的身份证号</span>
+            </button>
+            <button class="conv">
+              <span class="conv-title">把复盘日志做成周报</span>
+              <span class="conv-preview">Word 已经生成，在桌面</span>
+            </button>
+            <div class="conv-group">更早</div>
+            <button class="conv">
+              <span class="conv-title">教室座位表排布</span>
+              <span class="conv-preview">按身高和视力重新排</span>
+            </button>
+            <button class="conv">
+              <span class="conv-title">爬一下学校通知公告</span>
+              <span class="conv-preview">近 30 天，导出成表格</span>
+            </button>
+            <button class="conv">
+              <span class="conv-title">帮妈妈写生日祝福</span>
+              <span class="conv-preview">改得再家常一点</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="side-foot">
+          <span class="ws-dot"></span>
+          <span class="ws-name">文档 / AI工作台</span>
+          <span class="ws-size">128 MB</span>
+        </div>
+      </aside>
+
+      <!-- ================= 主区域 ================= -->
+      <main class="main">
+
+        <!-- ------------------ 对话页 ------------------ -->
+        <section class="page" id="page-chat">
+          <div class="page-head">
+            <div>
+              <h1>整理初三(2)班家长会材料</h1>
+              <p class="page-sub">本地模型 · 34 条消息 · 22:41 保存</p>
+            </div>
+            <span class="head-spacer"></span>
+            <button class="head-chip">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7.2" cy="7.2" r="4.4"/><path d="m10.6 10.6 2.6 2.6"/></svg>
+              搜索
+            </button>
+            <button class="head-chip">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.6v7.2M5 7l3 3 3-3M3 12.4h10"/></svg>
+              导出
+            </button>
+          </div>
+
+          <div class="thread-wrap" id="threadWrap">
+            <div class="thread" id="thread">
+
+              <div class="thread-start">今天 22:31</div>
+
+              <!-- 用户 -->
+              <div class="msg msg-user">
+                <div class="bubble">桌面上「家长会」文件夹里有一份名单，按小组拆开，每个组长一份 Word。</div>
+                <div class="msg-time">22:31</div>
+              </div>
+
+              <!-- 助手 -->
+              <div class="msg msg-ai">
+                <div class="msg-role">
+                  <span class="avatar">
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                  </span>
+                  <span class="role-name">AI 工作台</span>
+                  <span class="role-time">22:31</span>
+                </div>
+
+                <!-- 思维链 -->
+                <div class="think-card open">
+                  <button class="think-head" onclick="this.parentNode.classList.toggle('open')">
+                    <span class="think-ico">
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M6.2 2.6a2.4 2.4 0 0 0-2.4 2.4c0 .5.1.9.4 1.3a2.4 2.4 0 0 0 .3 4.3 2.4 2.4 0 0 0 4.3 1.6V2.6H6.2z"/>
+                        <path d="M9.8 2.6a2.4 2.4 0 0 1 2.4 2.4c0 .5-.1.9-.4 1.3a2.4 2.4 0 0 1-.3 4.3 2.4 2.4 0 0 1-4.3 1.6"/>
+                      </svg>
+                    </span>
+                    <span class="think-title">深度思考</span>
+                    <span class="think-meta">4 步 · 12.3s</span>
+                    <span class="spacer"></span>
+                    <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg>
+                  </button>
+                  <div class="think-body"><div>
+                    <ol class="steps">
+                      <li><b>定位文件</b>在 <code>桌面/家长会</code> 找到 <code>名单.xlsx</code>，共 48 行、6 列。</li>
+                      <li><b>核对口径</b>「小组」列有 8 个取值，人数分别是 6×8；和班主任在群里说的 48 人对得上。</li>
+                      <li><b>确认模板</b>沿用了上次的组长模板，标题、日期、表格列宽都没有改动。</li>
+                      <li><b>生成文件</b>每组一份，文件名取组长姓名，统一放到同一目录下。</li>
+                    </ol>
+                  </div></div>
+                </div>
+
+                <!-- 工具胶囊 -->
+                <div class="tool">
+                  <button class="tool-pill" onclick="this.parentNode.classList.toggle('open');this.setAttribute('aria-expanded',this.parentNode.classList.contains('open'))" aria-expanded="false">
+                    <span class="tool-ico">
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="8" cy="8" r="2.2"/><path d="M8 2.2v1.3M8 12.5v1.3M2.2 8h1.3M12.5 8h1.3M4 4l.9.9M11.1 11.1l.9.9M12 4l-.9.9M4.9 11.1 4 12"/>
+                      </svg>
+                    </span>
+                    <span class="tool-name">执行 Python</span>
+                    <span class="tool-arg">按小组拆分名单并生成 8 份 Word</span>
+                    <span class="tool-ok">
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3.4 8.4 3 3 6.2-6.2"/></svg>
+                    </span>
+                    <span class="tool-dur">2.4s</span>
+                    <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg>
+                  </button>
+                  <div class="tool-body"><div>
+<pre>读取  桌面/家长会/名单.xlsx
+       48 行 · 8 组 · 缺 0 个字段
+装载  组长模板.docx
+写入  桌面/家长会/第1组_王雨桐.docx
+      …
+      桌面/家长会/第8组_陈子涵.docx
+<span class="ok">完成：8 个文件 · 用时 2.4s</span></pre>
+                  </div></div>
+                </div>
+
+                <!-- 正文 -->
+                <div class="md">
+                  <p>名单核对完了，一共 <b>48 人</b>，和班主任给的数字对得上。已经按 8 个小组拆好，每组 6 人，文件放在 <code>桌面/家长会</code>，文件名用的是组长姓名，方便直接转发：</p>
+                  <div class="files">
+                    <div class="file-row">
+                      <span class="file-ico">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 2.4h4.6L12 5.8v7.8H4z"/><path d="M8.6 2.4v3.4H12"/></svg>
+                      </span>
+                      <div>
+                        <div class="file-name">第1组_王雨桐.docx</div>
+                        <div class="file-meta">6 人 · 28 KB · 22:31</div>
+                      </div>
+                      <span class="spacer"></span>
+                      <button class="file-open">打开</button>
+                    </div>
+                    <div class="file-row">
+                      <span class="file-ico">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 2.4h4.6L12 5.8v7.8H4z"/><path d="M8.6 2.4v3.4H12"/></svg>
+                      </span>
+                      <div>
+                        <div class="file-name">第2组_李明轩.docx</div>
+                        <div class="file-meta">6 人 · 27 KB · 22:31</div>
+                      </div>
+                      <span class="spacer"></span>
+                      <button class="file-open">打开</button>
+                    </div>
+                    <div class="file-row">
+                      <span class="file-ico">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 2.4h4.6L12 5.8v7.8H4z"/><path d="M8.6 2.4v3.4H12"/></svg>
+                      </span>
+                      <div>
+                        <div class="file-name">第3组_张一鸣.docx</div>
+                        <div class="file-meta">6 人 · 28 KB · 22:31</div>
+                      </div>
+                      <span class="spacer"></span>
+                      <button class="file-open">打开</button>
+                    </div>
+                    <div class="file-row">
+                      <span class="file-open" style="color:var(--text-3);cursor:default;">另外 5 份已生成</span>
+                      <span class="spacer"></span>
+                      <button class="file-open">打开文件夹</button>
+                    </div>
+                  </div>
+                  <p>需要的话我可以再导出一份 PDF 汇总，或者把 8 份合成一个总表。</p>
+                </div>
+
+                <div class="msg-actions">
+                  <button class="act">复制</button>
+                  <button class="act">朗读</button>
+                  <button class="act">重答</button>
+                  <span class="spacer"></span>
+                  <span class="msg-meta">DeepSeek-V3.2 · 1,842 tokens · 8.2s</span>
+                </div>
+              </div>
+
+              <!-- 用户 -->
+              <div class="msg msg-user">
+                <div class="bubble">第三组和第五组各加一个人，重新生成这两份。旧版别覆盖。</div>
+                <div class="msg-time">22:39</div>
+              </div>
+
+              <!-- 流式演示位 -->
+              <div class="msg msg-ai" id="liveMsg" hidden>
+                <div class="msg-role">
+                  <span class="avatar">
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                  </span>
+                  <span class="role-name">AI 工作台</span>
+                  <span class="role-time" id="liveTime">22:39</span>
+                  <span class="typing-hint" id="liveHint">正在生成…</span>
+                </div>
+                <div class="md live" id="liveBody"></div>
+                <div class="msg-actions" id="liveActions" hidden>
+                  <button class="act">复制</button>
+                  <button class="act">朗读</button>
+                  <button class="act">重答</button>
+                  <span class="spacer"></span>
+                  <span class="msg-meta">DeepSeek-V3.2 · 612 tokens · 3.7s</span>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="thread-fade"></div>
+
+          <div class="composer-wrap">
+            <div class="composer-inner">
+              <div class="state-line">
+                <span class="pulse" id="stateDot"></span>
+                <span id="stateText">就绪 · 上下文 12%</span>
+              </div>
+              <div class="team-row">
+                <button class="team-chip">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 2.3 13.6 8 8 13.7 2.4 8z"/></svg>
+                  团队 · 不使用
+                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg>
+                </button>
+                <button class="team-chip"><span class="dot"></span>记忆已开启</button>
+              </div>
+
+              <div class="composer" id="composer">
+                <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift + Enter 换行"></textarea>
+                <div class="composer-bar">
+                  <button class="ibtn" title="添加文件">
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3.4v9.2M3.4 8h9.2"/></svg>
+                  </button>
+                  <span class="spacer"></span>
+                  <button class="model-pill">
+                    DeepSeek-V3.2
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg>
+                  </button>
+                  <button class="ibtn" title="语音输入">
+                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="6" y="2.4" width="4" height="7" rx="2"/><path d="M3.8 7.4a4.2 4.2 0 0 0 8.4 0M8 11.6v2"/>
+                    </svg>
+                  </button>
+                  <button class="send" id="sendBtn" title="发送" disabled>
+                    <svg class="ico-send" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.8V3.6M4.3 7.1 8 3.4l3.7 3.7"/></svg>
+                    <svg class="ico-stop" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.6"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="composer-hint">文件 / 图片可以直接拖进窗口 · 生成中再点一次是停止</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ------------------ 钉钉助手页 ------------------ -->
+        <section class="page" id="page-im" hidden>
+          <div class="page-head">
+            <div class="im-title">
+              <h1>钉钉助手</h1>
+              <span class="pill-live"><i></i>运行中</span>
+            </div>
+            <span class="head-spacer"></span>
+            <span class="im-head-extra">间隔 25 秒</span>
+            <button class="btn">停止助理</button>
+          </div>
+
+          <div class="tabs" role="tablist">
+            <button class="tab is-active" data-tab="msgs">消息 <span class="tab-count" id="tabCount">9</span></button>
+            <button class="tab" data-tab="settings">设置</button>
+            <button class="tab" data-tab="tags">标签</button>
+          </div>
+
+          <div class="tab-panels">
+
+            <!-- 面板①：消息 -->
+            <div class="panel is-active" data-panel="msgs">
+              <div class="im-cols">
+                <div class="im-col">
+                  <div class="col-head">
+                    新消息（未回复）
+                    <span class="count" id="leftCount">5</span>
+                  </div>
+                  <div class="col-scroll" id="colLeft">
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">李老师</span><span class="kind">群聊</span><span class="im-time">22:31</span></div>
+                        <p class="im-text">明天下午三点的家长会，麻烦你把各组的座位表发我一份，辛苦了。</p>
+                        <div class="im-sub"><span class="conv-name">初三(2)班 · 家长群</span><span class="st st-wait">待处理</span></div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">妈妈</span><span class="kind">单聊</span><span class="im-time">21:58</span></div>
+                        <p class="im-text">周末回来吃饭吗？你爸买了螃蟹。</p>
+                        <div class="im-sub"><span class="conv-name">单聊 · 妈妈</span><span class="st st-wait">待处理</span></div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">王雨桐妈妈</span><span class="kind">群聊</span><span class="im-time">21:40</span></div>
+                        <p class="im-text">浩辰，第三组的名单是不是漏了张一鸣？我看别的组都是 7 个人。</p>
+                        <div class="im-sub"><span class="conv-name">初三(2)班 · 家长群</span><span class="st st-manual">需人工</span></div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">张老师</span><span class="kind">单聊</span><span class="im-time">20:12</span></div>
+                        <p class="im-text">信息学奥赛的报名表我放你桌上了，明天放学前交。</p>
+                        <div class="im-sub"><span class="conv-name">单聊 · 张老师</span><span class="st st-work">处理中</span></div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">陈子涵</span><span class="kind">单聊</span><span class="im-time">昨天</span></div>
+                        <p class="im-text">今天的数学作业拍到哪了？我这边只看到第二页。</p>
+                        <div class="im-sub"><span class="conv-name">单聊 · 陈子涵</span><span class="st st-fail">发送失败</span></div>
+                      </div>
+                    </label>
+
+                  </div>
+                </div>
+
+                <div class="im-col">
+                  <div class="col-head">
+                    已处理
+                    <span class="count" id="rightCount">4</span>
+                  </div>
+                  <div class="col-scroll" id="colRight">
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">刘老师</span><span class="kind">群聊</span><span class="im-time">18:22</span></div>
+                        <p class="im-text">教室的多媒体今天能用吗？我下午想放个视频。</p>
+                        <div class="im-sub"><span class="conv-name">初三(2)班 · 家长群</span><span class="st st-done">已回复</span></div>
+                        <div class="ai-reply">
+                          <span class="ai-badge">
+                            <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                            AI 回复
+                          </span>
+                          <p>能用的，投影线在讲台左手边第二个抽屉。我三点前去把机子打开。</p>
+                        </div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">李明妈妈</span><span class="kind">单聊</span><span class="im-time">17:40</span></div>
+                        <p class="im-text">李明今天几点到家？我下班晚，怕他进不去门。</p>
+                        <div class="im-sub"><span class="conv-name">单聊 · 李明妈妈</span><span class="st st-done">已回复</span></div>
+                        <div class="ai-reply">
+                          <span class="ai-badge">
+                            <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                            AI 回复
+                          </span>
+                          <p>他今天值日，大概六点到家。钥匙我让他带着了。</p>
+                        </div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">初三(2)班</span><span class="kind">群聊</span><span class="im-time">16:05</span></div>
+                        <p class="im-text">群文件里的复习提纲还是上周的，谁更新一下？</p>
+                        <div class="im-sub"><span class="conv-name">初三(2)班 · 家长群</span><span class="st st-done">已回复</span></div>
+                        <div class="ai-reply">
+                          <span class="ai-badge">
+                            <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                            AI 回复
+                          </span>
+                          <p>已经换成这周的了，在「群文件 / 复习」下面，文件名带 10.24。</p>
+                        </div>
+                      </div>
+                    </label>
+
+                    <label class="im-row">
+                      <input class="cb" type="checkbox">
+                      <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                      <div class="im-card">
+                        <div class="im-top"><span class="who">爸爸</span><span class="kind">单聊</span><span class="im-time">昨天</span></div>
+                        <p class="im-text">这周还回来吗？</p>
+                        <div class="im-sub"><span class="conv-name">单聊 · 爸爸</span><span class="st st-done">已回复</span></div>
+                        <div class="ai-reply">
+                          <span class="ai-badge">
+                            <svg width="9" height="9" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg>
+                            AI 回复
+                          </span>
+                          <p>这周在学校复习，周日下午回。</p>
+                        </div>
+                      </div>
+                    </label>
+
+                  </div>
+                </div>
+              </div>
+
+              <div class="im-foot">
+                <button class="btn btn-danger" id="delBtn" disabled>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.6h10M6.2 4.6V3.2h3.6v1.4M4.4 4.6l.6 8.2h6l.6-8.2"/></svg>
+                  <span id="delLabel">删除选中</span>
+                </button>
+                <button class="btn">全部交给 AI</button>
+                <button class="btn btn-ghost">更多管理</button>
+                <span class="spacer"></span>
+                <span class="sel-info" id="selInfo">未选择</span>
+              </div>
+            </div>
+
+            <!-- 面板②：设置 -->
+            <div class="panel" data-panel="settings">
+              <div class="panel-scroll">
+                <div class="form">
+
+                  <div class="form-card">
+                    <div class="form-head">自动回复范围<span>不在范围内的消息只在左栏提醒，不会代回。</span></div>
+                    <div class="form-body">
+                      <label class="check-row">
+                        <input class="cb" type="checkbox" checked>
+                        <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                        <span class="check-main">
+                          <span class="check-title">群聊</span>
+                          <span class="check-desc">家长群、班委群这类多人群里的消息</span>
+                        </span>
+                      </label>
+                      <label class="check-row">
+                        <input class="cb" type="checkbox" checked>
+                        <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                        <span class="check-main">
+                          <span class="check-title">单聊</span>
+                          <span class="check-desc">一对一的会话</span>
+                        </span>
+                      </label>
+                      <label class="check-row">
+                        <input class="cb" type="checkbox">
+                        <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                        <span class="check-main">
+                          <span class="check-title">群里只有 @我 的消息才回</span>
+                          <span class="check-desc">勾上之后，群里没叫到你的消息一律不动</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="form-card">
+                    <div class="form-head">白名单<span>这些会话不受上面的范围限制，每条都回。</span></div>
+                    <div class="form-body">
+                      <div class="wl-list" id="wlList">
+                        <div class="wl-row"><span>李老师</span><span class="wl-kind">单聊</span><span class="spacer"></span><button class="wl-del" title="移除"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></svg></button></div>
+                        <div class="wl-row"><span>初三(2)班 · 家长群</span><span class="wl-kind">群聊</span><span class="spacer"></span><button class="wl-del" title="移除"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></svg></button></div>
+                      </div>
+                      <div class="inline-form">
+                        <input class="input grow" id="wlInput" placeholder="群名 或 对方姓名">
+                        <select class="input" id="wlKind" style="width:82px;padding:0 6px;">
+                          <option value="群聊">群聊</option>
+                          <option value="单聊">单聊</option>
+                        </select>
+                        <button class="btn" id="wlAdd">添加</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="form-card">
+                    <div class="form-head">什么时候代我回</div>
+                    <div class="form-body">
+                      <div class="num-row">
+                        我
+                        <input class="input num" id="delay" type="number" min="0" max="3600" value="60">
+                        秒没自己回，才由 AI 代回
+                      </div>
+                      <p class="hint">填 0 表示收到就回。设成 60 秒的话，这一分钟内你本人在钉钉里回了，AI 就不会再插话。</p>
+                    </div>
+                  </div>
+
+                  <div class="form-card">
+                    <div class="form-head">AI 拿不准的时候</div>
+                    <div class="form-body">
+                      <div class="switch-row">
+                        <label class="switch">
+                          <input type="checkbox" id="uncertainSw" checked>
+                          <span class="track"></span>
+                        </label>
+                        <span class="switch-label">拿不准也要回（回下面这句话）</span>
+                      </div>
+                      <input class="input" id="uncertainText" value="消息已纳入收件箱，加急处理中，主人正在赶来的路上，此消息由AI代回">
+                      <p class="hint">关掉的话，拿不准的消息会留在左栏并标成「需人工」，等你自己回，不会瞎编。</p>
+                    </div>
+                  </div>
+
+                  <div class="form-card">
+                    <div class="form-head">我的身份背景<span>AI 替你回消息时会以它为准，写得越具体越像你。</span></div>
+                    <div class="form-body">
+                      <textarea class="textarea" id="identity">我是刘浩辰，初三（2）班班长，荣成三中。
+别人一般叫我「浩辰」，不喜欢被叫全名。
+最近在准备信息学奥赛，周三下午有课，那会儿回不了消息。
+和张老师关系不错，说话可以随意点；跟班主任要客气。</textarea>
+                    </div>
+                  </div>
+
+                  <div class="form-card">
+                    <div class="form-head">其它</div>
+                    <div class="form-body">
+                      <div class="num-row">
+                        检查钉钉新消息的间隔
+                        <input class="input num" id="interval" type="number" min="10" max="600" value="25">
+                        秒
+                      </div>
+                      <div class="switch-row">
+                        <label class="switch">
+                          <input type="checkbox" checked>
+                          <span class="track"></span>
+                        </label>
+                        <span class="switch-label">启用自动回复</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="form-foot">
+                    <span class="hint">改动会在下一次轮询时生效，不用重启。</span>
+                    <span class="spacer"></span>
+                    <button class="btn btn-primary" id="saveBtn">保存设置</button>
+                  </div>
+
+                </div>
+              </div>
+            </div>
+
+            <!-- 面板③：标签 -->
+            <div class="panel" data-panel="tags">
+              <div class="tags-head">
+                <div>
+                  <div style="font-size:12.5px;font-weight:600;">会话标签</div>
+                  <div class="scan-state" id="scanState">上次扫描：今天 21:02 · 23 个会话</div>
+                </div>
+                <span class="head-spacer" style="flex:1;"></span>
+                <button class="btn" id="scanBtn">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.6-3.7M13.2 2.8v2.9h-2.9"/></svg>
+                  扫描并打标签
+                </button>
+              </div>
+
+              <div class="tags-list" id="tagsList">
+                <button class="tag-row is-active">
+                  <span class="tag-kind">【群聊】</span>
+                  <span class="tag-conv">初三(2)班 · 家长群</span>
+                  <span class="tag-value">家长群</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【群聊】</span>
+                  <span class="tag-conv">初三(2)班 · 班委</span>
+                  <span class="tag-value">班委群</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【群聊】</span>
+                  <span class="tag-conv">信息学奥赛集训队</span>
+                  <span class="tag-value">竞赛队</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【单聊】</span>
+                  <span class="tag-conv">李老师</span>
+                  <span class="tag-value">班主任</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【单聊】</span>
+                  <span class="tag-conv">妈妈</span>
+                  <span class="tag-value">妈妈</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【单聊】</span>
+                  <span class="tag-conv">王雨桐妈妈</span>
+                  <span class="tag-value">家长</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【单聊】</span>
+                  <span class="tag-conv">陈子涵</span>
+                  <span class="tag-value is-empty">未标注</span>
+                </button>
+                <button class="tag-row">
+                  <span class="tag-kind">【单聊】</span>
+                  <span class="tag-conv">张老师</span>
+                  <span class="tag-value">竞赛教练</span>
+                </button>
+              </div>
+
+              <div class="tags-foot">
+                <input class="input grow" id="tagInput" placeholder="比如：同班同学 / 班主任 / 妈妈 / 家长群" value="家长群">
+                <button class="btn btn-primary" id="tagSave">保存标签</button>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="watermark">v9.21 Web UI 原型 · 仅演示，未接真实数据</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+  var root = document.documentElement;
+
+  /* ---------------- 主题 ---------------- */
+  var themeBtn = $('#themeBtn');
+  function syncThemeIcon() {
+    var dark = root.dataset.theme === 'dark';
+    themeBtn.querySelector('.ico-moon').style.display = dark ? 'none' : 'block';
+    themeBtn.querySelector('.ico-sun').style.display = dark ? 'block' : 'none';
+  }
+  syncThemeIcon();
+  themeBtn.addEventListener('click', function () {
+    root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    syncThemeIcon();
+  });
+
+  /* ---------------- 页面切换 ---------------- */
+  $$('.nav-item').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      $$('.nav-item').forEach(function (b) { b.classList.toggle('is-active', b === btn); });
+      var page = btn.dataset.page;
+      $$('.page').forEach(function (el) { el.hidden = el.id !== 'page-' + page; });
+    });
+  });
+
+  $$('.conv').forEach(function (c) {
+    c.addEventListener('click', function () {
+      $$('.conv').forEach(function (x) { x.classList.toggle('is-active', x === c); });
+    });
+  });
+
+  /* ---------------- 助手页标签 ---------------- */
+  $$('.tab').forEach(function (t) {
+    t.addEventListener('click', function () {
+      $$('.tab').forEach(function (x) { x.classList.toggle('is-active', x === t); });
+      $$('.panel').forEach(function (p) {
+        p.classList.toggle('is-active', p.dataset.panel === t.dataset.tab);
+      });
+    });
+  });
+
+  /* ---------------- 勾选 / 删除 ---------------- */
+  var delBtn = $('#delBtn');
+  var delLabel = $('#delLabel');
+  var selInfo = $('#selInfo');
+
+  function refreshSel() {
+    var n = $$('.im-row .cb:checked').length;
+    delBtn.disabled = n === 0;
+    delLabel.textContent = n ? '删除选中（' + n + '）' : '删除选中';
+    selInfo.textContent = n ? '已选 ' + n + ' 条' : '未选择';
+    var total = $$('.im-row').length;
+    $('#tabCount').textContent = total;
+  }
+
+  function recount() {
+    var l = $$('#colLeft .im-row').length;
+    var r = $$('#colRight .im-row').length;
+    $('#leftCount').textContent = l;
+    $('#rightCount').textContent = r;
+    $('#tabCount').textContent = l + r;
+    $$('.col-head .count')[0].textContent = l;
+    $$('.col-head .count')[1].textContent = r;
+  }
+
+  document.addEventListener('change', function (e) {
+    if (e.target && e.target.classList.contains('cb')) refreshSel();
+  });
+
+  delBtn.addEventListener('click', function () {
+    var rows = $$('.im-row .cb:checked').map(function (cb) { return cb.closest('.im-row'); });
+    if (!rows.length) return;
+    rows.forEach(function (row, i) {
+      setTimeout(function () {
+        row.classList.add('removing');
+        setTimeout(function () { row.remove(); recount(); }, 190);
+      }, i * 28);
+    });
+    setTimeout(function () {
+      refreshSel();
+      toast('已删除 ' + rows.length + ' 条消息（原型演示）');
+    }, rows.length * 28 + 210);
+  });
+
+  /* ---------------- toast ---------------- */
+  var toastEl = $('#toast');
+  var toastTimer = null;
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 1900);
+  }
+
+  /* ---------------- 白名单 ---------------- */
+  $('#wlAdd').addEventListener('click', function () {
+    var v = $('#wlInput').value.trim();
+    if (!v) { $('#wlInput').focus(); return; }
+    var kind = $('#wlKind').value;
+    var row = document.createElement('div');
+    row.className = 'wl-row';
+    row.innerHTML = '<span></span><span class="wl-kind"></span><span class="spacer"></span>' +
+      '<button class="wl-del" title="移除"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></svg></button>';
+    row.children[0].textContent = v;
+    row.children[1].textContent = kind;
+    $('#wlList').appendChild(row);
+    $('#wlInput').value = '';
+    toast('已加入白名单（原型演示）');
+  });
+
+  $('#wlList').addEventListener('click', function (e) {
+    var b = e.target.closest('.wl-del');
+    if (b) { b.closest('.wl-row').remove(); }
+  });
+
+  /* ---------------- 设置保存 ---------------- */
+  $('#saveBtn').addEventListener('click', function () {
+    toast('设置已保存（原型演示）');
+  });
+
+  /* ---------------- 标签 ---------------- */
+  $$('.tag-row').forEach(function (row) {
+    row.addEventListener('click', function () {
+      $$('.tag-row').forEach(function (x) { x.classList.toggle('is-active', x === row); });
+      var val = row.querySelector('.tag-value').textContent;
+      $('#tagInput').value = val === '未标注' ? '' : val;
+      $('#tagInput').focus();
+    });
+  });
+
+  $('#tagSave').addEventListener('click', function () {
+    var active = $('.tag-row.is-active');
+    if (!active) { toast('先选一条会话'); return; }
+    var v = $('#tagInput').value.trim();
+    var chip = active.querySelector('.tag-value');
+    chip.textContent = v || '未标注';
+    chip.classList.toggle('is-empty', !v);
+    toast(v ? '标签已保存（原型演示）' : '已清空标签（原型演示）');
+  });
+
+  var scanBtn = $('#scanBtn');
+  scanBtn.addEventListener('click', function () {
+    if (scanBtn.disabled) return;
+    scanBtn.disabled = true;
+    var total = 23;
+    var n = 0;
+    var names = ['家长群', '班委群', '李老师', '妈妈', '张老师', '王雨桐妈妈'];
+    var state = $('#scanState');
+    var timer = setInterval(function () {
+      n += 1 + Math.floor(Math.random() * 3);
+      if (n >= total) {
+        n = total;
+        clearInterval(timer);
+        state.textContent = '扫描完成 · ' + total + ' 个会话 · 刚刚';
+        scanBtn.disabled = false;
+        toast('已扫描 ' + total + ' 个会话（原型演示）');
+        return;
+      }
+      state.textContent = '正在扫描 ' + n + '/' + total + '：' + names[n % names.length];
+    }, 240);
+  });
+
+  /* ---------------- 思维链 / 工具胶囊已有内联 onclick ---------------- */
+
+  /* ---------------- 装饰性按钮：给个回执，避免"点了没反应" ---------------- */
+  document.addEventListener('click', function (e) {
+    var act = e.target.closest('.act');
+    if (act) { toast('原型演示：' + act.textContent + '（未接真实功能）'); return; }
+    var open = e.target.closest('.file-open');
+    if (open && open.tagName === 'BUTTON') { toast('原型演示：这里会调用系统默认程序打开'); return; }
+    var chip = e.target.closest('.head-chip');
+    if (chip) { toast('原型演示：' + chip.textContent.trim()); }
+  });
+
+  /* ---------------- 输入框 ---------------- */
+  var input = $('#input');
+  var sendBtn = $('#sendBtn');
+  var composer = $('#composer');
+  var thread = $('#thread');
+  var threadWrap = $('#threadWrap');
+
+  function autosize() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 132) + 'px';
+  }
+  function syncSend() {
+    sendBtn.disabled = !streaming && input.value.trim() === '';
+  }
+
+  input.addEventListener('input', function () { autosize(); syncSend(); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      if (!streaming) send();
+    }
+  });
+
+  /* ---------------- 流式演示 ---------------- */
+  var streaming = false;
+  var stopFlag = false;
+  var timer = null;
+  var replyIndex = 0;
+
+  var replies = [
+    '好，第三组和第五组各加一个人，现在两组各 7 人，其余六组不变。旧版没有覆盖——新生成的两份文件名后面加了 _v2，原来的还在。\n\n新文件已经放到 桌面/家长会/更新 里了，需要我把这两份单独发到群里吗？',
+    '收到。我把这条记进这个对话的记忆里了：以后遇到「按小组拆名单」都默认保留旧版、新文件加 _v2 后缀。\n\n还有别的要一起改的吗？',
+    '可以。这个任务已经交给并行任务池了，大概十几秒。跑完我会把结果直接贴在这里，不会弹窗打扰你。'
+  ];
+
+  function setBusy(on) {
+    streaming = on;
+    composer.classList.toggle('is-busy', on);
+    sendBtn.title = on ? '停止生成' : '发送';
+    sendBtn.disabled = on ? false : input.value.trim() === '';
+    $('#stateDot').style.background = on ? 'var(--accent)' : 'var(--ok)';
+    $('#stateText').textContent = on ? '正在生成回复…' : '就绪 · 上下文 12%';
+  }
+
+  function scrollBottom(force) {
+    var near = threadWrap.scrollHeight - threadWrap.scrollTop - threadWrap.clientHeight < 140;
+    if (force || near) threadWrap.scrollTop = threadWrap.scrollHeight;
+  }
+
+  function typeInto(container, text, done) {
+    var span = document.createElement('span');
+    var caret = document.createElement('span');
+    caret.className = 'caret';
+    container.appendChild(span);
+    container.appendChild(caret);
+    var i = 0;
+    setBusy(true);
+    stopFlag = false;
+
+    function finish() {
+      if (!streaming) return;
+      clearTimeout(timer);
+      caret.remove();
+      span.textContent = text;
+      setBusy(false);
+      if (done) done();
+    }
+
+    function tick() {
+      if (stopFlag) { finish(); return; }
+      var step = 1 + Math.floor(Math.random() * 2);
+      i = Math.min(text.length, i + step);
+      span.textContent = text.slice(0, i);
+      scrollBottom(false);
+      if (i >= text.length) { finish(); return; }
+      timer = setTimeout(tick, 26);
+    }
+    tick();
+  }
+
+  function appendUser(text) {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg msg-user';
+    var b = document.createElement('div');
+    b.className = 'bubble';
+    b.textContent = text;
+    var t = document.createElement('div');
+    t.className = 'msg-time';
+    t.textContent = nowLabel();
+    wrap.appendChild(b);
+    wrap.appendChild(t);
+    thread.appendChild(wrap);
+    scrollBottom(true);
+  }
+
+  function appendLive() {
+    var wrap = document.createElement('div');
+    wrap.className = 'msg msg-ai';
+    wrap.innerHTML =
+      '<div class="msg-role">' +
+        '<span class="avatar"><svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.4 3.9 3.9 1.4-3.9 1.4L8 12.4 6.6 8.5 2.7 7.1l3.9-1.4L8 1.8z"/></svg></span>' +
+        '<span class="role-name">AI 工作台</span>' +
+        '<span class="role-time">' + nowLabel() + '</span>' +
+        '<span class="typing-hint">正在生成…</span>' +
+      '</div>' +
+      '<div class="md live"></div>' +
+      '<div class="msg-actions" hidden>' +
+        '<button class="act">复制</button><button class="act">朗读</button><button class="act">重答</button>' +
+        '<span class="spacer"></span><span class="msg-meta">DeepSeek-V3.2 · 612 tokens · 3.7s</span>' +
+      '</div>';
+    thread.appendChild(wrap);
+    scrollBottom(true);
+    return wrap;
+  }
+
+  function nowLabel() {
+    var d = new Date();
+    var p = function (n) { return n < 10 ? '0' + n : '' + n; };
+    return p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function streamInto(wrap, text, done) {
+    var body = wrap.querySelector('.md');
+    var hint = wrap.querySelector('.typing-hint');
+    body.innerHTML = '';
+    typeInto(body, text, function () {
+      hint.remove();
+      wrap.querySelector('.msg-actions').hidden = false;
+      scrollBottom(true);
+      if (done) done();
+    });
+  }
+
+  function send() {
+    var text = input.value.trim();
+    if (!text || streaming) return;
+    appendUser(text);
+    input.value = '';
+    autosize();
+    syncSend();
+    var wrap = appendLive();
+    setTimeout(function () {
+      streamInto(wrap, replies[replyIndex % replies.length]);
+      replyIndex++;
+    }, 420);
+  }
+
+  sendBtn.addEventListener('click', function () {
+    if (streaming) { stopFlag = true; return; }
+    send();
+  });
+
+  /* 首屏演示：自动流式输出一次 */
+  var liveMsg = $('#liveMsg');
+  setTimeout(function () {
+    liveMsg.hidden = false;
+    threadWrap.scrollTop = threadWrap.scrollHeight;
+    var body = $('#liveBody');
+    var hint = $('#liveHint');
+    typeInto(body, replies[0], function () {
+      hint.remove();
+      $('#liveActions').hidden = false;
+      threadWrap.scrollTop = threadWrap.scrollHeight;
+    });
+  }, 1100);
+
+  /* 初始化 */
+  autosize();
+  syncSend();
+  recount();
+  refreshSel();
+})();
+</script>
+</body>
+</html>

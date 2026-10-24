@@ -16,6 +16,8 @@ DEFAULT_CFG = {
     "interval": 25,        # 轮询间隔（秒）
     "scope": "self",       # self=只听自己发给自己(自聊)；all=所有会话；at_me=群里@我
     "auto_reply": True,    # 处理完自动把结果发回钉钉
+    # ★ v9.20.0：scope=all 时最多轮询多少个会话（多了会一轮几十次 dws 调用，很慢）
+    "max_convs": 15,
     "self_cid": "",        # 「自己给自己」会话的 openConversationId（自动探测后缓存）
     "processed": [],       # 已处理过的 messageId（去重，最多留 800 条）
     "primed": False,       # 是否已「跳过历史消息」（首次启动只处理新消息）
@@ -27,6 +29,8 @@ class AssistantService(QObject):
     """钉钉消息轮询服务。"""
 
     incoming = pyqtSignal(dict)   # 新消息 {msgid, cid, conv, sender, text, time}
+    # ★ v9.20.0：我自己本人在钉钉里发的消息（不进处理队列，只用来补全上下文）
+    outgoing = pyqtSignal(dict)
     log = pyqtSignal(str)
     state = pyqtSignal(bool)      # 开/停
 
@@ -60,9 +64,19 @@ class AssistantService(QObject):
         return self._running
 
     def apply_cfg(self, cfg):
-        for k in ("interval", "scope", "auto_reply"):
+        old_scope = self.cfg.get("scope")
+        for k in ("interval", "scope", "auto_reply", "max_convs"):
             if k in cfg:
                 self.cfg[k] = cfg[k]
+        # ★ v9.20.0：监听范围变了就得重新「跳过历史」。
+        #   否则从「只听自聊」切到「所有会话」的那一瞬间，程序会把过去几个月的
+        #   聊天记录全当成新消息，一条条排队回过去 —— 这是灾难。
+        new_scope = cfg.get("scope")
+        if new_scope and new_scope != old_scope:
+            self.cfg["primed"] = False
+            self.cfg["processed"] = []
+            self.log.emit("监听范围已改为「%s」，现有历史消息会跳过，只处理之后的新消息"
+                          % self._scope_name())
         self.save()
 
     def mark_processed(self, msgid):
@@ -170,6 +184,13 @@ class AssistantService(QObject):
                 except Exception as e:
                     self.log.emit("列会话失败：%s" % e)
                     return 0
+                # ★ v9.20.0：一次别读太多会话（每个会话一次 dws 调用，很慢）
+                try:
+                    cap = max(1, int(self.cfg.get("max_convs") or 15))
+                except Exception:
+                    cap = 15
+                if len(items) > cap:
+                    items = items[:cap]
                 targets = [(c.get("openConversationId"), c.get("conversationName") or "")
                            for c in items]
             for cid, name in targets:
@@ -183,7 +204,7 @@ class AssistantService(QObject):
                 for m in msgs:
                     found.append(self._wrap(m, cid, name))
 
-        new, seen = [], set()
+        new, mine_out, seen = [], [], set()
         for it in found:
             if not it or not it.get("msgid") or it.get("ai_sent"):
                 continue
@@ -192,7 +213,12 @@ class AssistantService(QObject):
             if not (it.get("text") or "").strip():
                 continue
             if scope != "self" and mine and it.get("sender") == mine:
-                continue          # 自己在别的会话里发的，不算给助理的任务
+                # ★ v9.20.0：我自己在钉钉里发的，不算给助理的任务，
+                #   但要单独抛出去 —— AI 得知道"我本人说过什么"，
+                #   延时回复也要靠它判断"你是不是已经自己回过了"。
+                seen.add(it["msgid"])
+                mine_out.append(it)
+                continue
             seen.add(it["msgid"])
             new.append(it)
         new.sort(key=lambda x: x.get("time") or "")
@@ -203,11 +229,17 @@ class AssistantService(QObject):
             self.cfg["primed"] = True
             p = list(self.cfg.get("processed") or [])
             p.extend([it["msgid"] for it in new])
+            p.extend([it["msgid"] for it in mine_out])
             self.cfg["processed"] = p[-MAX_PROCESSED:]
             self.save()
             self.log.emit("已跳过 %d 条历史消息，从现在开始只处理新消息" % len(new))
             return 0
 
+        for it in mine_out:
+            try:
+                self.outgoing.emit(it)
+            except Exception:
+                pass
         for it in new:
             self.incoming.emit(it)
         if new:

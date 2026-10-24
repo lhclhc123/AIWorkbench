@@ -41,3 +41,9 @@ settings.json
 Thumbs.db
 desktop.ini
 启动DeepSeek网页.bat
+
+# ---- 本地日志（构建 / 回归 / 探针输出，常含本机绝对路径，不进仓库）----
+*.log
+*.log.*
+probe_*.out
+build_v*_log.txt

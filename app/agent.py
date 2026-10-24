@@ -36,6 +36,9 @@ from . import worklog as _worklog  # noqa: E402
 #   风格与 webcap 一致（fn(args, ctx=None) -> str，永远返回中文、永远不抛异常）。
 #   import 放在这里；TOOLS_MORE / readonly_tools() / resolve_flags() 都在 tools_more 里。
 from . import tools_more as _tools_more  # noqa: E402
+# ★ v9.20.0：按行读 / 按行查 / 按行改（read_file 分批读 + find_lines + edit_lines
+#   + apply_patch）。实现全部在 app/devtools.py，这里只做注册与分发。
+from . import devtools as _devtools  # noqa: E402
 
 # 定时任务的文案工具（describe / next_text 在 agent 里要直接用）
 from . import scheduler as _sched_mod  # noqa: E402
@@ -44,9 +47,13 @@ from . import scheduler as _sched_mod  # noqa: E402
 KNOWN_TOOLS = (
     # 读 / 理解
     "read_file", "list_dir", "read_document", "read_image", "search_files",
+    #   ★ v9.20.0：按内容查行号（read_file 的分批读也在 devtools 里）
+    "find_lines",
     "fetch_url", "system_info", "now", "search_history", "window_list",
     # 写 / 生成
     "write_file", "create_document", "file_op", "open_path", "archive",
+    #   ★ v9.20.0：按行号小范围改（改代码优先用它，别再整文件重写）
+    "edit_lines", "apply_patch",
     # 执行 / 系统
     "run_command", "run_python", "build_exe", "list_processes", "kill_process",
     "clipboard", "screenshot", "notify",
@@ -90,15 +97,21 @@ KNOWN_TOOLS = (
 # ★ 只此一份，别再在 chat_worker / main_window 里各抄一遍（会漂移）——
 #   它决定 write_done（假成功防御）、完成度看门狗、以及工作总结里的「成功/未完成」。
 WRITE_TOOLS = ("write_file", "create_document", "archive",
-               "download_file", "screenshot", "build_exe")
+               "download_file", "screenshot", "build_exe",
+               # ★ v9.20.0：按行号小改也是"真的改了文件"——
+               #   不进这张表的话，write_done 不置位，完成度看门狗会以为没做完。
+               "edit_lines", "apply_patch")
 
 # ★ v9.18.0：会产生文件、必须过"写沙箱闸门"的工具（比 WRITE_TOOLS 更全）——
 #   多出来的 file_op / image_op / create_chart / web_form_batch 也能写文件，
 #   只是不进 write_done 统计（那套语义另说），所以单独一张表。
 #   UI 层用它在这些工具上挂"确认框"，好让**工作区外的写入**能由用户点头。
+#   ⚠ v9.20.0：edit_lines / apply_patch 会**原地改已有文件**，比新建更危险，
+#   必须在这张表里 —— 漏了就等于给模型开了一个绕过写沙箱的后门。
 SANDBOX_WRITE_TOOLS = ("write_file", "create_document", "archive", "download_file",
                        "screenshot", "build_exe", "file_op", "image_op",
-                       "create_chart", "web_form_batch")
+                       "create_chart", "web_form_batch",
+                       "edit_lines", "apply_patch")
 
 # 模型偶尔会用「别名 / 技能名 / 近似名」当工具名（实测：会把技能 slug
 # 直接当工具名调）。这里做一次友好归一，既能自动路由，也能让日志/界面
@@ -740,6 +753,9 @@ WRITE_NUDGE_HINT = (
     "这个任务需要你真正地创建或修改文件，但你还没有调用过任何写入类工具。\n"
     "你是在用户本机真实运行的程序，完全可以写文件；请立刻真正调用工具：\n"
     "- 写文本/代码：<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"文件名\",\"content\":\"完整内容\"}}</tool_call>\n"
+    "- 改已有文件的某几行（推荐，别整文件重写）：\n"
+    "  <tool_call>{\"name\":\"edit_lines\",\"arguments\":"
+    "{\"path\":\"文件名\",\"start\":10,\"end\":12,\"expect\":\"原来那三行\",\"new_text\":\"改后的内容\"}}</tool_call>\n"
     "- 生成 Word/Excel/PPT/PDF：<tool_call>{\"name\":\"create_document\",\"arguments\":"
     "{\"path\":\"报告.docx\",\"content\":\"# 标题\\n\\n正文…\"}}</tool_call>\n"
     "然后基于真实写入结果答复用户。\n"
@@ -1077,6 +1093,7 @@ def completion_gaps(user_text, tools_used, write_done, verified_after_write,
         if "update_plan" not in tools_used:
             gaps.append("还没有用 update_plan 列出任务清单")
     if needs_read_action(t) and not (tools_used & {"list_dir", "read_file",
+                                                   "find_lines",
                                                    "read_document", "search_files",
                                                    "list_processes", "system_info",
                                                    "list_tasks", "fetch_url",
@@ -1220,8 +1237,10 @@ VERIFY_FIX_HINT = (
     "---------- 真实运行输出 ----------\n{output}\n---------- 输出结束 ----------\n"
     "它**没有通过**。现在按顺序做，一步都不许跳过：\n"
     "1) 先读懂报错：哪一行、什么异常类型、为什么（看完 traceback，不要凭感觉猜）；\n"
-    "2) 用 read_file 把出问题的那段代码读出来确认（不要凭记忆改）；\n"
-    "3) 用 write_file **真的改文件**（不是只在聊天里贴一段新代码）；\n"
+    "2) 用 find_lines 找到出问题的那几行，再用 read_file(start=…, limit=…)\n"
+    "   把那一段读出来确认（不要凭记忆改，也不要整文件重读一遍）；\n"
+    "3) 用 edit_lines **按行号真的改那几行**（带 expect 更稳；不是只在聊天里贴一段新代码，\n"
+    "   也不是整文件重写）；\n"
     "4) 改完**立刻再运行一次**（run_python 跑刚写的那个文件），把真实输出贴出来；\n"
     "5) 还报错就重复 1~4，**直到真的跑通**（退出码 0、没有 Traceback）。\n"
     "需要查第三方库用法或报错含义时，可以先 web_search 搜一次再动手改。\n"
@@ -2773,9 +2792,13 @@ class AgentRunner:
         """
         # ① 别名（桌面 / 文档 / ~）与盘符归一 -> 真实路径
         raw = _folders.resolve((raw or "").strip())
-        # ② 展开环境变量 / 命名空间前缀（先展开，再判，不看原始串）
+        # ② 末尾分隔符要**在 normalize_path 之前**判：os.path.normpath("out/")
+        #    会把斜杠吃掉变成 "out"，之后再也看不出这是个目录写法，
+        #    于是一个叫 out 的**文件**被造出来，把后面所有 out/xxx 全堵死。
+        dir_like = raw.endswith(("/", "\\"))
+        # ②' 展开环境变量 / 命名空间前缀（先展开，再判，不看原始串）
         raw = _sec.normalize_path(raw) or raw
-        if not raw or raw == "." or raw.endswith(("/", "\\")):
+        if not raw or raw == "." or dir_like or raw.endswith(("/", "\\")):
             return None, (f"path 必须是一个文件名，不能是目录：{raw!r}。"
                           f"例：out/report.docx 或 桌面\\周报.docx")
         if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
@@ -3313,20 +3336,23 @@ class AgentRunner:
         """真正干活的派发逻辑。confirm_cb(cmd)->bool 用于命令/删除/杀进程确认。"""
         try:
             if name == "read_file":
-                outside = not _inside(self.files_dir, args.get("path", ""))
-                path = _safe_path(self.files_dir, args.get("path", ""), allow_outside=True)
-                if not os.path.isfile(path):
-                    return f"[错误] 文件不存在：{args.get('path')}（解析为 {path}）"
-                size = os.path.getsize(path)
-                try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                except Exception as e:
-                    return f"[错误] 读取失败：{e}"
-                if len(content) > 20000:
-                    content = content[:20000] + "\n...（已截断，超过 20000 字）"
-                tag = "（工作区外只读）" if outside else ""
-                return f"文件 {path}{tag}（{size} 字节）内容：\n```\n{content}\n```"
+                # ★ v9.20.0：改成**分批读 + 每行带行号**（实现在 app/devtools.py）。
+                #   老行为（整文件读、超 2 万字砍一刀）已废弃：那种切法模型
+                #   根本不知道自己漏了什么，也没法引用行号去做局部修改。
+                #   兼容点：path 语义、允许读工作区外（只读）、错误措辞都是人话；
+                #   另外接受 offset（0 基）当 start 的老写法。
+                return _devtools.read_file(args, self)
+
+            elif name == "find_lines":
+                return _devtools.find_lines(args, self)
+
+            elif name == "edit_lines":
+                # 写沙箱闸门在 devtools 里走 self._resolve_write（跟 write_file 同一套），
+                # 所以工作区外的修改照样要用户点头。
+                return _devtools.edit_lines(args, self, confirm_cb)
+
+            elif name == "apply_patch":
+                return _devtools.apply_patch(args, self, confirm_cb)
 
             elif name == "list_dir":
                 outside = not _inside(self.files_dir, args.get("path", "."))
@@ -3356,11 +3382,15 @@ class AgentRunner:
 
             elif name == "write_file":
                 raw = _folders.resolve((args.get("path") or "").strip())
-                # ★ v9.18.0：先展开 `%TEMP%` / `~` / `\\?\` 前缀，再判（不看原始串）
+                # ★ v9.20.0：末尾分隔符必须在 normalize_path **之前**判 ——
+                #   normpath("out/") 会把斜杠吃掉变成 "out"，随后就会造出一个
+                #   名叫 out 的文件，把后面所有 out/xxx 全堵死（parser_cases 实测）。
+                _dir_like = raw.endswith(("/", "\\"))
+                # ★ v9.18.0：再展开 `%TEMP%` / `~` / `\\?\` 前缀（不看原始串）
                 raw = _sec.normalize_path(raw) or raw
                 # 末尾带分隔符（out/、out\）说明把它当目录用了，直接拒绝，
                 # 否则会造出一个名叫 out 的文件，把后面所有 out/xxx 都堵死
-                if (not raw or raw == "." or raw.endswith(("/", "\\"))):
+                if (not raw or raw == "." or _dir_like or raw.endswith(("/", "\\"))):
                     return (f"[错误] path 必须是一个文件名，不能是目录：{raw!r}。"
                             f"例：out/deep.txt 或 桌面\\a.txt")
                 if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
@@ -3882,26 +3912,20 @@ class AgentRunner:
                 if err:
                     return _as_error(err)
                 try:
-                    import requests
-                    with requests.get(url, stream=True, timeout=(10, 60),
-                                      headers={"User-Agent": "Mozilla/5.0 (AIWorkbench)"}) as r:
-                        if r.status_code != 200:
-                            return f"[错误] HTTP {r.status_code} {url}"
-                        total = int(r.headers.get("Content-Length") or 0)
-                        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                        got = 0
-                        with open(path, "wb") as f:
-                            for chunk in r.iter_content(65536):
-                                if chunk:
-                                    f.write(chunk)
-                                    got += len(chunk)
-                                    if got > 512 * 1024 * 1024:
-                                        return "[错误] 文件超过 512MB，已中止下载"
+                    # ★ v9.19：多通道测速选最快（GitHub 自动加 ghproxy.net 镜像），
+                    #   失败自动切下一个通道，支持断点续传；不再是裸直连。
+                    from app import downloader as _dl
+                    best, lat = _dl.pick_fastest(url)
+                    path, got, total, used = _dl.download(
+                        url, path, max_bytes=512 * 1024 * 1024, prefer=best)
                 except Exception as e:
                     return f"[错误] 下载失败：{e}"
                 self._note_written(path, got)
+                ch = ""
+                if used and used != url:
+                    ch = "\n（已用镜像加速通道：" + _dl.describe_channel(used) + "）"
                 return (f"[成功] 已下载到 {path}（{_human_size(got)}"
-                        + (f" / 共 {_human_size(total)}" if total else "") + "）")
+                        + (f" / 共 {_human_size(total)}" if total else "") + "）" + ch)
 
             # ======================== 代码执行 ========================
             elif name == "run_python":

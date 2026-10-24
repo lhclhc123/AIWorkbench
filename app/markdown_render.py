@@ -21,6 +21,7 @@ r"""将 Markdown 渲染为 QTextBrowser 可显示的 HTML（代码块内联高�
     语言名后的空格与 `+#.-`、4 个以上反引号的围栏、行首缩进；
     **围栏没闭合时把剩下的内容整段当代码块**（流式必需）。
 """
+import hashlib
 import re
 from collections import OrderedDict
 
@@ -45,11 +46,21 @@ from .agent import TOOL_BLOCK_RE as _TOOL_RE              # noqa: E402
 from .agent import TOOL_BODY_RE as _TOOL_XMLARG_RE        # noqa: E402
 
 # 缓存容量：代码高亮条数 / 整段渲染条数
-_HL_CACHE_MAX = 48
-_RENDER_CACHE_MAX = 8
+# ★ v9.20.0：整段渲染原来是 8 条、而且**拿正文当 key** —— 切走再切回一个长
+#   对话，120 条消息几乎全部 miss，每条都要重新跑 markdown + Pygments。
+#   现在放宽到 300 条（够装一个长对话的全部消息），key 换成正文的 md5：
+#   · 用哈希不用原文，dict 里不会驻留长字符串（正文可能有几十 KB × 300 条）；
+#   · md5 碰撞概率对"给缓存用途"可以忽略。
+_HL_CACHE_MAX = 300
+_RENDER_CACHE_MAX = 300
 _hl_cache = OrderedDict()
 _render_cache = OrderedDict()
 _text_block_cache = OrderedDict()
+
+
+def _h(text):
+    """正文 -> 缓存键（md5 十六进制）。见上面为什么不用原文当 key。"""
+    return hashlib.md5((text or "").encode("utf-8", "replace")).hexdigest()
 
 
 def _cache_get(cache, key):
@@ -97,9 +108,9 @@ def _inline_pygments(code: str, lang: str) -> str:
     """语法高亮成内联样式的 HTML 片段（带 LRU 缓存，见模块头注释）。
 
     为什么键要包含 lang：同一段代码用不同语言高亮结果不同；
-    为什么键要用 code 全文：高亮结果只由 (lang, code) 决定，没有别的输入。
+    为什么键用 code 的**哈希**而不是全文：见 `_HL_CACHE_MAX` 上面的说明。
     """
-    key = (lang or "", code or "")
+    key = (lang or "", _h(code))
     hit = _cache_get(_hl_cache, key)
     if hit is not None:
         return hit
@@ -157,7 +168,7 @@ def _split_code_blocks(text):
     ★ 也做了缓存：流式渲染时同一段正文会被反复切分（正文在长、但**已完成的
     代码块**是不变的），命中率很高。
     """
-    hit = _cache_get(_text_block_cache, text)
+    hit = _cache_get(_text_block_cache, _h(text))
     if hit is not None:
         return hit
 
@@ -199,7 +210,7 @@ def _split_code_blocks(text):
         flush()
 
     res = ("\n".join(out), blocks)
-    _cache_put(_text_block_cache, text, res, _RENDER_CACHE_MAX)
+    _cache_put(_text_block_cache, _h(text), res, _RENDER_CACHE_MAX)
     return res
 
 
@@ -216,7 +227,7 @@ def render_with_blocks(text: str):
     if not text:
         return "", []
     text = _strip_tool_call(text)
-    hit = _cache_get(_render_cache, ("wb", text))
+    hit = _cache_get(_render_cache, ("wb", _h(text)))
     if hit is not None:
         return hit[0], [dict(b) for b in hit[1]]
 
@@ -229,7 +240,7 @@ def render_with_blocks(text: str):
         html = html.replace("%%CODEBLOCK%d%%" % i, "")
     # 清掉占位符移除后留下的空段落
     html = _EMPTY_P_RE.sub("", html)
-    _cache_put(_render_cache, ("wb", text), (html, out), _RENDER_CACHE_MAX)
+    _cache_put(_render_cache, ("wb", _h(text)), (html, out), _RENDER_CACHE_MAX)
     return html, [dict(b) for b in out]
 
 
@@ -238,7 +249,7 @@ def render_markdown(text: str) -> str:
         return ""
     # 去掉 Agent 工具调用标签（工具活动由专用 UI 展示）
     text = _strip_tool_call(text)
-    hit = _cache_get(_render_cache, ("md", text))
+    hit = _cache_get(_render_cache, ("md", _h(text)))
     if hit is not None:
         return hit
 
@@ -255,5 +266,5 @@ def render_markdown(text: str) -> str:
         )
         html = html.replace("%%CODEBLOCK%d%%" % i, code_html)
     html = _EMPTY_P_RE.sub("", html)
-    _cache_put(_render_cache, ("md", text), html, _RENDER_CACHE_MAX)
+    _cache_put(_render_cache, ("md", _h(text)), html, _RENDER_CACHE_MAX)
     return html

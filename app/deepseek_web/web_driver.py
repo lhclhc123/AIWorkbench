@@ -9,11 +9,12 @@
    真机验证工具见 `tests/probe_cdp_state.py`。
 """
 import json
+import os
 import time
 
-from . import errors
+from . import api_path, errors
 from .cdp_client import CDPClient, CDPError
-from .. import config
+from .. import config, ratelimit
 
 
 class WebDriverError(Exception):
@@ -606,6 +607,19 @@ class WebDriver:
         self.cdp = cdp
         self._log = log or (lambda *a, **k: None)
         self._agent_ready = False
+        # ★ v9.19.0：接口直发（在页面上下文里 fetch，不走点击/打字）。
+        #   "auto" = 先试直发，失败就永久降级回点击链路（用户无感）；
+        #   "off"  = 强制老链路（排查用：AWB_DSW_API=off）。
+        self.api_mode = "off" if str(
+            os.environ.get("AWB_DSW_API", "auto")).lower() in ("off", "0", "false", "") else "auto"
+        self._api = None                # api_path.ApiPath（懒建）
+        self._api_session_id = ""       # 直发模式下复用的网页对话 id
+        self._api_fail_note = ""        # 降级原因（给界面/日志看）
+        # ★ v9.18.0：宿主是进程内 QtWebEngine（内嵌浏览器）时为 True。
+        #   内嵌宿主是"被遮挡即 hidden"（WA_DontShowOnScreen），但实测 CDP 的
+        #   Input.insertText / Enter / 点击**照常生效**，所以只有 embedded 模式下
+        #   才放宽 visibilityState 硬闸门；Chrome 模式行为保持原样。
+        self.embedded = False
 
     # ---------- 内部工具 ----------
     def _logf(self, level, msg):
@@ -693,8 +707,11 @@ class WebDriver:
             if st.get("generating"):
                 return errors.WebErrorKind.GENERATING, "网页正在生成回复"
             # 窗口不可见时"看起来就绪"，实际发不出去 —— 单独报出来（v9.14.2）
+            # ★ v9.18.0 例外：内嵌 QtWebEngine 宿主被遮挡时 visibilityState 也是
+            #   hidden，但实测 Input 事件仍然生效，不能再据此判死（会误杀正常发送）。
             try:
-                if str(self._js("window.__AWB__.visibility()")) != "visible":
+                if (not self.embedded
+                        and str(self._js("window.__AWB__.visibility()")) != "visible"):
                     return (errors.WebErrorKind.WINDOW_HIDDEN,
                             errors.WEB_ERROR_TEXT[errors.WebErrorKind.WINDOW_HIDDEN])
             except WebDriverError:
@@ -729,6 +746,9 @@ class WebDriver:
         """点「新对话」；找不到入口则退化为重新导航到首页。"""
         if self.cdp is None:
             raise WebDriverError(errors.WebErrorKind.NOT_STARTED)
+        # ★ v9.19.0：直发模式下"新建对话"= 丢掉当前会话 id，下次请求自己建一个。
+        #   （不需要真去点网页上的「新对话」按钮 —— 那正是用户嫌的"网页点击"。）
+        self._api_session_id = ""
         try:
             done = self._js("window.__AWB__.newChat()")
         except WebDriverError:
@@ -750,16 +770,24 @@ class WebDriver:
         """当前所在的 DeepSeek 会话 URL（形如 .../a/chat/s/<id>）。
 
         还在首页（没进任何会话）时返回 "" —— 首页不是一个可复用的会话。
+
+        ★ v9.19.0：直发模式下页面地址栏**不会变**（我们没去点网页），
+          但会话是真的建出来了，所以这里用直发拿到的会话 id 合成同一个 URL。
+          上层（service）据此把"一个工作台对话 ↔ 一个网页会话"绑死，
+          用户切回旧对话时仍然回到同一个网页会话，不会又开新的。
         """
         if self.cdp is None:
             return ""
         try:
             href = str(self._js("window.__AWB__.pageHref()") or "")
         except Exception:
-            return ""
-        if "/a/chat/s/" not in href:
-            return ""
-        return href.split("#", 1)[0].split("?", 1)[0]
+            href = ""
+        if "/a/chat/s/" in href:
+            return href.split("#", 1)[0].split("?", 1)[0]
+        sid = str(getattr(self, "_api_session_id", "") or "")
+        if sid:
+            return "https://chat.deepseek.com/a/chat/s/" + sid
+        return ""
 
     def resume_session(self, url, wait=15.0):
         """导航回一个**已存在**的网页会话（**绝不新建**）。
@@ -773,6 +801,12 @@ class WebDriver:
         if not url or self.cdp is None:
             return False
         cur = self.session_url()
+        # ★ v9.19.0：直发模式下也把网页会话 id 接过来（`/a/chat/s/<id>` 里的 id），
+        #   这样"切回旧对话"仍然落在**同一个**网页会话里，不会每次都新开。
+        try:
+            self._api_session_id = self._session_id_from_url(url) or self._api_session_id
+        except Exception:
+            pass
         if cur and cur.rstrip("/") == url.rstrip("/"):
             return True
         try:
@@ -821,6 +855,13 @@ class WebDriver:
             self.cdp.call("Page.bringToFront", {}, timeout=6)
         except Exception:
             pass
+        # ★ v9.18.0：内嵌 QtWebEngine 宿主直接放行。
+        #   WA_DontShowOnScreen 的窗口在 Chromium 眼里是"被遮挡"→ visibilityState
+        #   恒为 hidden；但实测 CDP 的 Input.insertText / Enter / 点击照常生效。
+        #   若继续按可见性判死，会把每一次正常发送都误判成"窗口不可见"。
+        #   （Browser.getWindowForTarget 在内嵌内核里还是 -32601，也一并跳过。）
+        if self.embedded:
+            return True
         # ② 把窗口从"最小化/离屏"恢复成普通窗口并摆到屏幕内
         try:
             res = self.cdp.call("Browser.getWindowForTarget", {}, timeout=6)
@@ -971,6 +1012,45 @@ class WebDriver:
             return False
 
     # ---------- 主流程：提交一轮 ----------
+    @staticmethod
+    def _session_id_from_url(url):
+        """从 `/a/chat/s/<id>` 里抠出会话 id（拿不到就返回 ""）。"""
+        u = str(url or "")
+        key = "/a/chat/s/"
+        if key not in u:
+            return ""
+        return u.split(key, 1)[1].split("#", 1)[0].split("?", 1)[0].split("/", 1)[0]
+
+    def _submit_api(self, prompt_text, on_progress=None, answer_timeout=300.0):
+        """接口直发（v9.19.0）：在页面上下文里 fetch，**不碰 DOM**。
+
+        Returns: 答复原文（str）。
+
+        Raises:
+            任何异常（`ApiUnavailable` 或意外）—— 由 `submit()` 捕获后永久降级
+            到点击链路。这里不吞异常，因为"静默失败"正是要消灭的东西。
+        """
+        if self.cdp is None:
+            raise WebDriverError(errors.WebErrorKind.NOT_STARTED)
+        if self._api is None:
+            self._api = api_path.ApiPath(self.cdp, log=self._logf)
+        new_session = not self._api_session_id
+        t0 = time.time()
+        answer, reasoning, sid = self._api.chat(
+            prompt_text,
+            session_id=self._api_session_id,
+            new_session=new_session,
+            thinking=bool(getattr(self, "api_thinking", False)),
+            search=bool(getattr(self, "api_search", False)),
+            on_progress=on_progress,
+            timeout=float(answer_timeout))
+        if sid:
+            self._api_session_id = sid
+        self._logf("info", f"接口直发完成：答复 {len(answer)} 字"
+                           + (f"、思维链 {len(reasoning)} 字" if reasoning else "")
+                           + f"，{time.time() - t0:.1f}s，网页会话={sid or '(沿用)'}")
+        return answer
+
     def submit(self, prompt_text, *, on_progress=None,
                ack_timeout=12.0, answer_timeout=300.0, dedupe_key=None):
         """把一段提示词发给网页，等生成结束，返回答复原文。
@@ -990,6 +1070,154 @@ class WebDriver:
         """
         if self.cdp is None:
             raise WebDriverError(errors.WebErrorKind.NOT_STARTED)
+
+        # ★★ v9.19.0（用户要求「尽量模拟浏览器直接发起请求，不要走类似网页点击的」）
+        #   第一优先：**接口直发** —— 在页面上下文里 `fetch('/api/v0/chat/completion')`，
+        #   带真实 Cookie / 同源 / 真实 UA。不填输入框、不点按钮、不等按钮可用，
+        #   所以不会有"重复发送""字留在输入框里""一条对话开出十几条"这些毛病，
+        #   也不需要窗口可见（后台也能跑）。
+        #
+        #   ★ v9.20.0：直发失败**不再一律永久降级**。
+        #     如果失败原因只是「输入过快 / 稍后重试 / 系统繁忙」（风控），
+        #     这是"发得太快"，不是接口坏了 —— 退避后**在同一个会话里重发**。
+        #     只有真·结构性问题（登录失效 / 接口改版 / PoW 失败）才永久降级回点击链路。
+        if self.api_mode == "auto":
+            ok, answer = self._submit_api_with_retry(
+                prompt_text, on_progress=on_progress, answer_timeout=answer_timeout)
+            if ok:
+                return answer
+
+        # ★ v9.20.0：点击链路也可能被风控（网页回「输入过快，请稍后重试」）。
+        #   重试**不新建对话**（new_conversation 由上层会话路由负责，这里一次都不调）。
+        rl_retries = 0
+        while True:
+            ratelimit.acquire("deepseek-web")
+            try:
+                text = self._submit_click_once(
+                    prompt_text, on_progress=on_progress, ack_timeout=ack_timeout,
+                    answer_timeout=answer_timeout, dedupe_key=dedupe_key)
+            except WebDriverError as exc:
+                if ratelimit.is_rate_limit(exc):
+                    if rl_retries < config.MODEL_RETRY_MAX:
+                        rl_retries += 1
+                        wait = ratelimit.note_rate_limit("deepseek-web")
+                        self._logf("warn",
+                                   f"被 DeepSeek 限流了（{exc}）—— 这是调用太快触发的风控，"
+                                   f"不是程序 bug；等 {wait:.1f} 秒后在同一会话重发"
+                                   f"（第 {rl_retries}/{config.MODEL_RETRY_MAX} 次）")
+                        self._clear_pending()
+                        time.sleep(wait)
+                        continue
+                    raise self._rate_limited_error(exc)
+                raise
+            finally:
+                ratelimit.release()
+
+            # 网页有时把「输入过快，请稍后重试」当成一条"答复"显示出来，
+            # 不抛异常 —— 必须看正文，否则会把风控提示当成模型回答交给用户。
+            if self._answer_is_rate_limit(text):
+                if rl_retries < config.MODEL_RETRY_MAX:
+                    rl_retries += 1
+                    wait = ratelimit.note_rate_limit("deepseek-web")
+                    self._logf("warn",
+                               "DeepSeek 网页回了「输入过快」（调用太快被风控，不是程序 bug）；"
+                               f"等 {wait:.1f} 秒后在同一会话重发"
+                               f"（第 {rl_retries}/{config.MODEL_RETRY_MAX} 次）")
+                    self._clear_pending()
+                    time.sleep(wait)
+                    continue
+                raise self._rate_limited_error(text)
+            return text
+
+    @staticmethod
+    def _answer_is_rate_limit(text):
+        """答复正文是不是风控提示。
+
+        只认**短文本**：真·限流提示就是一句「输入过快，请稍后重试」（< 60 字）。
+        用户如果恰好问「429 是什么 / 什么叫 too many requests」，模型会答一大段，
+        正文里照样出现这些词 —— 那种长答复绝不能被当成限流丢掉重发。
+        """
+        s = str(text or "").strip()
+        return bool(s) and len(s) <= 60 and ratelimit.is_rate_limit(s)
+
+    def _rate_limited_error(self, detail):
+        """把"被限流"翻译成人话报给上层（不伪装成超时/网页结构变化）。"""
+        return WebDriverError(
+            errors.WebErrorKind.SERVER_ERROR,
+            f"被 DeepSeek 限流了（{str(detail)[:120]}）：这是调用太快触发的风控，"
+            "不是程序 bug。已自动退避重试仍然不行，请等一会儿再点「重试」。")
+
+    def _clear_pending(self):
+        """清掉页面上的防重发标记。
+
+        只在"这次确实要被重发"时调：否则同一个 `dedupe_key` 会被 ① 的判重逻辑
+        挡死，退避完反而发不出去。
+        """
+        try:
+            self._js("window.__AWB__.clearPending()")
+        except Exception:
+            pass
+
+    def _submit_api_with_retry(self, prompt_text, *, on_progress=None,
+                               answer_timeout=300.0):
+        """接口直发 + 「输入过快」退避重试。
+
+        Returns: (ok, answer)
+            ok=True  -> answer 是答复原文（可能是空串，按原逻辑处理）
+            ok=False -> 直发这条路不可用（非限流原因），调用方继续走点击链路
+
+        Raises: WebDriverError（重试次数用尽，仍被限流）
+        """
+        rl_retries = 0
+        while True:
+            ratelimit.acquire("deepseek-web")
+            answer, err = None, None
+            try:
+                answer = self._submit_api(prompt_text, on_progress=on_progress,
+                                          answer_timeout=answer_timeout)
+            except Exception as exc:      # 含 ApiUnavailable 与任何意外
+                err = exc
+            finally:
+                ratelimit.release()
+
+            if err is not None:
+                if ratelimit.is_rate_limit(err):
+                    if rl_retries < config.MODEL_RETRY_MAX:
+                        rl_retries += 1
+                        wait = ratelimit.note_rate_limit("deepseek-web")
+                        self._logf("warn",
+                                   f"DeepSeek 接口回了限流（{err}）—— 这是调用太快触发的风控，"
+                                   f"不是程序 bug；等 {wait:.1f} 秒后在同一会话重发"
+                                   f"（第 {rl_retries}/{config.MODEL_RETRY_MAX} 次）")
+                        time.sleep(wait)
+                        continue
+                    raise self._rate_limited_error(err)
+                # 非限流 -> 老行为：永久降级回点击链路（本次调用立刻继续往下走）
+                self.api_mode = "off"
+                self._api_fail_note = str(err)[:300]
+                self._logf("warn", f"接口直发不可用（{err}）—— 本会话改用模拟点击链路，"
+                                   "不再重试直发")
+                return False, None
+
+            if self._answer_is_rate_limit(answer):
+                if rl_retries < config.MODEL_RETRY_MAX:
+                    rl_retries += 1
+                    wait = ratelimit.note_rate_limit("deepseek-web")
+                    self._logf("warn",
+                               "DeepSeek 接口回的是「输入过快」（调用太快被风控，不是程序 bug）；"
+                               f"等 {wait:.1f} 秒后在同一会话重发"
+                               f"（第 {rl_retries}/{config.MODEL_RETRY_MAX} 次）")
+                    time.sleep(wait)
+                    continue
+                raise self._rate_limited_error(answer)
+            return True, answer
+
+    def _submit_click_once(self, prompt_text, *, on_progress=None,
+                           ack_timeout=12.0, answer_timeout=300.0, dedupe_key=None):
+        """模拟点击链路：发一次，返回答复原文（**不做限流重试**，由 submit 负责）。
+
+        调这里之前必须已经 `ratelimit.acquire("deepseek-web")` 拿到名额。
+        """
         if not self._ensure_agent():
             raise WebDriverError(errors.WebErrorKind.PAGE_CHANGED, "无法注入网页脚本")
 

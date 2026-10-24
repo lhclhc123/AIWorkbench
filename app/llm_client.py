@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """LLM 调用层：OpenAI 兼容 /chat/completions 流式调用 + 多端点热备。"""
 import json
+import logging
+import threading
 import time
 import requests
 
-from . import config
+from . import config, ratelimit
 
 TIMEOUT = 25  # 单次请求超时（秒）
+
+log = logging.getLogger("awb.llm")
 
 # 这些 HTTP 状态码是「限流 / 网关瞬时错误」，可以退避重试；
 # 与 401/403/404/额度用尽（硬错误，见 _is_hard_err）区分开。
@@ -118,7 +122,13 @@ class LLMClient:
         #   `cancel()` 会把句柄关掉，让正在读 SSE 的循环立刻退出，
         #   从而把"点了停止还要等十几秒"压到几乎瞬时。
         self._cancelled = False
+        # ★ v9.20.0：退避等待也要能被打断。`time.sleep(60)` 睡下去就叫不醒，
+        #   用户点了停止还得把整个退避走完 —— 用 Event.wait 才能立刻醒。
+        self._cancel_evt = threading.Event()
         self._active_resp = None
+        # ★ v9.19：单次请求的重试次数。团队模式下由 team.py 调小（2），
+        #   避免"一次端点抖动 = 150s×3 次重试"把整支团队拖死。
+        self.max_attempts = 3
 
     def cancel(self):
         """用户点了停止：尽快掐断正在进行中的流式请求（需求 15）。
@@ -127,6 +137,11 @@ class LLMClient:
         模型还在吐字时它自己不会醒过来检查标志位 —— 必须把底层连接关掉才能立刻醒。
         """
         self._cancelled = True
+        # 唤醒正在退避等待的线程（v9.20.0）：否则点停止后它还要睡满整个退避
+        try:
+            self._cancel_evt.set()
+        except Exception:
+            pass
         resp = self._active_resp
         if resp is not None:
             try:
@@ -137,6 +152,33 @@ class LLMClient:
     def _reset_cancel(self):
         """开始新的一轮对话前把取消开关复位（否则一次停止会让后面全发不出去）。"""
         self._cancelled = False
+        try:
+            self._cancel_evt.clear()
+        except Exception:
+            pass
+
+    def _sleep_cancelable(self, seconds):
+        """退避等待，但**可被用户点“停止”立刻打断**。
+
+        返回 True = 等待期间被取消，调用方应立刻抛"已停止"，不要继续重试。
+        """
+        sec = max(0.0, float(seconds or 0))
+        if sec <= 0:
+            return bool(self._cancelled)
+        try:
+            return bool(self._cancel_evt.wait(sec))
+        except Exception:
+            time.sleep(sec)
+            return bool(self._cancelled)
+
+    def _wait_rate_limit(self, tag, why):
+        """被限流后的统一处理：报告风控 → 等退避 → 返回后调用方重试。
+
+        返回 True 表示等待期间用户点了停止，调用方应立即抛出"已停止"。
+        """
+        wait = ratelimit.note_rate_limit(tag)
+        log.warning("调用太快被拦了（%s），等 %.1f 秒再试", why, wait)
+        return self._sleep_cancelable(wait)
 
     def set_web_gate(self, fn):
         """注入"网页通道是否就绪"的判断函数（供 chat_auto 使用）。"""
@@ -213,9 +255,11 @@ class LLMClient:
         return min(2.0 * (2 ** attempt), 10.0)
 
     def _stream_once(self, provider, model, messages, enable_search, on_token, timeout,
-                     on_reasoning=None, _max_attempts=3):
+                     on_reasoning=None, _max_attempts=None):
         """对单个 (provider, model) 发起流式请求，逐 token 回调 on_token。
         成功返回完整文本；失败抛出异常。
+
+        `_max_attempts` 默认取 ``self.max_attempts``（3）；团队模式会调小到 2。
 
         on_reasoning：**可选**回调（默认 None = 完全不影响现有行为）。
         部分模型（阿里百炼上的 DeepSeek-V4.1-Flash / DeepSeek-V4-Pro / Qwen3.x）
@@ -235,105 +279,188 @@ class LLMClient:
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
         }
-        last_err = None
-        for attempt in range(_max_attempts):
-            try:
-                resp = self.session.post(url, json=payload, headers=headers,
-                                         stream=True, timeout=(10, timeout))
-            except (requests.Timeout, requests.ConnectionError) as e:
-                # 连接层瞬时错误：退避后重试（尚未发出任何 token，安全）
-                last_err = e
-                if attempt < _max_attempts - 1:
-                    time.sleep(self._backoff(attempt))
-                    continue
-                raise
+        # ★ v9.20.0：DeepSeek 网页版是"本机 HTTP 服务 -> 浏览器"两跳。
+        #   真正调模型的那一跳（web_driver.submit）已经节流并做过退避重试；
+        #   这里**不能**再抢一次名额 —— 2 个客户端线程各占 1 个名额后，
+        #   服务端那一跳再来要名额就会自锁（而且会把 3 次重试再乘 3 倍）。
+        is_web = bool(provider.get("web"))
+        if not _max_attempts:
+            _max_attempts = int(getattr(self, "max_attempts", 3) or 3)
+        attempt = 0          # 普通重试（连接抖动 / 5xx 网关）已用次数
+        rl_retries = 0       # 「调用太快」已重试次数（上限 config.MODEL_RETRY_MAX）
+        to_retries = 0       # 纯超时已重试次数（上限 config.MODEL_TIMEOUT_RETRY）
+        while True:
+            # ★ v9.19：每轮重试前先看"用户是不是已经点了停止"。
+            #   以前这个判断只在 SSE 循环里，网络卡住时点了停止还得等满 3 次读超时。
+            if self._cancelled:
+                raise LLMError("本次请求已被用户停止")
 
-            if resp.status_code != 200:
-                text_body = (resp.text or "")[:500]
-                msg = f"HTTP {resp.status_code} {text_body[:200]}"
+            # ★ v9.20.0 全局限流：真正发请求**之前**排队。
+            #   主对话/工具循环/助理/团队/后台任务池是不同线程，共用这一个节流器。
+            #   名额在 finally 里归还 —— 异常、重试、提前 return 都不会漏。
+            if not is_web:
+                ratelimit.acquire("model")
+            try:
                 try:
-                    resp.close()
-                except Exception:
-                    pass
-                # 429 限流 / 5xx 网关瞬时错误：退避后重试，仍用同一个模型
-                # （严格模式语义不变——没有偷偷换模型，只是对本模型多等几秒）
-                if resp.status_code in _RETRYABLE_HTTP and attempt < _max_attempts - 1:
-                    last_err = LLMError(msg)
-                    time.sleep(self._backoff(attempt, resp))
-                    continue
-                raise LLMError(msg)
-
-            # === 以下仅在「请求成功（200）」后执行，不在重试范围 ===
-            # 记录本次实际命中的端点与模型
-            self._mark_used(provider, model)
-
-            buf = b""
-            full = []
-            got_sse = False
-            # ★ v9.18.0（需求 15「点停止后要等好久」）：把正在收流的响应挂到实例上，
-            #   这样用户点"停止"时 `cancel()` 能立刻把它掐掉 ——
-            #   否则要等这一轮流式**自然收完**才轮得到循环里那个 `if self._abort`，
-            #   模型还在滔滔不绝时就是"点了停止还要等十几秒"。
-            self._active_resp = resp
-            try:
-                for raw in resp.iter_lines(decode_unicode=False):
-                    # 用户已点停止：立刻收手，把已经收到的部分原样返回
-                    # （上层会丢掉它 —— 停止时不该把半截内容当最终答复）
-                    if self._cancelled:
-                        return "".join(full)
-                    if raw is None:
+                    resp = self.session.post(url, json=payload, headers=headers,
+                                             stream=True, timeout=(10, timeout))
+                except requests.Timeout as e:
+                    # 极少数服务端会把"太快"塞进超时正文里
+                    if (not is_web and ratelimit.is_rate_limit(e)
+                            and rl_retries < config.MODEL_RETRY_MAX):
+                        rl_retries += 1
+                        if self._wait_rate_limit("model", e):
+                            raise LLMError("本次请求已被用户停止")
                         continue
-                    if isinstance(raw, str):
-                        raw = raw.encode("utf-8")
-                    buf += raw + b"\n"
-                    # 按行解析 SSE
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        line = line.strip()
-                        if not line.startswith(b"data:"):
+                    if to_retries < config.MODEL_TIMEOUT_RETRY:
+                        to_retries += 1
+                        log.warning("请求超时（%s），等 %.0f 秒后重试（超时重试 %d/%d）",
+                                    e, self._backoff(attempt), to_retries,
+                                    config.MODEL_TIMEOUT_RETRY)
+                        if self._sleep_cancelable(self._backoff(attempt)):
+                            raise LLMError("本次请求已被用户停止")
+                        continue
+                    raise
+                except requests.ConnectionError as e:
+                    # 连接层瞬时错误：退避后重试（尚未发出任何 token，安全）
+                    if (not is_web and ratelimit.is_rate_limit(e)
+                            and rl_retries < config.MODEL_RETRY_MAX):
+                        rl_retries += 1
+                        if self._wait_rate_limit("model", e):
+                            raise LLMError("本次请求已被用户停止")
+                        continue
+                    if attempt < _max_attempts - 1:
+                        wait = self._backoff(attempt)
+                        attempt += 1
+                        if self._sleep_cancelable(wait):
+                            raise LLMError("本次请求已被用户停止")
+                        continue
+                    raise
+
+                if resp.status_code != 200:
+                    text_body = (resp.text or "")[:500]
+                    msg = f"HTTP {resp.status_code} {text_body[:200]}"
+                    retry_after = None
+                    try:
+                        retry_after = (resp.headers or {}).get("Retry-After")
+                    except Exception:
+                        retry_after = None
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+                    # ★ v9.20.0：429 / 正文里带「输入过快 / 稍后重试 / 系统繁忙…」
+                    #   → 这是"调用太快被拦了"，不是模型坏了。用**指数退避**多试几次，
+                    #   并且把全局节流器一起推后，别让别的线程接着撞。
+                    if (resp.status_code == 429 or ratelimit.is_rate_limit(msg)) and not is_web:
+                        if rl_retries < config.MODEL_RETRY_MAX:
+                            rl_retries += 1
+                            if self._wait_rate_limit("model", msg[:80]):
+                                raise LLMError("本次请求已被用户停止")
                             continue
-                        got_sse = True
-                        data = line[5:].strip()
-                        if data == b"[DONE]":
+                        raise LLMError(
+                            msg + f"（已连续 {config.MODEL_RETRY_MAX} 次被限流，请稍后再试）")
+
+                    # 5xx 网关瞬时错误：退避后重试，仍用同一个模型
+                    # （严格模式语义不变——没有偷偷换模型，只是对本模型多等几秒）
+                    if (resp.status_code in _RETRYABLE_HTTP
+                            and attempt < _max_attempts - 1):
+                        wait = self._backoff(attempt, resp=None)
+                        if retry_after:
+                            try:
+                                wait = min(float(retry_after), 10.0)
+                            except Exception:
+                                pass
+                        attempt += 1
+                        if self._sleep_cancelable(wait):
+                            raise LLMError("本次请求已被用户停止")
+                        continue
+                    raise LLMError(msg)
+
+                # === 以下仅在「请求成功（200）」后执行，不在重试范围 ===
+                # 记录本次实际命中的端点与模型
+                self._mark_used(provider, model)
+
+                buf = b""
+                full = []
+                got_sse = False
+                # ★ v9.18.0（需求 15「点停止后要等好久」）：把正在收流的响应挂到实例上，
+                #   这样用户点"停止"时 `cancel()` 能立刻把它掐掉 ——
+                #   否则要等这一轮流式**自然收完**才轮得到循环里那个 `if self._abort`，
+                #   模型还在滔滔不绝时就是"点了停止还要等十几秒"。
+                self._active_resp = resp
+                try:
+                    for raw in resp.iter_lines(decode_unicode=False):
+                        # 用户已点停止：立刻收手，把已经收到的部分原样返回
+                        # （上层会丢掉它 —— 停止时不该把半截内容当最终答复）
+                        if self._cancelled:
                             return "".join(full)
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
+                        if raw is None:
                             continue
-                        try:
-                            dl = obj["choices"][0]["delta"] or {}
-                        except Exception:
-                            dl = {}
-                        # 思维链（DeepSeek-V4.x / Qwen3.x 等）：单独回调，不算正文
-                        rc = dl.get("reasoning_content") or ""
-                        if rc and on_reasoning:
-                            on_reasoning(rc)
-                        delta = dl.get("content") or ""
-                        if delta:
-                            full.append(delta)
-                            if on_token:
-                                on_token(delta)
+                        if isinstance(raw, str):
+                            raw = raw.encode("utf-8")
+                        buf += raw + b"\n"
+                        # 按行解析 SSE
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            line = line.strip()
+                            if not line.startswith(b"data:"):
+                                continue
+                            got_sse = True
+                            data = line[5:].strip()
+                            if data == b"[DONE]":
+                                return "".join(full)
+                            try:
+                                obj = json.loads(data)
+                            except Exception:
+                                continue
+                            try:
+                                dl = obj["choices"][0]["delta"] or {}
+                            except Exception:
+                                dl = {}
+                            # 思维链（DeepSeek-V4.x / Qwen3.x 等）：单独回调，不算正文
+                            rc = dl.get("reasoning_content") or ""
+                            if rc and on_reasoning:
+                                on_reasoning(rc)
+                            delta = dl.get("content") or ""
+                            if delta:
+                                full.append(delta)
+                                if on_token:
+                                    on_token(delta)
+                finally:
+                    self._active_resp = None
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                if not got_sse:
+                    # 服务端未返回 SSE，尝试把整段当 JSON 解析（非流式兜底）
+                    text = buf.decode("utf-8", "ignore")
+                    try:
+                        obj = json.loads(text)
+                        msg = obj["choices"][0]["message"]
+                        if on_reasoning and msg.get("reasoning_content"):
+                            on_reasoning(msg["reasoning_content"])
+                        content = msg["content"]
+                        if on_token:
+                            on_token(content)
+                        return content
+                    except Exception:
+                        # 有些端点 200 但正文是 {"error":{"message":"输入过快…"}}，
+                        # 这种情况也按限流重试，别报成"格式错误"。
+                        if not is_web and ratelimit.is_rate_limit(text):
+                            if rl_retries < config.MODEL_RETRY_MAX:
+                                rl_retries += 1
+                                if self._wait_rate_limit("model", text[:80]):
+                                    raise LLMError("本次请求已被用户停止")
+                                continue
+                            raise LLMError(text[:300] or "被限流了，请稍后再试")
+                        raise LLMError("响应既不是 SSE 也不是合法 JSON")
+                return "".join(full)
             finally:
-                self._active_resp = None
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-            if not got_sse:
-                # 服务端未返回 SSE，尝试把整段当 JSON 解析（非流式兜底）
-                text = buf.decode("utf-8", "ignore")
-                try:
-                    obj = json.loads(text)
-                    msg = obj["choices"][0]["message"]
-                    if on_reasoning and msg.get("reasoning_content"):
-                        on_reasoning(msg["reasoning_content"])
-                    content = msg["content"]
-                    if on_token:
-                        on_token(content)
-                    return content
-                except Exception:
-                    raise LLMError("响应既不是 SSE 也不是合法 JSON")
-            return "".join(full)
+                if not is_web:
+                    ratelimit.release()
 
     # ---------- 对外接口 ----------
     def stream_specific(self, provider_name, model, messages, enable_search=False,
@@ -545,15 +672,21 @@ class LLMClient:
                    "temperature": 0.1, "stream": False}
         headers = {"Authorization": "Bearer " + key,
                    "Content-Type": "application/json"}
-        resp = self.session.post(url, json=payload, headers=headers,
-                                 timeout=(10, timeout))
-        if resp.status_code != 200:
-            raise LLMError(f"HTTP {resp.status_code} {resp.text[:160]}")
-        obj = resp.json()
+        # ★ v9.20.0：视觉请求也是"调模型"，同样要过全局节流（否则 OCR 批量识别
+        #   会和主对话抢配额，一样会撞「输入过快」）。
+        ratelimit.acquire("model")
         try:
-            return obj["choices"][0]["message"]["content"]
-        except Exception:
-            raise LLMError("视觉模型返回格式异常")
+            resp = self.session.post(url, json=payload, headers=headers,
+                                     timeout=(10, timeout))
+            if resp.status_code != 200:
+                raise LLMError(f"HTTP {resp.status_code} {resp.text[:160]}")
+            obj = resp.json()
+            try:
+                return obj["choices"][0]["message"]["content"]
+            except Exception:
+                raise LLMError("视觉模型返回格式异常")
+        finally:
+            ratelimit.release()
 
     def vision_extract(self, image_path, prompt, timeout=90):
         """让多模态模型识别本地图片（OCR / 描述）。按 VISION_PRIORITY 依次尝试。"""

@@ -92,7 +92,7 @@ class TeamBar(QWidget):
 
         self._rebuild_menu()
         self.refresh_theme()
-        self.set_team("")               # 默认不使用团队
+        self.set_team("", silent=True)  # 默认不使用团队（构造期不广播，免得写脏对话）
 
     # ------------------------------------------------------------------
     # 团队选择
@@ -129,8 +129,15 @@ class TeamBar(QWidget):
         act_hist = self.menu.addAction("▥ 查看历史团队运行")
         act_hist.triggered.connect(lambda: self.open_page.emit("team"))
 
-    def set_team(self, team_id):
-        """选中某支团队并刷新成员名片。非法/空 id 一律当作"不使用团队"。"""
+    def set_team(self, team_id, silent=False):
+        """选中某支团队并刷新成员名片。非法/空 id 一律当作"不使用团队"。
+
+        ★ v9.19.0：`silent=True` 用于**回填**（切/新建对话时把该对话记着的团队
+          同步到控件上）。老实现不分场合都 `emit(team_changed)` —— 于是每切一次
+          对话就当成"用户刚刚换了队伍"，外层往对话里塞一条
+          「⬡ 本对话已切回普通模式」，而且这条还会作为 role=tool 喂给模型。
+          用户实测一个对话里同一条提示刷了 7 遍，就是这么来的。
+        """
         tid = str(team_id or "").strip()
         if tid not in self.list_team_ids():
             tid = ""
@@ -139,7 +146,7 @@ class TeamBar(QWidget):
         self._rebuild_members()
         self._rebuild_menu()
         self._update_btn_text()
-        if changed:
+        if changed and not silent:
             self.team_changed.emit(tid)
         return tid
 

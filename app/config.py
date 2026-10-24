@@ -242,9 +242,27 @@ MODEL_FAILURE_POLICY = "strict"
 # 自动模式下不参与"聊天"的模型（视觉模型只管看图，不该被拉来聊天）
 NON_CHAT_MODELS = {"glm-4v-flash", "glm-4.6v-flash", "qwen3.8-flash"}
 
+# ---------------------------------------------------------------------------
+# 模型调用节流与退避（v9.20.0）
+# ---------------------------------------------------------------------------
+# 用户原话：「调用模型让尽量控制这个时间，不要太快，否则很容易崩溃或者触发风控」
+# 现象：主对话 + 工具循环（最多 12 轮）+ 助理预取 + 团队多角色 + 后台任务池
+#       （taskman.MAX_RUNNING = 4）挤在同一份配额上，DeepSeek 网页版会回
+#       「输入过快，请稍后重试」，发得太密时程序还会直接崩。
+# 实现在 app/ratelimit.py（全局唯一，所有线程共用）。
+MODEL_MIN_GAP = 1.2          # 任意两次模型请求的最小间隔（秒）
+MODEL_MAX_CONCURRENT = 2     # 同时进行的模型请求上限
+MODEL_RETRY_MAX = 3          # 撞上"太快"时最多重试几次
+MODEL_TIMEOUT_RETRY = 1      # 纯超时（不是限流）最多重试几次
+
 # 提示词版本号。改提示词时把它 +1，
 # workspace.load_settings() 发现版本不一致会把新提示词写进已有工作区。
-PROMPT_VERSION = 31
+# v9.19.1：系统提示里的「文件沙箱」改成**按对话**解析（原来是全局当前目录，
+# 切对话后模型会把产物写到别人文件夹里）
+# v9.20.0：把「改文件」的说法从「读全文 → 整文件重写」改成
+# 「find_lines 找行号 → read_file 分批确认 → edit_lines 只改那几行」，
+# 并补上 read_file(start/limit) / find_lines / edit_lines / apply_patch 的说明。
+PROMPT_VERSION = 33
 
 # ★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
 #   流式输出里"**把前面已经发出去的内容作废、从头重来**"的标记。
@@ -265,6 +283,28 @@ STREAM_RESET = "\u241cAWB-RESET\u241d"
 def is_stream_reset(delta) -> bool:
     """这个增量是不是"作废重来"标记（而不是正文）。"""
     return delta == STREAM_RESET
+
+
+# 「作废重来」标记残留的单边字符（只做兜底清理用）
+_RESET_LEFTOVER = ("\u241c", "\u241d")
+
+
+def strip_stream_reset(text):
+    """清掉正文里残留的「作废重来」标记。
+
+    ★ v9.19.0（实测事故）：某些通道（DeepSeek 网页版重写答案时）把标记当成普通增量
+      混进了正文，结果**被存进对话历史**，再发给模型时模型会照着抄一遍，
+      历史里就出现「…chats␜AWB-RESET␝我先看一下…」这种东西。
+      凡是正文进出（落盘 / 拼上下文 / 朗读），都过一遍这里。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    if STREAM_RESET not in text and not any(c in text for c in _RESET_LEFTOVER):
+        return text
+    out = text.replace(STREAM_RESET, "")
+    for ch in _RESET_LEFTOVER:
+        out = out.replace(ch, "")
+    return out
 
 # 标题生成用的系统提示词（内部调用，不给用户看到）
 TITLE_SYSTEM_PROMPT = (
@@ -349,7 +389,16 @@ DEFAULT_SYSTEM_PROMPT = (
     "\n"
     "【读 / 理解】\n"
     "- list_dir：列出目录，参数 path（默认 \".\"）。支持任意盘符，如 path 填 \"D:\\\\\" 列 D 盘根目录。\n"
-    "- read_file：读取**纯文本**文件（.txt/.md/.py/.json/.csv 等），参数 path。\n"
+    "- read_file：读取**纯文本**文件（.txt/.md/.py/.json/.csv 等），参数 path、\n"
+    "  start（1 基行号，默认 1）、limit（默认 200 行，上限 2000）。\n"
+    "  **返回的每一行都带行号**（形如 ` 200│ def foo():`）。大文件必须分批读：\n"
+    "  先读 1~200 行看结构，再用 start=201 往后读；被截断时结果里会写明\n"
+    "  「共 N 行 / 还剩多少 / 下次从第几行开始」，照着它给的下一个 start 继续读就行。\n"
+    "  **绝对不要一次读完几千行**（既浪费上下文又容易看漏）。\n"
+    "- find_lines：按内容找**行号**（改代码前先用它定位）。参数 pattern（文本或正则）、\n"
+    "  path（文件或目录，默认 \".\"）、glob（如 *.py）、regex（默认 false）、\n"
+    "  case_sensitive（默认 true）、context（前后各带几行，默认 1）、max_results（默认 60）。\n"
+    "  返回 `路径:行号: 内容`。**要改某个函数/某几行，先用它拿到准确行号。**\n"
     "- read_document：解析**文档**并提取文字，参数 path。支持 Word(.docx)、PDF、Excel(.xlsx)、\n"
     "  PPT(.pptx)、HTML、CSV、RTF。**要读 Word/PDF/表格就用它，不要用 read_file。**\n"
     "- read_image：识别**图片**里的文字与画面（走视觉模型），参数 path，可选 prompt。\n"
@@ -360,9 +409,22 @@ DEFAULT_SYSTEM_PROMPT = (
     "- system_info：查询本机系统信息（CPU/内存/各磁盘剩余空间），无参数。\n"
     "\n"
     "【写 / 操作】\n"
+    "  **【改已有文件，优先用 edit_lines，不要整文件重写】**\n"
+    "  老写法「先读全文 → 把完整新内容写回去」又慢又容易丢内容（长文件还会被截断），\n"
+    "  现在改代码一律走：find_lines 找行号 → read_file(start=…, limit=…)\n"
+    "  确认那几行 → edit_lines 只改那几行。\n"
+    "- edit_lines：**按行号小范围改**，参数 path、start（1 基，含）、end（1 基，含）、\n"
+    "  new_text（替换后的内容；**空串表示删掉这几行**）。两个关键点：\n"
+    "  ① end=start-1 表示「在第 start 行前面**插入**、不删原行」；\n"
+    "  ② **强烈建议带 expect**（你打算改的那几行的原文）—— 系统会拿它和文件里\n"
+    "     真实内容比对，不一致就**拒绝并且一个字都不写**，还会把那几行的实际原文\n"
+    "     回给你。这是防「行号算错把文件改坏」的唯一保险，改代码时务必填。\n"
+    "  行号越界、把文件改成空文件，都会被直接拒绝。\n"
+    "- apply_patch：一次改多处，参数 path、hunks（数组，每项 {start,end,new_text,expect}）。\n"
+    "  系统按 start 倒序应用；**任何一个 hunk 的 expect 对不上就整批放弃**，一个字节都不写。\n"
     "- write_file：写入/创建文件，参数 path、content。**可写到任意目录**（含工作区外，\n"
     "  如 D:\\\\桌面\\\\报告.docx）；只有系统关键目录（Windows、Program Files 等）被系统禁止。\n"
-    "  修改已有文件：先读出来，改好后再把**完整新内容**写回去（覆盖写）。\n"
+    "  修改已有文件：**优先 edit_lines 按行号小改**（见上）；只有整篇重写才用 write_file 覆盖写。\n"
     "  你就在本机真实运行，能真正落盘——**绝不要说\"模拟环境无法修改 / 我无法直接修改文件\"**。\n"
     "  **【硬性】凡是用户要你「写程序 / 写代码 / 写脚本 / 开发一个小工具 / 做个程序」，\n"
     "  你必须真的把完整代码写成一个文件（默认落到工作区 files\\\\ 下，如 files\\\\bank.py；\n"

@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QTextBrowser, QTextEdit, QPlainTextEdit, QFileDialog, QMessageBox,
     QApplication, QDialog, QLineEdit, QCheckBox,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QEvent
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QIcon, QFont as QGFont, QGuiApplication
 
 from .. import themes
@@ -291,13 +291,78 @@ class ChatInput(QPlainTextEdit):
     ⚠ 中文输入法正在组字（拼音还没上屏）时，Enter 应该交给输入法选词，
     绝不能当成"发送"。这里用两重判断：Qt 的 `QInputMethod.isComposing()`
     加上自己维护的 `inputMethodEvent` 组字状态，避免误发半句话。
+
+    ★ v9.20.0 修「输入框有点大，适当缩小」：
+      以前高度是外面写死的 `setMinimumHeight(68)`，空着也是 68px 的大白框。
+      现在**按内容自适应**：默认只占 1 行，内容变多就长高，最多 4 行
+      （`_MAX_LINES`）之后不再长、改成内部滚动条。只在"算出来的高度真的变了"
+      时才 `setFixedHeight`，避免每敲一个字都触发一次布局抖动。
     """
 
     submitted = pyqtSignal()
 
+    # 高度策略：1 行起步，4 行封顶（再长就出滚动条）
+    _MIN_LINES = 1
+    _MAX_LINES = 4
+    _DOC_MARGIN = 2          # 文档内边距（上下各 2px，够不贴边又不浪费纵向空间）
+    _EXTRA_H = 6             # 上下留白 + QSS padding，经验值（见 _fit_height）
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._composing = False
+        self._last_h = 0
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.document().setDocumentMargin(self._DOC_MARGIN)
+        self.textChanged.connect(self._fit_height)
+        self._fit_height()
+
+    # ---------- 高度自适应（v9.20.0） ----------
+    def _line_h(self):
+        return max(int(self.fontMetrics().lineSpacing()), 12)
+
+    def _visible_lines(self):
+        """文档现在占几行（软换行也算，见 QPlainTextDocument size）。"""
+        try:
+            n = int(round(float(self.document().size().height())))
+        except Exception:
+            n = self.blockCount()
+        return n
+
+    def _fit_height(self):
+        if getattr(self, "_fitting", False):
+            return
+        self._fitting = True
+        try:
+            lines = max(self._MIN_LINES,
+                        min(self._MAX_LINES, self._visible_lines()))
+            h = lines * self._line_h() + self._DOC_MARGIN * 2 + self._EXTRA_H
+            if h != self._last_h:      # ★ 高度没变就不动，避免抖动
+                self._last_h = h
+                self.setFixedHeight(h)
+        finally:
+            self._fitting = False
+
+    def changeEvent(self, event):        # noqa: N802 (Qt 命名)
+        """字体 / 样式换了（主题切换、QSS 字号）→ 旧的行高作废，重算一次。"""
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._last_h = 0
+            self._fit_height()
+
+    def showEvent(self, event):          # noqa: N802 (Qt 命名)
+        super().showEvent(event)
+        self._last_h = 0                 # 加入布局后字体才是最终值
+        self._fit_height()
+
+    def sizeHint(self):                # noqa: N802 (Qt 命名)
+        s = super().sizeHint()
+        return QSize(s.width(), self._last_h or s.height())
+
+    def minimumSizeHint(self):         # noqa: N802 (Qt 命名)
+        s = super().minimumSizeHint()
+        return QSize(s.width(), self._last_h or s.height())
 
     def _ime_composing(self):
         try:

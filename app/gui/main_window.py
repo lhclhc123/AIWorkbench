@@ -53,6 +53,15 @@ from .team_bar import TeamBar
 
 RADIUS_CARD = 12
 
+# ★ v9.20.0 修「点开长对话严重卡顿 / 未响应」：聊天区**分页渲染**。
+#   一张 MessageCard 内部有 QTextBrowser + 若干按钮 + 语法高亮，实测单张
+#   约 5~17ms（纯文本 5ms / 带代码 17ms）；一次铺 120 条 = 1.7s 主线程全黑。
+#   现在首次进对话只铺最近 CHAT_PAGE_SIZE 条，顶部留一个「加载更早」按钮，
+#   点一次往前再铺一批。
+#   为什么是 30 而不是 40：按实测（120 条混合消息）40 条约 480ms，卡在
+#   "0.5 秒没反应"的红线上；30 条约 350ms，留出真机更慢的余量。
+CHAT_PAGE_SIZE = 30
+
 # 用户消息里"带了附件"那行标注的前缀。
 # ★ v9.18.0（需求 16）：字形从 `app/icons.py` 取，**这里和 _visible_user_text()
 #   必须用同一个常量** —— 以前两处各写一遍字面量 emoji，换图标时就会漏掉一处，
@@ -144,13 +153,18 @@ class ConvRun:
     现在每个对话一份，互不干扰：切走→状态留在自己那份里；切回来→原样恢复。
     """
 
-    __slots__ = ("cid", "worker", "running", "live_text", "pending_tool",
+    __slots__ = ("cid", "worker", "runner", "running", "live_text", "pending_tool",
                  "live_card", "last_model_label", "dsw_selected",
                  "live_reason", "reason_card", "team_run")
 
     def __init__(self, cid=""):
         self.cid = cid
         self.worker = None
+        # ★ v9.19.0：AgentRunner 也必须**每个对话一份**。
+        #   老实现只有 `self.runner` 一个全局实例：A 对话在跑、用户切到 B 再发一条，
+        #   B 的 `_make_runner()` 就把这个全局指针覆盖掉了 —— 于是 A 的产物清单
+        #   (`runner.written`)、记忆回调全指向 B，落盘落进别人的文件夹。
+        self.runner = None
         self.running = False
         self.live_text = ""
         self.pending_tool = []
@@ -201,7 +215,15 @@ class MainWindow(QMainWindow):
     #   `TeamRun._emit` 是在**成员线程**里被调用的（taskman.submit(..., nested=True)
     #   的线程，或 TeamJob 线程）—— 直接摸控件就是随机崩，必须过一道信号。
     #   payload 是 dict，所以第二个参数用 `object`（pyqtSignal 不支持原生 dict）。
-    _team_evt = pyqtSignal(str, object)
+    # ★ v9.19.0：加了第三个参数 cid —— 团队事件必须写回**发起它的那个对话**。
+    #   老实现不带 cid，`_on_team_evt` 一律往 `self.conv`（= 正在显示的那个）里写，
+    #   于是 A 对话的团队在跑、用户切到 B，A 的「派单/成员完成」提示全糊到了 B 上。
+    _team_evt = pyqtSignal(str, object, str)
+    # ★ v9.20.0：助理代回"发送结果"从后台线程回 UI 线程要走信号
+    #   （跨线程直接动 Qt 控件在 Windows 上迟早炸）
+    _im_send_evt = pyqtSignal(str, object, str, bool)
+    # ★ v9.20.0：子进程预取回来的结果（后台线程 → UI 线程）
+    _im_prefetch_evt = pyqtSignal(str, int, str, str, object)
 
     # ---------- ★ v9.18.0：把"运行态"按对话分派（需求 7）----------
     # 下面这些名字以前是 MainWindow 的普通实例属性（全局只有一份）。现在改成
@@ -267,6 +289,25 @@ class MainWindow(QMainWindow):
     @worker.setter
     def worker(self, value):
         self._run().worker = value
+
+    @property
+    def runner(self):
+        """**当前对话自己的** AgentRunner（v9.19.0，按需创建）。
+
+        以前它是 MainWindow 上的一个普通属性 —— 全局只有一份。两个对话同时跑时，
+        后发起的那一轮会把指针覆盖掉：`_asst_finish` 收文件、`keys` 热更新、
+        产物清单 `runner.written` 全都看到的是**别人**那一轮的东西。
+        现在跟着对话走，`_send` 里显式赋一次（绑定 cid），其余地方读到的
+        永远是这个对话自己的那一份。
+        """
+        run = self._run()
+        if run.runner is None:
+            run.runner = self._make_runner(run.cid)
+        return run.runner
+
+    @runner.setter
+    def runner(self, value):
+        self._run().runner = value
 
     @property
     def _live_card(self):
@@ -360,6 +401,8 @@ class MainWindow(QMainWindow):
         self._bg_notice.connect(self._on_bg_notice)
         # ★ v9.18.0（需求 13）：团队过程事件（后台线程）-> UI 线程
         self._team_evt.connect(self._on_team_evt)
+        self._im_send_evt.connect(self._im_sent_back)
+        self._im_prefetch_evt.connect(self._asst_prefetch_store)
         # 同时起的团队可能不止一支（每个对话一支）；持有引用防 QThread 被 GC
         self._team_jobs = {}
         self.mcp = mcp_client.MCPManager(self.workspace.path)
@@ -368,7 +411,6 @@ class MainWindow(QMainWindow):
         self.speaker.edge_voice = self.settings.get("tts_voice") or tts_mod.DEFAULT_EDGE_VOICE
         self.speaker.rate = int(self.settings.get("tts_rate", 0) or 0)
         self.ding = dt_mod.DingTalkClient(dt_mod.config_from_settings(self.settings))
-        self.runner = self._make_runner()
 
         self.reminders = []          # [{text, ts, dingtalk, human}]
         self.attachments = []        # 待发送附件 [{name, kind, path, text, chars}]
@@ -383,6 +425,8 @@ class MainWindow(QMainWindow):
         #   property 路由到当前对话那一份（见类顶部的 property 块），全文件其它
         #   地方照旧写 `self.running` 就行。
         self._runs = {}
+        # ★ v9.19.0：先给 `_runs` 建好再建 runner（runner 现在挂在 ConvRun 上）
+        self.runner = self._make_runner()
         self.title_worker = None
         self._cards = []
         self._groups = []               # 过程折叠组 [(group, key)]
@@ -399,6 +443,30 @@ class MainWindow(QMainWindow):
         self._asst_queue = []       # 待处理的消息
         self._asst_worker = None    # 正在处理消息的 worker
         self._asst_cur = None       # 正在处理的那条消息
+        # ★ v9.19.0：这一轮助理任务**自己**的 runner（收产物时用它，不用全局的）
+        self._asst_runner = None
+        # ★ v9.20.0：这一轮开始的时间（看门狗用：卡住就兜底回复，不能一直"处理中"）
+        self._asst_started = 0.0
+        self._asst_wait_logged = 0.0
+        # ★ v9.20.0：延时代回 —— msgid -> 最早可以开始处理的时间戳
+        #   用户要求「我多少秒没自己回，才由 AI 代回」，所以消息进来先压着，
+        #   到点了再检查一眼：这期间我自己回过就跳过。
+        self._asst_not_before = {}
+        # ★ v9.20.0：这一轮助理任务的性质 —— "manual"（手动点了就发）/
+        #   "prefetch"（先拉回复，等 60 秒再决定发不发）
+        self._asst_kind = "manual"
+        self._asst_cid = ""
+        # ★ v9.20.0：助理默认走 glm；glm 不可用时这里会被设成 "auto"，只降一次不反复试
+        self._asst_force_model = ""
+        # ★ v9.20.0：这次预取走的是不是"独立子进程"（看门狗要区别对待）
+        self._asst_proc = False
+        self.im_pipe = None
+        # ★ v9.20.0：标签扫描线程（一次只跑一个）
+        self._im_scan_thread = None
+        self._asst_watchdog = QTimer(self)
+        self._asst_watchdog.setInterval(15000)
+        self._asst_watchdog.timeout.connect(self._asst_check_stuck)
+        self._asst_watchdog.start()
 
         self.setWindowTitle(f"{ver.APP_NAME} v{ver.VERSION}")
         self.setWindowIcon(make_icon())
@@ -926,7 +994,27 @@ class MainWindow(QMainWindow):
         self.page_assistant.process_all.connect(self._assistant_process_all)
         self.page_assistant.resend.connect(self._assistant_resend)
         self.page_assistant.cleared.connect(lambda: self._asst_queue.clear())
+        # ★ v9.20.0：助理页重做后的接线（消息双栏 / 设置 / 标签 / 更多管理）
+        self.page_assistant.msgs_deleted.connect(self._im_delete_msgs)
+        self.page_assistant.im_settings_saved.connect(self._im_settings_saved)
+        self.page_assistant.tag_scan.connect(self._im_tag_scan)
+        self.page_assistant.tag_saved.connect(self._im_tag_saved)
+        self.page_assistant.manage_requested.connect(self._im_open_manager)
+        self.page_assistant.whitelist_added.connect(self._im_whitelist_add)
+        self.page_assistant.whitelist_removed.connect(self._im_whitelist_remove)
+        self.page_assistant.thread_saved.connect(self._im_thread_saved)
+        self.page_assistant.task_added.connect(self._im_task_added)
+        self.page_assistant.task_deleted.connect(self._im_task_deleted)
+        self.page_assistant.task_toggled.connect(self._im_task_toggled)
+        self.page_assistant.memory_saved.connect(self._im_memory_saved)
+        self.page_assistant.refresh_requested.connect(self._im_refresh_all)
+        # ★ v9.20.0：钉钉连接（CLI/账号/会话）从「集成」收进助理「设置」页
+        self.page_assistant.ding_login.connect(self._asst_ding_login)
+        self.page_assistant.ding_refresh_convs.connect(self._asst_ding_convs)
+        self.page_assistant.ding_test_send.connect(self._asst_ding_test)
         self.assistant.incoming.connect(self._assistant_on_incoming)
+        # ★ v9.20.0：我自己在钉钉里发的消息也记下来（上下文 + 延时判断都要用）
+        self.assistant.outgoing.connect(self._assistant_on_outgoing)
         self.assistant.log.connect(lambda s: self.page_assistant.log(str(s)))
         self.assistant.state.connect(self.page_assistant.set_running)
 
@@ -1110,8 +1198,10 @@ class MainWindow(QMainWindow):
         self.input.setPlaceholderText(
             "输入消息，Enter 发送，Shift+Enter 换行　·　"
             "点右下角麦克风可以直接说话　·　文件/图片拖进窗口即可交给 AI")
-        self.input.setMinimumHeight(68)
-        self.input.setMaximumHeight(180)
+        # ★ v9.20.0 修「用户输入框有点大」：老代码在这里写死
+        #   setMinimumHeight(68) / setMaximumHeight(180) —— 空着也是 68px 的大白框。
+        #   现在高度由 ChatInput 自己按内容算：1 行起步、4 行封顶（再长出滚动条），
+        #   这里**不要**再设 min/max，否则会把自适应压回去。
         self.input.textChanged.connect(self._on_input_changed)
         self.input.submitted.connect(self._send)
 
@@ -1278,6 +1368,9 @@ class MainWindow(QMainWindow):
             pass
         if key == "assistant":
             self.page_assistant.load_cfg(self.assistant.cfg)
+            # ★ v9.20.0：进这一页就全量刷一次（消息 / 设置 / 标签），
+            #   否则用户改了设置切走再回来看到的还是老值。
+            self._im_refresh_all()
         if key == "skills":
             self.page_skills.bind(self.skills)
         elif key == "tasks":
@@ -1344,9 +1437,16 @@ class MainWindow(QMainWindow):
             pass
 
     # ================= 工作区 =================
-    def _make_runner(self):
+    def _make_runner(self, cid=""):
+        """建一个 AgentRunner。
+
+        ★ v9.19.0：**必须按 cid 绑定**。以前 files_dir / 记忆路径都读"全局当前对话"，
+          用户在一轮跑到一半时切对话，这一轮写出的产物和记忆就会落进**别的对话**
+          —— 这正是用户报的"切换对话会导致对话记录、记忆混乱错乱"。
+        """
+        cid = str(cid or "").strip()
         r = agent_mod.AgentRunner(
-            self.workspace.files_dir,
+            self.workspace.files_dir_for(cid) if cid else self.workspace.files_dir,
             vision_cb=self._vision,
             workspace_path=self.workspace.path,
             search_cb=self._web_search,
@@ -1364,13 +1464,17 @@ class MainWindow(QMainWindow):
         r.settings = self.settings
         # ★ v9.17.0：把"当前对话的记忆文件"告诉工具层（remember/recall 用它决定
         #   记到本对话还是主记忆）。用回调而不是一次性取值，切换对话后自动跟随。
-        r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
+        r.conv_memory_path_cb = (
+            (lambda c=cid: self.workspace.conv_memory_file(c)) if cid else
+            (lambda: self.workspace.conv_memory_file()))
         # ★ v9.18.0 行为修复（根因 D）：产物目录同样改成回调。
         #   files_dir 原来只在构造时取一次（那时还没选定对话 → 落到
         #   `chats/00_历史文件/files`），切对话后永不更新。
         #   现在每次用都从 workspace 实时取 → 切到哪个对话，产物就写进哪个
         #   对话自己的 `chats/<NN_标题>/files`（需求 8）。
-        r.files_dir_cb = lambda: self.workspace.files_dir
+        r.files_dir_cb = (
+            (lambda c=cid: self.workspace.files_dir_for(c)) if cid else
+            (lambda: self.workspace.files_dir))
         return r
 
     # ================= 工作总结 + 自动记忆（每轮结束都会跑） =================
@@ -1612,6 +1716,13 @@ class MainWindow(QMainWindow):
         `work_dir`：v9.18.0（需求 13）新加。团队成员的产物必须落在 TeamRun 指定的
         目录里（`team/<id>/<member>_files`），团队总监汇总阶段才登记得到这些文件；
         不传则沿用原来的独立沙箱 `.awb/bgagent/<tag>/files`。
+
+        返回（v9.18.0 起多带三个字段，团队引擎靠它们判断「真失败」）：
+          text            给用户/下游看的正文；**模型调用失败时为空串**
+          files           登记到的产物
+          ok              False = 模型调用失败（429/403/异常/超时），不是"正常没输出"
+          error           失败原因（ok=False 时必有）
+          steps_exhausted True = 工具步数用尽（已补一次纯文字收尾，结论可能不完整）
         """
         import uuid as _uuid
         tag = time.strftime("%m%d-%H%M") + "-" + _uuid.uuid4().hex[:4]
@@ -1631,6 +1742,25 @@ class MainWindow(QMainWindow):
             cli.set_web_gate(self.dsw.auto_ready)
         except Exception:
             pass
+
+        # ★ v9.19：如果这一轮是「团队」在派活（team._tls 里有 TeamRun），
+        #   ① 把这个 client 登记到 TeamRun 上 —— 用户点"停止"时才能真正掐断
+        #      正在路上的 HTTP 请求，而不是等它自己读超时（最长 150s）；
+        #   ② 把单次调用超时压到 90s、重试压到 2 次 —— 端点抖动时
+        #      一个成员最坏 90×2≈3 分钟，而不是 150×3≈7.5 分钟。
+        _team_run = None
+        try:
+            _team_run = getattr(_team_mod._tls, "run", None)
+        except Exception:
+            _team_run = None
+        _in_team = _team_run is not None
+        if _in_team:
+            try:
+                _team_run.track_client(cli)
+                cli.max_attempts = 2
+            except Exception:
+                pass
+        _llm_timeout = 90 if _in_team else 150
 
         runner = agent_mod.AgentRunner(
             files_dir, workspace_path=base,
@@ -1656,11 +1786,16 @@ class MainWindow(QMainWindow):
                 {"role": "user", "content": task_text}]
         model_sel = self.settings.get("selected_model", "auto")
         tools_used, last = set(), ""
-        for _ in range(max(1, min(int(max_steps or 8), 20))):
+        model_error = ""       # ★ P0-4：模型调用失败（429/403/超时…）单独记，绝不当成答复
+        steps_exhausted = False  # ★ P1-7：工具步数用尽 → 需要一次「只给结论」的强制收尾
+        steps = max(1, min(int(max_steps or 8), 20))
+        for _step in range(steps):
             try:
-                text = cli.chat(msgs, model_sel, False, None, 150)
+                text = cli.chat(msgs, model_sel, False, None, _llm_timeout)
             except Exception as exc:                   # noqa: BLE001
-                last = f"[错误] 模型调用失败：{type(exc).__name__}: {exc}"
+                # ★ 以前把 "[错误] 模型调用失败：429 …" 写进 last 后 break，
+                #   上层只看 task 状态 → 成员全标 done、报告就是这段报错原文。
+                model_error = f"{type(exc).__name__}: {exc}"
                 break
             text = text or ""
             calls = agent_mod.parse_tool_calls(text, limit=3)
@@ -1682,20 +1817,73 @@ class MainWindow(QMainWindow):
             msgs.append({"role": "user",
                          "content": "\n\n".join(fb) +
                          "\n\n（继续；如果任务已完成就直接给出最终答复文字。）"})
+        else:
+            # for 正常跑满（没有 break）＝ 最后一轮还在调工具，被步数上限截断。
+            steps_exhausted = True
+
+        # ★ P1-7：步数用尽时补一次「只给结论、不给工具」的强制收尾调用。
+        #   否则成员卡片拿到的是半截工具日志，看起来"做完"了其实没有结论。
+        if steps_exhausted and not model_error:
+            msgs.append({"role": "user",
+                         "content": "（工具调用步数已用尽）请**不要再调用任何工具**，"
+                                    "只用纯文字给出最终结论：做了什么、文件在哪、"
+                                    "验证结果是什么；没做到的部分如实说明。"})
+            try:
+                tail = cli.chat(msgs, model_sel, False, None, _llm_timeout) or ""
+                clean = agent_mod.strip_tool_text(tail)
+                if clean:
+                    last = clean
+            except Exception as exc:                   # noqa: BLE001
+                # 收尾调用失败不影响已有的部分结论，但要在 note 里说清楚
+                model_error = "" if last else f"{type(exc).__name__}: {exc}"
         files = []
+        _seen = set()
         for w in (runner.written or []):
             p = w.get("path") if isinstance(w, dict) else w
             if not p:
                 continue
             try:
+                real = os.path.normcase(os.path.abspath(p))
+                if real in _seen:
+                    continue
+                _seen.add(real)
                 files.append({"path": p, "size": os.path.getsize(p)})
             except Exception:
                 files.append({"path": p, "size": 0})
-        body = (last or "（没有产出文字结论）")
-        return {"text": body,
-                "files": files,
-                "dir": base,
-                "tools": sorted(tools_used)}
+        # ★ v9.19：`runner.written` 只记 write_file 写出来的文件；
+        #   模型用 run_python 现场生成的产物（比如导出的 xlsx、跑出来的截图）
+        #   不会进 written，导致报告里"没有产物"、用户也找不到文件。
+        #   这里补一遍工作目录扫描（跳过 .awb/traces 之类的内部数据）。
+        try:
+            for dp, dn, fns in os.walk(files_dir):
+                dn[:] = [d for d in dn if d not in (".awb", "__pycache__", ".git")]
+                for fn in fns:
+                    fp = os.path.join(dp, fn)
+                    real = os.path.normcase(os.path.abspath(fp))
+                    if real in _seen:
+                        continue
+                    _seen.add(real)
+                    try:
+                        files.append({"path": fp, "size": os.path.getsize(fp)})
+                    except Exception:
+                        files.append({"path": fp, "size": 0})
+        except Exception:
+            pass
+        out = {"text": (last or "（没有产出文字结论）") if not model_error else "",
+               "files": files,
+               "dir": base,
+               "tools": sorted(tools_used),
+               "ok": not model_error,
+               "steps_exhausted": bool(steps_exhausted)}
+        if model_error:
+            out["error"] = f"模型调用失败：{model_error}"
+        if _in_team and _team_run is not None:
+            # 成员跑完就注销，免得 TeamRun 长期攥着一堆 client（内存 + 误伤）。
+            try:
+                _team_run.untrack_client(cli)
+            except Exception:
+                pass
+        return out
 
     # ---------- 团队 ----------
     def _team_member_run(self, member_id, prompt, files_dir, max_steps):
@@ -1703,7 +1891,7 @@ class MainWindow(QMainWindow):
 
         为什么必须有这一层适配：`TeamRun._run_member` 是按
             agent_fn(member_id, prompt, files_dir, max_steps) -> {"text","files"}
-        去调的（见 `app/team.py:271`），而 `_bg_agent_run(task_text, title="", max_steps=8)`
+        去调的（见 `app/team.py` 的 `TeamRun._run_member`），而 `_bg_agent_run(task_text, title="", max_steps=8)`
         是"一条独立 AI 链路"的入口、自己开沙箱目录 —— 两个签名**位置参数含义不同**。
 
         ⚠ 直接传 `self._bg_agent_run` 的后果（老代码就是这么写的，实为死路）：
@@ -1740,6 +1928,12 @@ class MainWindow(QMainWindow):
                 for f in files:
                     if f.get("path"):
                         task.add_file(f["path"])
+                if run.status != "done":
+                    # ★ P0-4：后台任务页也要能看出「这轮没正常交付」，别只剩一个"已完成"。
+                    task.log_line(f"团队状态：{run.status}"
+                                  + (f"（{run.error}）" if run.error else ""))
+                    for w in (run.warnings or [])[:10]:
+                        task.log_line(f"警告：{w}")
             self._bg_notice.emit(f"团队 {run.id} 已结束（{run.status}）")
             return rep or "（团队无汇总）"
 
@@ -1793,36 +1987,47 @@ class MainWindow(QMainWindow):
         if bar is None:
             return
         try:
-            bar.set_team(str((self.conv or {}).get("team_id") or ""))
+            # ★ v9.19.0：silent=True —— 这里只是「把对话记着的选择回填到控件」，
+            #   不是用户换了队伍。不静默的话每切一次对话都会往记录里塞一条
+            #   「⬡ 本对话已切回普通模式」，还会被当 role=tool 喂给模型。
+            bar.set_team(str((self.conv or {}).get("team_id") or ""), silent=True)
             bar.reset_transient()
         except Exception:
             pass
 
-    def _on_team_evt(self, kind, payload):
+    def _on_team_evt(self, kind, payload, cid=None):
         """团队过程事件 —— **已经在 UI 线程**（经 `_team_evt` 信号转过来）。
 
         两件事：① 团队条上的成员名片亮灯/熄灯；② 关键节点同步到状态行与对话流，
         免得用户只盯着输入框上方那一行小字。
+
+        ★ v9.19.0：`cid` = 发起这一轮团队的对话。对话流里的提示、状态行都必须
+          按它判定 —— 用户可能早就切到别的对话去了。
+          `cid=None` 表示"当前对话"（和本文件其它回调的约定一致）。
         """
         payload = payload or {}
-        try:
-            self.team_bar.apply_event(kind, payload)
-        except Exception:
-            pass
+        cid = self._conv_cid() if cid is None else str(cid or "")
+        # 团队条只有"当前显示的那个对话"的才该被点亮
+        if self._is_current(cid):
+            try:
+                self.team_bar.apply_event(kind, payload)
+            except Exception:
+                pass
         if kind == "phase":
-            self._on_phase("team", payload.get("label") or "")
+            self._on_phase("team", payload.get("label") or "", cid)
         elif kind == "dispatch":
             n = len(payload.get("tasks") or [])
             self._append_system_note(
-                f"⬡ 项目总监已把需求拆成 {n} 项派下去，开始并行执行。")
+                f"⬡ 项目总监已把需求拆成 {n} 项派下去，开始并行执行。", cid)
         elif kind == "member_start":
-            self._on_phase("team", f"{payload.get('name', '')} 正在{payload.get('note') or '工作'}")
+            self._on_phase(
+                "team", f"{payload.get('name', '')} 正在{payload.get('note') or '工作'}", cid)
         elif kind == "member_done":
             mark = (_icons_mod.ic("ok") if payload.get("status") == "done"
                     else _icons_mod.ic("fail"))
             self._append_system_note(
                 f"{mark} {payload.get('name', '成员')} · {payload.get('title', '')}"
-                f"（{payload.get('status')}）")
+                f"（{payload.get('status')}）", cid)
 
     def _send_team(self, text, team_id, cid, note=""):
         """把这一轮交给预置团队去做（v9.18.0 需求 13）。
@@ -1851,11 +2056,12 @@ class MainWindow(QMainWindow):
             self._render(stick=True)
         self._append_system_note(
             f"⬡ 本轮交给团队「{t.get('name', team_id)}」执行"
-            f"（成员：{'、'.join(m['name'] for m in (t.get('members') or []))}）。")
+            f"（成员：{'、'.join(m['name'] for m in (t.get('members') or []))}）。", cid)
 
         # ⚠ TeamRun._emit 是在成员线程里调的：**只能**发 Qt 信号，绝不能摸控件。
+        # ★ v9.19.0：带上 cid —— 事件要回到**发起的那个对话**，不是"正在看的那个"。
         def _on_event(kind, payload):
-            self._team_evt.emit(str(kind), payload or {})
+            self._team_evt.emit(str(kind), payload or {}, cid)
 
         trun = self.teamman.create(
             text, self._team_member_run, taskman=self.taskman,
@@ -1903,7 +2109,9 @@ class MainWindow(QMainWindow):
         if self._is_current(cid):
             try:
                 self.team_bar.set_phase(
-                    {"done": "✓ 团队已完成", "failed": "✕ 团队执行失败",
+                    {"done": "✓ 团队已完成",
+                     "partial": "⚠ 团队部分完成（有成员失败或未交付）",
+                     "failed": "✕ 团队执行失败",
                      "cancelled": "⊘ 团队已取消"}.get(status, "团队已结束"))
             except Exception:
                 pass
@@ -1913,13 +2121,17 @@ class MainWindow(QMainWindow):
             self._render(stick=True)
         self._bg_notice.emit(f"团队 {getattr(trun, 'id', '')} 已结束（{status}）")
 
-    def _plain_runner(self, allow_subagent=True):
-        """给后台线程用的 AgentRunner：只挂不碰界面的回调。"""
+    def _plain_runner(self, allow_subagent=True, cid=""):
+        """给后台线程用的 AgentRunner：只挂不碰界面的回调。
+
+        cid：把产物/记忆锁在指定对话上（v9.19.0，防切换对话串台）。
+        """
+        cid = str(cid or "").strip()
         def _sub(task, steps=6):
             return self._agent_run_once(task, max_iter=int(steps) + 2,
                                         quiet=True)
         r = agent_mod.AgentRunner(
-            self.workspace.files_dir,
+            self.workspace.files_dir_for(cid) if cid else self.workspace.files_dir,
             vision_cb=self._vision,
             workspace_path=self.workspace.path,
             search_cb=lambda q: self.client.web_search(q),
@@ -1929,8 +2141,12 @@ class MainWindow(QMainWindow):
             taskman=self.taskman, teamman=self.teamman,
             team_cb=self._team_start_sync, bg_agent_cb=self._bg_agent_run,
             subagent_cb=(_sub if allow_subagent else None))
-        r.conv_memory_path_cb = lambda: self.workspace.conv_memory_file()
-        r.files_dir_cb = lambda: self.workspace.files_dir   # ★ 根因 D：同上，实时跟随对话
+        r.conv_memory_path_cb = (
+            (lambda c=cid: self.workspace.conv_memory_file(c)) if cid else
+            (lambda: self.workspace.conv_memory_file()))
+        r.files_dir_cb = (
+            (lambda c=cid: self.workspace.files_dir_for(c)) if cid else
+            (lambda: self.workspace.files_dir))
         return r
 
     def _agent_run_once(self, prompt, max_iter=8, quiet=False,
@@ -2139,17 +2355,39 @@ class MainWindow(QMainWindow):
         self._append_system_note(
             f"◷ 定时任务「{t.get('name')}」已自动执行：\n{res[:1500]}")
 
-    def _append_system_note(self, text):
-        """把后台发生的事写进当前对话（用户看得见）。"""
-        if not self.conv:
-            return
-        self.conv.setdefault("messages", []).append(
-            {"role": "tool", "content": text})
+    def _conv_obj(self, cid=None):
+        """取某个对话的记录对象（当前显示的那个优先，否则从磁盘读进来）。
+
+        ★ v9.19.0：后台回调（团队事件等）回来时，用户往往已经切到别的对话了。
+          这时往 `self.conv` 里写 = 把 A 的过程写进 B 的记录里 —— 用户报的
+          「切换对话会导致对话记录混乱」就是这么来的。所以统一走这里取。
+        """
+        cid = self._conv_cid() if cid is None else str(cid or "")
+        if not cid or self._is_current(cid):
+            return self.conv
         try:
-            self.workspace.save_conversation(self.conv)
+            return self.workspace.load_conversation(cid)
+        except Exception:
+            return None
+
+    def _append_system_note(self, text, cid=None):
+        """把后台发生的事写进**对应对话**（用户看得见）。
+
+        ★ v9.19.0：加了 cid —— 一轮跑完前用户切走了，这条提示要落在**发起它的
+          那个对话**里，不能糊到用户正在看的另一个对话上。
+        """
+        cid = self._conv_cid() if cid is None else str(cid or "")
+        conv = self._conv_obj(cid)
+        if not conv:
+            return
+        conv.setdefault("messages", []).append(
+            {"role": "tool", "content": config.strip_stream_reset(text)})
+        try:
+            self.workspace.save_conversation(conv)
         except Exception:
             pass
-        self._render()
+        if self._is_current(cid):
+            self._render()
 
     def _open_workspace(self, path, first=False):
         self.workspace = ws_mod.Workspace(path).ensure()
@@ -2227,6 +2465,11 @@ class MainWindow(QMainWindow):
         self.speaker.engine = self.settings.get("tts_engine", "sapi")
         self.speaker.edge_voice = self.settings.get("tts_voice") or tts_mod.DEFAULT_EDGE_VOICE
         self.speaker.rate = int(self.settings.get("tts_rate", 0) or 0)
+        # ★ v9.19.0：换工作区 = 换了一整套对话。旧对话的"每个对话一份运行态"
+        #   （含 runner / 产物目录）在旧工作区里，绝不能带到新工作区来 ——
+        #   否则新工作区里点开一个对话，产物会往旧工作区的 chats/ 里写。
+        self.__dict__.pop("_runs", None)
+        self.conv = None
         self.runner = self._make_runner()
         ws_mod.set_last_workspace(path)
         if first:
@@ -2241,6 +2484,8 @@ class MainWindow(QMainWindow):
         else:
             self._new_conversation(silent=True)
         self._refresh_all()
+        # ★ v9.20.0：IM 仓库（会话档案 / 消息流水 / 定时任务 / 日志本 / 记忆）
+        self._init_im()
         self._maybe_start_dingtalk_stream()
 
     def _load_conversations(self):
@@ -2267,6 +2512,10 @@ class MainWindow(QMainWindow):
             pass
         self._card_collapsed = {}      # 换会话：折叠记录随之清空
         self._render_sig = None        # ★ 换对话必须让渲染指纹失效，否则可能被短路
+        # ★ v9.20.0：新对话 = 分页窗口重算（还没消息，等价于 fold=0）
+        self._fold_auto = True
+        self._fold_n = 0
+        self._conv_gen = int(getattr(self, "_conv_gen", 0)) + 1   # 作废在途的延迟渲染
         self._sync_team_bar()          # ★ v9.18.0（需求 13）：新对话 = 默认不使用团队
         self._render()
         self._refresh_run_ui()
@@ -2276,10 +2525,69 @@ class MainWindow(QMainWindow):
         self.input.setFocus()
         self._open_page("chat")
 
+    @staticmethod
+    def _sanitize_conv(conv):
+        """清掉历史记录里由 bug 写进去的垃圾（v9.19.0）。
+
+        两类：
+        ① `␜AWB-RESET␝` 及其残骸 —— 那是"作废重来"的内部信号，被 DeepSeek 网页
+           通道当正文塞进了历史，模型看到会照着抄（实测出现过
+           `第一步：列出 D:\\AI 工作空间\\chats␜AWB-RESET␝我先看一下当前进度`）。
+        ② 重复的「⬡ 本对话已切回普通模式」—— 每切一次对话就写一条（老 `set_team`
+           不分场合 emit），一个对话能攒七八条，还会被当 role=tool 喂给模型，
+           模型就会在回答里"复述这些历史消息"。
+
+        返回是否真的改动过（需要重新落盘）。
+        """
+        if not isinstance(conv, dict):
+            return False
+        msgs = conv.get("messages")
+        if not isinstance(msgs, list):
+            return False
+        changed = False
+        out = []
+        seen_plain_note = False
+        for m in msgs:
+            if not isinstance(m, dict):
+                out.append(m)
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content:
+                clean = config.strip_stream_reset(content)
+                if clean != content:
+                    m = dict(m)
+                    m["content"] = clean
+                    content = clean
+                    changed = True
+                if (m.get("role") == "tool"
+                        and content.startswith("⬡ 本对话已切回普通模式")):
+                    # 只留第一条，其余全是噪声
+                    if seen_plain_note:
+                        changed = True
+                        continue
+                    seen_plain_note = True
+            if not (isinstance(content, str) and content.strip()) and m.get("role") in (
+                    "tool", "thinking"):
+                # 清空的过程块直接丢掉（不能留一条空气泡）。
+                # 注意：**只清 tool/thinking**，assistant 哪怕空着也可能是模型
+                # 当时真的没说话，删了就改变了历史，不碰。
+                changed = True
+                continue
+            out.append(m)
+        if changed:
+            conv["messages"] = out
+        return changed
+
     def _on_conv_selected(self, item):
         cid = item.data(Qt.ItemDataRole.UserRole)
         conv = self.workspace.load_conversation(cid)
         if conv:
+            # ★ v9.19.0：先把老 bug 写进去的垃圾清掉，再显示（也顺手修好用户的旧记录）
+            try:
+                if self._sanitize_conv(conv):
+                    self.workspace.save_conversation(conv)
+            except Exception:
+                pass
             self.conv = conv
             # ★ v9.17.0：跟着切换"当前对话目录"
             try:
@@ -2293,12 +2601,53 @@ class MainWindow(QMainWindow):
             #   现在什么都不清：切回来原样恢复；界面控件按"这个对话当前是不是在跑"重设。
             self._card_collapsed = {}  # 折叠记录是纯界面态，重建时按当前内容重算即可
             self._render_sig = None    # ★ 换对话：渲染指纹失效（防跨对话误短路）
+            # ★ v9.20.0：新对话进来 = 分页窗口重算（只铺最近一页）
+            self._fold_auto = True
+            self._fold_n = 0
             # ★ v9.18.0（需求 13）：团队选择是**每个对话自己的**（存在 conv["team_id"]），
             #   切过来要把团队条同步成这个对话记的那一支，否则会串台。
             self._sync_team_bar()
-            self._render()
             self._refresh_run_ui()
             self._update_page_title()
+            # ★★ v9.20.0 修「点开长对话严重卡顿 / 未响应」：
+            #   老写法在这里同步 `_render()`，120 条消息要一次性造 120 张
+            #   MessageCard（实测 ~1.7s 全在主线程）—— 用户点下去就是白屏 +
+            #   窗口"未响应"。现在拆成两段：
+            #     ① 立刻做：换 conv、标题、团队条、运行态、清空旧内容
+            #        （长对话先给一行「正在加载对话…」占位，界面马上有反应）；
+            #     ② 下一帧做：真正的卡片渲染（QTimer.singleShot(0)）。
+            #   Qt 会先处理队列里已排的 paint 事件、再跑 0ms 定时器，所以
+            #   点击的第一帧就能画出来，不会出现"点下去整窗发白"。
+            #   `_conv_gen` 是代次号：用户快速连点两个对话时，只有最后一轮
+            #   真渲染，前一轮直接丢掉（否则白烧一遍 CPU）。
+            self._conv_gen = int(getattr(self, "_conv_gen", 0)) + 1
+            gen = self._conv_gen
+            if len(conv.get("messages") or []) > CHAT_PAGE_SIZE:
+                self._show_loading()
+            QTimer.singleShot(0, lambda g=gen: self._render_conv_async(g))
+
+    def _render_conv_async(self, gen):
+        """延后一帧真正渲染刚才选中的对话（见 `_on_conv_selected`）。"""
+        if gen != int(getattr(self, "_conv_gen", gen)):
+            return                      # 用户已经点了别的对话，这一轮作废
+        self._render()
+
+    def _show_loading(self):
+        """切到长对话时的轻量占位：只清空 + 一行灰字，绝不建卡片。
+
+        目的只有一个 —— 让"点下去"这一帧有反应。真正的渲染在下一帧。
+        """
+        self._clear_chat()
+        self._cards = []
+        self._groups = []
+        self._live_card = None
+        self._reason_card = None
+        t = themes.tokens()
+        lab = QLabel("正在加载对话…")
+        lab.setStyleSheet(f"color:{t['text_muted']};font-size:{themes.fs(13)};"
+                          "padding:18px 8px;")
+        self.chat_layout.addWidget(lab)
+        self.chat_layout.addStretch(1)
 
     def _delete_conversation(self):
         if not self.conv:
@@ -3034,6 +3383,517 @@ class MainWindow(QMainWindow):
         else:
             self.assistant.stop()
 
+    # ---------- ★ v9.20.0：IM 助手底座（持久化 / 上下文 / 定时 / 日志本） ----------
+    def _init_im(self):
+        """换工作区时重建 IM 仓库与编排核心。"""
+        try:
+            from ..im import IMStore
+            from ..im.hub import IMHub
+            self.im_store = IMStore(self.workspace.path)
+            self.im_hub = IMHub(self.im_store, self._im_llm, self._im_send,
+                                log=lambda s: self._safe_asst_log(s),
+                                me_name=self._ding_self_name())
+            # ★ v9.20.0：「先拉后等」的时序编排（预取回复 → 等 N 秒 → 查你回没回 → 合并发送）
+            try:
+                from ..im.pipeline import ReplyPipeline
+                st0 = self.im_store.settings()
+                self.im_pipe = ReplyPipeline(
+                    store=self.im_store,
+                    delay=int(st0.get("delay_seconds") or 60),
+                    log=lambda s: self._safe_asst_log(s),
+                    me_name=self._ding_self_name())
+                self._safe_asst_log(
+                    "代回策略：收到消息就先生成回复，等你 %s 秒；"
+                    "这期间你自己回了就不代回" % self.im_pipe.delay)
+            except Exception as exc:
+                self.im_pipe = None
+                self._safe_asst_log(
+                    f"代回编排初始化失败（退回逐条处理）：{type(exc).__name__}: {exc}")
+            # 定时任务（每日/每周/每月主动发消息）—— 10 秒检查一次，
+            # 兼着驱动「预取 / 到点发送」，60 秒延时才能准到 ±10 秒内
+            if not hasattr(self, "_im_timer") or self._im_timer is None:
+                self._im_timer = QTimer(self)
+                self._im_timer.setInterval(10000)
+                self._im_timer.timeout.connect(self._im_tick)
+            self._im_timer.start()
+            self._safe_asst_log(
+                f"IM 数据目录：{self.im_store.root}"
+                f"（会话 {len(self.im_store.threads())} 个 / "
+                f"定时任务 {len(self.im_store.tasks())} 条）")
+            # ★ v9.20.0：把用户上次在「设置」里填的东西接上老轮询服务
+            #   （间隔 / 自动回复开关 / 粗粒度的监听范围）
+            try:
+                st = self.im_store.settings()
+                patch = {}
+                if st.get("interval"):
+                    patch["interval"] = int(st["interval"])
+                g = bool(st.get("scope_group", True))
+                p = bool(st.get("scope_p2p", True))
+                patch["scope"] = ("at_me" if (g and not p)
+                                  else ("all" if (g or p) else "self"))
+                if patch:
+                    self.assistant.apply_cfg(patch)
+            except Exception:
+                pass
+            self._im_refresh_all()
+        except Exception as exc:
+            self.im_store = None
+            self.im_hub = None
+            self._safe_asst_log(f"IM 底座初始化失败：{type(exc).__name__}: {exc}")
+
+    def _safe_asst_log(self, text):
+        try:
+            self.page_assistant.log(str(text))
+        except Exception:
+            pass
+
+    def _assistant_on_outgoing(self, msg):
+        """我自己本人在钉钉里发出去的消息 —— 只记流水，不进处理队列。
+
+        ★ v9.20.0：两个用处：
+          ① AI 组上下文时能看到"我本人是怎么回的"，语气才对得上；
+          ② 「多少秒没回才由 AI 代回」靠它判断你到底回了没有。
+        """
+        try:
+            hub = getattr(self, "im_hub", None)
+            cid = str((msg or {}).get("cid") or "")
+            if hub is None or not cid:
+                return
+            self.im_store.append_message(
+                cid, mid=(msg or {}).get("msgid") or "", direction="out",
+                sender=(msg or {}).get("sender") or self._ding_self_name(),
+                text=(msg or {}).get("text") or "", ai=False, status="")
+        except Exception as exc:
+            self._safe_asst_log(f"记录我自己的消息失败：{type(exc).__name__}: {exc}")
+
+    def _im_send(self, thread_id, text):
+        """把一句话发回某个钉钉会话（hub 用）。"""
+        try:
+            if not thread_id:
+                return False
+            return bool(self.ding.dws_send_to_cid(thread_id, str(text)))
+        except Exception as exc:
+            self._safe_asst_log(f"发回钉钉失败：{type(exc).__name__}: {exc}")
+            return False
+
+    def _im_llm(self, messages, thread):
+        """hub 用的模型调用（同步）。
+
+        ★ 用户要求「模型不要让用户选，默认 glm」—— 助理固定优先 glm-4-flash，
+          前台对话选什么模型都不影响它。免费档不可用时退到 auto（省钱优先），
+          仍然不需要用户操心。
+        """
+        cli = self.bg_client
+        try:
+            return cli.chat(messages, "glm-4-flash", False, None, 90) or ""
+        except Exception:
+            try:
+                return cli.chat(messages, "auto", False, None, 120) or ""
+            except Exception:
+                return ""
+
+    def _im_tick(self):
+        """定时消息 + 代回时序的心跳（每 10 秒）。失败绝不影响界面。"""
+        hub = getattr(self, "im_hub", None)
+        if hub is not None:
+            try:
+                sent = hub.tick()
+                for item in sent:
+                    t = item.get("task") or {}
+                    self._safe_asst_log(
+                        f"◷ 定时消息「{t.get('title')}」"
+                        + ("已发到钉钉" if item.get("ok") else "发送失败"))
+            except Exception as exc:
+                self._safe_asst_log(f"定时消息检查失败：{type(exc).__name__}: {exc}")
+        # ★ v9.20.0：到点的代回 + 需要预取的批次
+        try:
+            self._im_pipeline_due()
+            self._im_pipeline_pump()
+        except Exception as exc:
+            self._safe_asst_log(f"代回时序检查失败：{type(exc).__name__}: {exc}")
+
+    def _im_refresh_views(self):
+        """只刷新「消息」双栏（每收到一条、每回一条都会走这里）。
+
+        ★ v9.20.0：设置页 / 标签页**不跟着刷** —— 用户可能正在里面打字改东西，
+          每 20 秒把他改到一半的勾选冲掉是灾难。要刷全量走 `_im_refresh_all()`。
+        """
+        if getattr(self, "im_hub", None) is None:
+            return
+        try:
+            rows = self.im_store.rows()
+        except Exception as exc:
+            self._safe_asst_log(f"读消息列表失败：{type(exc).__name__}: {exc}")
+            return
+        try:
+            self.page_assistant.set_im_data(rows=rows)
+        except Exception:
+            pass
+
+    def _im_refresh_all(self):
+        """全量刷新：消息双栏 + 设置 + 标签 + 更多管理对话框的数据。"""
+        if getattr(self, "im_hub", None) is None:
+            return
+        try:
+            st = self.im_store.settings()
+            rows = self.im_store.rows()
+            tags = self.im_store.tags()
+            threads = self.im_store.threads()
+            tasks = self.im_store.tasks()
+            logs = self.im_store.logbook()
+            memory = self.im_store.memory()
+        except Exception as exc:
+            self._safe_asst_log(f"读助手数据失败：{type(exc).__name__}: {exc}")
+            return
+        try:
+            self.page_assistant.set_im_data(
+                rows=rows, settings=st, tags=tags,
+                threads=threads, tasks=tasks, logs=logs,
+                memory=memory, review_fn=self.im_store.review)
+            self.page_assistant.set_ding_status(self._asst_ding_status_text())
+        except Exception as exc:
+            self._safe_asst_log(f"刷新助手页失败：{type(exc).__name__}: {exc}")
+
+    # ---------- 钉钉连接（在助理「设置」页里配）----------
+    def _asst_ding_status_text(self):
+        """读登录状态（带 60 秒缓存 —— `dws auth status` 是一次子进程，别每次刷都跑）。"""
+        now = time.time()
+        cache = getattr(self, "_ding_status_cache", None)
+        if cache and now - cache[0] < 60:
+            return cache[1]
+        text = ""
+        try:
+            if not self.ding.dws_available():
+                text = ("没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
+                        "或自行 npm i -g dingtalk-workspace-cli。")
+            else:
+                st = self.ding.dws_auth_status() or {}
+                if st.get("authenticated"):
+                    who = st.get("user_name") or "（已登录）"
+                    corp = st.get("corp_name") or ""
+                    text = "✓ 已登录：%s%s" % (who, ("（%s）" % corp) if corp else "")
+                else:
+                    text = "✗ 还没登录 —— 点下面的「扫码授权登录」或「设备码登录」"
+        except Exception as exc:
+            text = "状态读取失败：%s: %s" % (type(exc).__name__, exc)
+        self._ding_status_cache = (now, text)
+        return text
+
+    def _asst_ding_login(self, device):
+        self._safe_asst_log("已发起 dws 授权登录（%s），请按提示完成授权…"
+                            % ("设备码" if device else "浏览器扫码"))
+        self._ding_status_cache = None
+        try:
+            self._dingtalk_dws_login(bool(device))
+        except Exception as exc:
+            self._safe_asst_log(f"发起登录失败：{type(exc).__name__}: {exc}")
+            return
+        # 登录完回来刷一次状态（用户不用手动点）
+        def _later():
+            time.sleep(8)
+            self._ding_status_cache = None
+            self._im_refresh_all()
+        threading.Thread(target=_later, daemon=True).start()
+
+    def _asst_ding_convs(self):
+        """刷新会话列表（后台读，回来填下拉框）。"""
+        if not self.ding.dws_available():
+            self._safe_asst_log("没找到 dws，读不了会话列表")
+            return
+        self._safe_asst_log("正在读取钉钉会话列表…")
+
+        def w():
+            rows = []
+            try:
+                raw = self.ding.dws_list_conversations(30) or []
+            except Exception as exc:
+                self._safe_asst_log(f"读会话列表失败：{type(exc).__name__}: {exc}")
+                raw = []
+            for c in raw:
+                if not isinstance(c, dict):
+                    continue
+                cid = str(c.get("id") or c.get("openConversationId") or "").strip()
+                if not cid:
+                    continue
+                rows.append({"id": cid,
+                             "name": str(c.get("name") or c.get("conversationName") or cid),
+                             "kind": str(c.get("kind") or "group")})
+            self._asst_ding_convs_back.emit(rows)
+        threading.Thread(target=w, daemon=True).start()
+
+    def _asst_ding_convs_back(self, rows):
+        """（UI 线程）会话列表回来了。"""
+        self._safe_asst_log("会话列表：%d 个" % len(rows or []))
+        try:
+            self.page_assistant.set_ding_status(self._asst_ding_status_text(), rows)
+        except Exception:
+            pass
+
+    def _asst_ding_test(self, cid, text):
+        if not cid:
+            return
+        def w():
+            ok = False
+            try:
+                ok = bool(self._im_send(cid, text))
+            except Exception as exc:
+                self._safe_asst_log(f"发测试消息失败：{type(exc).__name__}: {exc}")
+            self._asst_log_ui("✓ 测试消息已发到钉钉" if ok else "✕ 测试消息发送失败")
+        threading.Thread(target=w, daemon=True).start()
+
+    # ---------- ★ v9.20.0：助理页「消息 / 设置 / 标签」的写操作 ----------
+    def _im_settings_saved(self, cfg):
+        """设置页保存：范围 / 白名单 / 延时 / 不确定时是否回 / 身份背景。"""
+        if getattr(self, "im_store", None) is None:
+            return
+        d = dict(cfg or {})
+        interval = d.pop("interval", None)
+        auto = d.pop("auto_reply", None)
+        try:
+            self.im_store.set_settings(**d)
+        except Exception as exc:
+            self._safe_asst_log(f"保存助手设置失败：{type(exc).__name__}: {exc}")
+            return
+        # 轮询间隔 / 自动回复开关仍然归老的轮询服务管
+        patch = {}
+        if interval:
+            try:
+                patch["interval"] = max(10, min(600, int(interval)))
+            except Exception:
+                pass
+        if auto is not None:
+            patch["auto_reply"] = bool(auto)
+        g = bool(d.get("scope_group", True))
+        p = bool(d.get("scope_p2p", True))
+        patch["scope"] = ("at_me" if (g and not p) else ("all" if (g or p) else "self"))
+        try:
+            self.assistant.apply_cfg(patch)
+        except Exception:
+            pass
+        # ★ v9.20.0：延时改了要立刻生效（不然要重启）
+        try:
+            if getattr(self, "im_pipe", None) is not None:
+                self.im_pipe.set_delay(d.get("delay_seconds"))
+        except Exception:
+            pass
+        self.statusBar().showMessage("助手设置已保存", 4000)
+        self._safe_asst_log(
+            "助手设置已保存：群聊 %s / 单聊 %s / 群里只在@我 %s / "
+            "延时 %s 秒 / 拿不准也回 %s"
+            % ("✓" if g else "✗", "✓" if p else "✗",
+               "✓" if d.get("scope_at_me", True) else "✗",
+               d.get("delay_seconds"), "✓" if d.get("reply_uncertain", True) else "✗"))
+        self._im_refresh_all()
+
+    def _im_delete_msgs(self, mids):
+        """从两栏里删掉选中消息（落盘标记，重启也不会再冒出来）。"""
+        if not mids or getattr(self, "im_store", None) is None:
+            return
+        mids = [str(x) for x in mids if x]
+        n = 0
+        for mid in mids:
+            m = self.page_assistant.msgs.get(mid) or {}
+            cid = str(m.get("cid") or "")
+            if not cid:
+                continue
+            try:
+                if self.im_store.hide_message(cid, mid):
+                    n += 1
+            except Exception:
+                pass
+        drop = set(mids)
+        for mid in mids:
+            self.page_assistant.msgs.pop(mid, None)
+            self._asst_not_before.pop(mid, None)
+        self._asst_queue[:] = [x for x in self._asst_queue if x not in drop]
+        # ★ v9.20.0：也从"等待代回"的窗口里摘掉，否则删了还会被代回
+        try:
+            if getattr(self, "im_pipe", None) is not None:
+                self.im_pipe.forget(mids)
+        except Exception:
+            pass
+        self._safe_asst_log(f"已删除 {n} 条消息")
+        self._im_refresh_views()
+
+    def _im_whitelist_add(self, item):
+        item = dict(item or {})
+        raw = str(item.get("name") or item.get("id") or "").strip()
+        if not raw or getattr(self, "im_store", None) is None:
+            return
+        cid, name, kind = raw, raw, str(item.get("kind") or "group")
+        matched = False
+        try:
+            for tid, t in (self.im_store.threads() or {}).items():
+                if tid == raw or str(t.get("name") or "") == raw:
+                    cid = tid
+                    name = str(t.get("name") or raw)
+                    kind = str(t.get("kind") or kind)
+                    matched = True
+                    break
+        except Exception:
+            pass
+        try:
+            self.im_store.whitelist_add(cid, name, kind)
+        except Exception as exc:
+            self._safe_asst_log(f"加白名单失败：{type(exc).__name__}: {exc}")
+            return
+        if matched:
+            self._safe_asst_log(f"白名单已加：{name}")
+        else:
+            self._safe_asst_log(
+                f"白名单已记下「{name}」，但还没对上具体会话 —— "
+                f"等助手收到过它的消息后，再加一次（或直接填会话 id）就生效")
+        self._im_refresh_all()
+
+    def _im_whitelist_remove(self, cid):
+        if getattr(self, "im_store", None) is None or not cid:
+            return
+        try:
+            self.im_store.whitelist_remove(str(cid))
+        except Exception:
+            return
+        self._safe_asst_log(f"白名单已移除：{cid}")
+        self._im_refresh_all()
+
+    # ---------- 标签页 ----------
+    def _im_tag_scan(self):
+        """首次全量扫描：读全部会话 → 让 AI 一个个打关系标签。"""
+        if getattr(self, "im_store", None) is None:
+            return
+        w = getattr(self, "_im_scan_thread", None)
+        if w is not None and w.isRunning():
+            self.page_assistant.set_scan_state("正在扫描中，请稍等…")
+            return
+        if not self.ding.dws_available():
+            self.page_assistant.set_scan_state("没找到 dws，先把「集成 → 钉钉」配好")
+            return
+        self.page_assistant.set_scan_state("正在读取钉钉会话列表…")
+        self._safe_asst_log("开始扫描全部会话并打标签（一次一个会话，会慢一些）")
+
+        outer = self
+
+        class _ScanWorker(QThread):
+            progress = pyqtSignal(int, int, str)
+            done = pyqtSignal(dict)
+
+            def __init__(self, store, ding, llm, parent=None):
+                super().__init__(parent)
+                self.store = store
+                self.ding = ding
+                self.llm = llm
+                self.aborted = False
+
+            def run(self):
+                try:
+                    from ..im import tags as _imtags
+                    res = _imtags.scan_and_tag(
+                        self.store, self.ding, self.llm,
+                        progress=lambda i, n, nm: self.progress.emit(int(i), int(n), str(nm)))
+                except Exception as exc:
+                    res = {"ok": False, "reason": f"{type(exc).__name__}: {exc}",
+                           "tagged": 0, "total": 0, "convs": []}
+                self.done.emit(res)
+
+        w = _ScanWorker(self.im_store, self.ding, self._im_llm, outer)
+        w.progress.connect(
+            lambda i, n, nm: self.page_assistant.set_scan_state(f"正在扫描 {i}/{n}：{nm}"))
+        w.done.connect(self._im_tag_scan_done)
+        self._im_scan_thread = w
+        w.start()
+
+    def _im_tag_scan_done(self, res):
+        self._im_scan_thread = None
+        res = dict(res or {})
+        if not res.get("ok"):
+            self.page_assistant.set_scan_state(
+                f"扫描失败：{res.get('reason') or '未知原因'}")
+            self._safe_asst_log(f"扫描失败：{res.get('reason')}")
+            return
+        self.page_assistant.set_scan_state(
+            "扫描完成：共 %s 个会话，打上 %s 个标签（拿不准的留空了，你可以自己改）"
+            % (res.get("total"), res.get("tagged")))
+        self._safe_asst_log(
+            "扫描完成：%s 个会话 / %s 个标签" % (res.get("total"), res.get("tagged")))
+        try:
+            self.im_store.set_settings(scanned=True)
+        except Exception:
+            pass
+        self._im_refresh_all()
+
+    def _im_tag_saved(self, cid, tag):
+        if getattr(self, "im_store", None) is None or not cid:
+            return
+        try:
+            self.im_store.set_tag(str(cid), str(tag or ""), note="手动", auto=False)
+        except Exception as exc:
+            self._safe_asst_log(f"保存标签失败：{type(exc).__name__}: {exc}")
+            return
+        self._safe_asst_log(f"标签已保存：{cid} → {tag or '（清空）'}")
+        self._im_refresh_all()
+
+    # ---------- 「更多管理」对话框（定时消息 / 日志本 / 记忆 / 会话模式） ----------
+    def _im_open_manager(self):
+        try:
+            self.page_assistant.show_manager()
+        except Exception as exc:
+            self._safe_asst_log(f"打开消息管理失败：{type(exc).__name__}: {exc}")
+            return
+        self._im_refresh_all()
+
+    def _im_thread_saved(self, d):
+        d = dict(d or {})
+        tid = str(d.pop("id", "") or "")
+        if not tid or getattr(self, "im_store", None) is None:
+            return
+        try:
+            self.im_store.update_thread(tid, **d)
+        except Exception as exc:
+            self._safe_asst_log(f"保存会话设置失败：{type(exc).__name__}: {exc}")
+            return
+        self._safe_asst_log(f"会话设置已保存：{tid}")
+        self._im_refresh_all()
+
+    def _im_task_added(self, t):
+        if getattr(self, "im_store", None) is None:
+            return
+        try:
+            rec = self.im_store.add_task(dict(t or {}))
+        except Exception as exc:
+            self._safe_asst_log(f"添加定时消息失败：{type(exc).__name__}: {exc}")
+            return
+        self._safe_asst_log(f"已添加定时消息：{rec.get('title')}")
+        self._im_refresh_all()
+
+    def _im_task_deleted(self, tid):
+        if getattr(self, "im_store", None) is None:
+            return
+        try:
+            self.im_store.remove_task(str(tid))
+        except Exception:
+            return
+        self._safe_asst_log("已删除定时消息")
+        self._im_refresh_all()
+
+    def _im_task_toggled(self, tid, on):
+        if getattr(self, "im_store", None) is None:
+            return
+        try:
+            self.im_store.update_task(str(tid), enabled=bool(on))
+        except Exception:
+            return
+        self._safe_asst_log(f"定时消息已{'启用' if on else '停用'}")
+        self._im_refresh_all()
+
+    def _im_memory_saved(self, text):
+        if getattr(self, "im_store", None) is None:
+            return
+        try:
+            self.im_store.set_memory(str(text or ""))
+        except Exception as exc:
+            self._safe_asst_log(f"保存记忆失败：{type(exc).__name__}: {exc}")
+            return
+        self._safe_asst_log("共享记忆已保存（所有会话都会带上它）")
+
     def _assistant_save_cfg(self, cfg):
         self.assistant.apply_cfg(cfg)
         self.statusBar().showMessage("助理设置已保存", 4000)
@@ -3048,26 +3908,72 @@ class MainWindow(QMainWindow):
             if self.assistant.cfg.get("enabled"):
                 self.assistant.start()
             self.page_assistant.load_cfg(self.assistant.cfg)
+            self._im_refresh_all()
         except Exception:
             pass
 
     def _assistant_on_incoming(self, msg):
-        """服务收到新消息：显示 + 通知 + 按需排队处理。"""
+        """服务收到新消息：落盘 → 显示 → 通知 → 按需排队处理。"""
+        # ★ v9.20.0：给这一条打上"收到时刻"，延时回复和"你自己回过没"都靠它
+        msg = dict(msg or {})
+        msg["recv_ts"] = time.time()
         mid = self.page_assistant.add_message(msg)
         self.assistant.mark_processed(mid)
+        # ★ v9.20.0：每条消息**先落盘**（含上下文与日志本抽取）。
+        #   老实现只放在内存里，程序一重启就全没了 —— 用户说的"消息消失"。
+        try:
+            hub = getattr(self, "im_hub", None)
+            if hub is not None:
+                conv = str(msg.get("conv") or "")
+                sender = str(msg.get("sender") or "")
+                scope = str(self.assistant.cfg.get("scope") or "")
+                kind = "self" if scope == "self" else (
+                    "p2p" if conv and conv == sender else "group")
+                hub.observe(dict(msg, kind=msg.get("kind") or kind))
+        except Exception as exc:
+            self._safe_asst_log(f"消息落盘失败（不影响处理）：{type(exc).__name__}: {exc}")
         who = msg.get("conv") or msg.get("sender") or "钉钉"
         self.statusBar().showMessage(
             f"⚑ 助理收到消息（{who}）：{str(msg.get('text'))[:40]}", 8000)
         if self.assistant.cfg.get("auto_reply"):
-            self._asst_queue.append(mid)
-            self._asst_pump()
+            # ★ v9.20.0：用户要的流程 ——「收到消息 → 立刻让 AI 把回复准备好
+            #   → 等你 N 秒 → 你没自己回就发（多条合并成一条）」
+            pipe = getattr(self, "im_pipe", None)
+            if pipe is not None and msg.get("cid"):
+                st = pipe.on_message(msg)
+                if st is not None:
+                    if len(st.get("msgids") or []) == 1:
+                        self._safe_asst_log(
+                            "收到新消息：先让 AI 把回复准备好，"
+                            "等你 %s 秒；这期间你自己回了就不代回" % pipe.delay)
+                    else:
+                        self._safe_asst_log(
+                            "同一个会话又来了 %d 条，已合并成一条回复一起处理"
+                            % len(st.get("msgids") or []))
+                    self._im_pipeline_pump()
+                else:
+                    self._asst_queue.append(mid)
+                    self._asst_pump()
+            else:
+                # 编排层没起来（极少数情况）→ 退回老的逐条队列
+                self._asst_queue.append(mid)
+                self._asst_pump()
         else:
-            self.page_assistant.log("新消息待处理（自动回复关着）：点「处理选中」")
+            self.page_assistant.log("新消息待处理（自动回复关着）：点「全部交给 AI」")
+        self._im_refresh_views()
 
     def _assistant_process_one(self, msgid):
         if not msgid:
-            self.page_assistant.log("先在列表里选一条消息")
+            self.page_assistant.log("先在右边勾一条消息")
             return
+        # 手动点的一定立刻处理，不再等延时
+        self._asst_not_before.pop(msgid, None)
+        # ★ v9.20.0：从"等待代回"的窗口里摘掉，否则时间到了还会再代回一次
+        try:
+            if getattr(self, "im_pipe", None) is not None:
+                self.im_pipe.forget([msgid])
+        except Exception:
+            pass
         self._asst_queue.append(msgid)
         self._asst_pump()
 
@@ -3075,8 +3981,334 @@ class MainWindow(QMainWindow):
         for mid in self.page_assistant.row_msgids():
             m = self.page_assistant.msgs.get(mid) or {}
             if m.get("status") in ("待处理", "失败"):
+                self._asst_not_before.pop(mid, None)
                 self._asst_queue.append(mid)
+        try:
+            if getattr(self, "im_pipe", None) is not None:
+                self.im_pipe.forget(list(self._asst_queue))
+        except Exception:
+            pass
         self._asst_pump()
+
+    def _asst_check_stuck(self):
+        """看门狗：这一轮太久没结果 -> 兜底，并把状态复位。
+
+        ★ v9.20.0：用户报的「AI 正在处理中，最后消息消失不见」里，有一部分就是
+          worker 卡死 / 事件没回来 —— 界面永远停在"处理中"。有了这个每 15 秒的
+          检查，最坏情况 5 分钟内一定会给对方一个交代。
+
+        ★ 两种任务分开处理：
+          · manual（手动点了就发）→ 立刻兜底回一句；
+          · prefetch（预取备用）→ **不能立刻发**，只把这次预取标成失败，
+            交给 `due()` 到点决定（发兜底话术 / 标需人工）。
+        """
+        try:
+            if not self._asst_started:
+                return
+            alive = (self._asst_worker is not None
+                     and self._asst_worker.isRunning())
+            # ★ 走独立子进程时没有 ChatWorker；子进程自己有 150 秒时限，
+            #   这里把它当作"还活着"，只在真超时才兜底。
+            if getattr(self, "_asst_proc", False):
+                alive = True
+            waited = time.time() - float(self._asst_started)
+            if alive and waited < 300:
+                return
+            reason = "模型 5 分钟没有返回" if alive else "处理线程意外退出"
+            kind = getattr(self, "_asst_kind", "manual")
+            msg = self._asst_cur
+            cid = getattr(self, "_asst_cid", "") or ""
+            try:
+                if self._asst_worker is not None:
+                    self._asst_worker.abort()
+            except Exception:
+                pass
+            self._asst_worker = None
+            self._asst_cur = None
+            self._asst_runner = None
+            self._asst_started = 0.0
+            self._asst_kind = "manual"
+            self._asst_cid = ""
+            if kind == "prefetch" and cid:
+                self._safe_asst_log(f"⚠ 看门狗：预取{reason}，到点按兜底处理")
+                pipe = getattr(self, "im_pipe", None)
+                if pipe is not None:
+                    b = pipe.batch(cid) or {}
+                    # 用**当前** seq 结束这次预取：这样它不会被当成"过时"而无限重拉
+                    pipe.end_fetch(cid, b.get("seq", -1), error=reason)
+                try:
+                    for mid, m in list((self.page_assistant.msgs or {}).items()):
+                        if m.get("cid") == cid and m.get("status") == "处理中":
+                            self.page_assistant.update_status(mid, "待处理")
+                except Exception:
+                    pass
+                self._im_pipeline_pump()
+                return
+            self._safe_asst_log(f"⚠ 看门狗：{reason}，已自动兜底回复")
+            self._asst_recover(msg, reason)
+            self._asst_pump()
+        except Exception:
+            pass
+
+    # ---------- ★ v9.20.0：「先拉后等再决定发不发」的完整时序 ----------
+    def _im_pipeline_pump(self):
+        """有会话需要预取就拉一次（串行，不跟前台对话/其它助理任务抢）。"""
+        pipe = getattr(self, "im_pipe", None)
+        if pipe is None:
+            return
+        if self._asst_worker is not None and self._asst_worker.isRunning():
+            return
+        # 前台正在对话时也让一让，别两边抢同一个模型配额
+        try:
+            if self._any_running():
+                QTimer.singleShot(3000, self._im_pipeline_pump)
+                return
+        except Exception:
+            pass
+        cid = pipe.need_fetch()
+        if cid:
+            self._asst_prefetch(cid)
+
+    def _im_fallback_text(self):
+        """「AI 拿不准 / 预取失败」时该回的那句话；返回 None = 按设置不回。"""
+        st = {}
+        try:
+            if getattr(self, "im_store", None) is not None:
+                st = self.im_store.settings() or {}
+        except Exception:
+            st = {}
+        if not st.get("reply_uncertain", True):
+            return None
+        return (str(st.get("uncertain_text") or "").strip()
+                or "消息已纳入收件箱，加急处理中，主人正在赶来的路上，此消息由AI代回")
+
+    def _asst_prefetch(self, cid):
+        """立刻去拉这一批的回复 —— 「先拉后等」，到点就能发，用户零等待。"""
+        pipe = getattr(self, "im_pipe", None)
+        if pipe is None or not cid:
+            return False
+        if self._asst_worker is not None and self._asst_worker.isRunning():
+            return False
+        batch = pipe.batch(cid)
+        if not batch or not batch.get("msgs"):
+            pipe.end_fetch(cid, -1, error="没有可处理的消息")
+            return False
+        seq = pipe.begin_fetch(cid)
+        if seq < 0:
+            return False
+        try:
+            system, history = self._im_context_for({"cid": cid})
+        except Exception as exc:
+            pipe.end_fetch(cid, seq, error=f"组上下文失败：{exc}")
+            return False
+        merged = pipe.build_prompt_text(batch)
+        hist_txt = ""
+        if history:
+            lines = []
+            for h in history[-12:]:
+                tag = "我" if h.get("role") == "assistant" else "对方"
+                lines.append(f"{tag}：{h.get('content')}")
+            hist_txt = "【最近的对话（供参考，别复述）】\n" + "\n".join(lines) + "\n\n"
+        prompt = (
+            "【钉钉收到的消息】你在替主人回复钉钉消息。\n"
+            "· 直接用**一段话**写出要回给对方的内容 —— 像真人发微信那样短，"
+            "不要客套开场、不要解释你在做什么、不要 Markdown、不要列步骤；\n"
+            "· 对方问什么就答什么；多条消息要**合并成一条回复**一次答完；\n"
+            "· 拿不准的（身份背景里没有、也推不出来）就只输出 [[UNCERTAIN]]，别硬编。\n\n"
+            + hist_txt + f"【这次要回的】{merged}"
+        )
+        api_msgs = [{"role": "system", "content": system},
+                    {"role": "user", "content": prompt}]
+        self._asst_kind = "prefetch"
+        self._asst_cid = cid
+        self._asst_cur = None
+        self._asst_started = time.time()
+        for m in batch["msgs"]:
+            self.page_assistant.update_status(m.get("msgid"), "处理中")
+        self._safe_asst_log("开始生成回复（%d 条合并）…" % len(batch["msgs"]))
+        # ★ 用户要求「助理不要让人选模型，默认 glm」；万一 glm 不可用，自动退 auto
+        model_sel = getattr(self, "_asst_force_model", "") or "glm-4-flash"
+        # ★ v9.20.0：优先用**独立子进程**拿回复（卡死能硬杀、不拖累界面）；
+        #   子进程不可用时退回进程内的 ChatWorker（功能等价，只是不能被硬杀）。
+        use_proc = False
+        try:
+            from ..im import replyproc
+            use_proc = bool(replyproc.available())
+        except Exception:
+            use_proc = False
+        if use_proc:
+            self._asst_proc = True
+            self._asst_worker = None
+            self._asst_runner = None
+            threading.Thread(
+                target=self._asst_prefetch_proc,
+                args=(cid, seq, api_msgs, model_sel), daemon=True).start()
+            return True
+        self._asst_proc = False
+        self._asst_runner = self._make_runner(self._conv_cid())
+        self._asst_worker = ChatWorker(
+            self.bg_client, self._asst_runner, api_msgs, True,
+            model_sel=model_sel, enable_search=False, max_iter=4)
+        self._asst_worker.finished.connect(
+            lambda out, c=cid, s=seq: self._asst_prefetch_done(c, s, out))
+        self._asst_worker.error.connect(
+            lambda e, c=cid, s=seq: self._asst_prefetch_done(c, s, None, err=e))
+        self._asst_worker.notice.connect(lambda s: self.page_assistant.log(str(s)))
+        self._asst_worker.start()
+        return True
+
+    def _asst_prefetch_proc(self, cid, seq, api_msgs, model_sel):
+        """（后台线程）走独立子进程拿回复，结果通过信号回 UI 线程。"""
+        text, err, files = "", "", []
+        try:
+            from ..im import replyproc
+            r = replyproc.request(api_msgs, model=model_sel, timeout=150) or {}
+            if r.get("ok") and str(r.get("text") or "").strip():
+                text = config.strip_stream_reset(str(r["text"]).strip())
+            else:
+                err = str(r.get("error") or "子进程没返回内容")
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        self._im_prefetch_evt.emit(str(cid), int(seq), str(text), str(err), files)
+
+    def _asst_prefetch_done(self, cid, seq, out_messages, err=""):
+        """进程内预取回来了：抽正文 → 交给 `_asst_prefetch_store`。"""
+        text, files = "", []
+        try:
+            for m in reversed(out_messages or []):
+                if m.get("role") == "assistant" and (m.get("content") or "").strip():
+                    text = config.strip_stream_reset(m["content"].strip())
+                    break
+            _r = self._asst_runner if self._asst_runner is not None else self.runner
+            files = [f.get("path") if isinstance(f, dict) else str(f)
+                     for f in (getattr(_r, "written", None) or [])]
+            files = [p for p in files if p and os.path.isfile(p)]
+        except Exception as exc:
+            err = err or f"收尾异常：{exc}"
+        self._asst_prefetch_store(cid, seq, text, err, files)
+
+    def _asst_prefetch_store(self, cid, seq, text, err="", files=None):
+        """预取结束（两条路径共用）：存成草稿，**先不发**（等时间到再判定）。"""
+        # glm 不可用 → 换 auto 再试一次（只试一次，避免死循环）
+        if err and not getattr(self, "_asst_force_model", ""):
+            self._asst_force_model = "auto"
+            self._safe_asst_log(
+                f"助理模型不可用（{str(err)[:60]}），换 auto 再试一次")
+        pipe = getattr(self, "im_pipe", None)
+        if pipe is not None:
+            pipe.end_fetch(cid, seq, text=text, files=list(files or []),
+                           error=err or "")
+        try:
+            for mid, m in list((self.page_assistant.msgs or {}).items()):
+                if m.get("cid") == cid and m.get("status") == "处理中":
+                    self.page_assistant.update_status(mid, "待处理")
+        except Exception:
+            pass
+        if text and "[[UNCERTAIN]]" not in text:
+            self._safe_asst_log(
+                "回复已备好（%d 字），到 %s 秒还是没你自己回就发出去"
+                % (len(text), pipe.delay if pipe is not None else "?"))
+        elif err:
+            self._safe_asst_log(f"预取没成（{str(err)[:60]}），到点会按兜底处理")
+        self._asst_worker = None
+        self._asst_runner = None
+        self._asst_started = 0.0
+        self._asst_proc = False
+        self._asst_kind = "manual"
+        self._asst_cid = ""
+        self._im_refresh_views()
+        QTimer.singleShot(0, self._im_pipeline_pump)
+
+    def _im_pipeline_due(self):
+        """到点了：该发的发，该跳过的跳过。"""
+        pipe = getattr(self, "im_pipe", None)
+        if pipe is None:
+            return
+        try:
+            due = pipe.due()
+        except Exception as exc:
+            self._safe_asst_log(f"到点检查失败：{type(exc).__name__}: {exc}")
+            return
+        for item in due:
+            cid = str(item.get("cid") or "")
+            batch_msgs = list(item.get("msgs") or [])
+            ids = [m.get("msgid") for m in batch_msgs if m.get("msgid")]
+            if not ids:
+                pipe.finish(cid, False, "没有消息 id")
+                continue
+
+            # ① 你自己已经回过了 —— 绝不代回
+            if item.get("manual"):
+                for mid in ids:
+                    self.page_assistant.update_status(
+                        mid, "已回复", "（你自己已经回过了，这条没让 AI 代回）")
+                    try:
+                        self.im_store.set_status(cid, mid, "sent",
+                                                 "（你自己已经回过了）")
+                    except Exception:
+                        pass
+                self._safe_asst_log(
+                    "你已经自己回过（%d 条），这一批不代回" % len(ids))
+                pipe.finish(cid, False, "你自己回过")
+                self._im_refresh_views()
+                continue
+
+            # ② 拿不准 / 没取到回复
+            text = str(item.get("text") or "").strip()
+            if ("[[UNCERTAIN]]" in text) or item.get("fallback") or not text:
+                fb = self._im_fallback_text()
+                if fb is None:
+                    for mid in ids:
+                        self.page_assistant.update_status(mid, "需人工", "")
+                        try:
+                            self.im_store.set_status(cid, mid, "需人工", "")
+                        except Exception:
+                            pass
+                    self._safe_asst_log(
+                        "AI 拿不准这 %d 条，按你的设置不代回，留在左栏等你回" % len(ids))
+                    pipe.finish(cid, False, "拿不准且设置不代回")
+                    self._im_refresh_views()
+                    continue
+                text = fb
+                self._safe_asst_log(
+                    "AI 拿不准 / 没取到回复（%s），已按兜底话术代回"
+                    % (item.get("error") or "拿不准"))
+
+            # ③ 真发
+            self._im_send_bg(cid, text, ids)
+            pipe.finish(cid, True)
+
+    def _im_send_bg(self, cid, text, ids):
+        """后台把代回内容发出去，结果回 UI 线程再写状态（跨线程只走信号）。"""
+        def w():
+            ok = False
+            try:
+                ok = bool(self._im_send(cid, text))
+            except Exception as exc:
+                self._safe_asst_log(f"代回失败：{type(exc).__name__}: {exc}")
+            self._im_send_evt.emit(str(cid), list(ids or []), str(text), bool(ok))
+        threading.Thread(target=w, daemon=True).start()
+
+    def _im_sent_back(self, cid, ids, text, ok):
+        """（UI 线程）代回结果落地：写状态 + 刷界面。"""
+        ids = list(ids or [])
+        for i, mid in enumerate(ids):
+            last = (i == len(ids) - 1)
+            try:
+                self.im_store.set_status(
+                    str(cid), mid,
+                    ("sent" if ok else "failed") if last else "merged",
+                    text if last else "")
+            except Exception:
+                pass
+            self.page_assistant.update_status(
+                mid, "已回复" if ok else "失败",
+                text if last else "（和另一条一起回了）")
+        if ok:
+            self._asst_log_ui("✓ 已代回钉钉：%s" % str(text)[:50])
+        else:
+            self._asst_log_ui("✕ 代回钉钉失败（%d 条，留在左栏）" % len(ids))
+        self._im_refresh_views()
 
     def _asst_pump(self):
         """串行处理队列：一次只跑一条，避免和前台对话抢 runner。"""
@@ -3086,33 +4318,115 @@ class MainWindow(QMainWindow):
         # ★ v9.18.0：现在是"**任意一个**对话在跑"就让路（多个对话可能同时跑）。
         try:
             if self._any_running():
+                # ★ v9.20.0：让路也要吭声，否则用户只看到"助理不动了"
+                now = time.time()
+                if now - float(self._asst_wait_logged or 0) > 90:
+                    self._asst_wait_logged = now
+                    self._safe_asst_log(
+                        "前台对话正在跑，助理先排队等一会儿（不会丢消息）")
                 QTimer.singleShot(3000, self._asst_pump)
                 return
         except Exception:
             pass
         if self._asst_queue:
-            self._asst_start(self._asst_queue.pop(0))
+            mid = self._asst_queue[0]
+            # ★ v9.20.0：延时未到就先等着（用户可能自己回）
+            try:
+                nb = float(self._asst_not_before.get(mid) or 0)
+            except Exception:
+                nb = 0.0
+            left = nb - time.time()
+            if left > 0:
+                QTimer.singleShot(int(min(left, 20) * 1000) + 300, self._asst_pump)
+                return
+            self._asst_queue.pop(0)
+            self._asst_not_before.pop(mid, None)
+            self._asst_start(mid)
+
+    def _im_context_for(self, msg):
+        """取这个会话的（系统提示, 历史消息列表）。
+
+        ★ v9.20.0：这就是用户要的「消息输入输出必须是一个独立的对话、能串上下文」。
+          每个钉钉会话一份档案（模式/人设/规则/上下文条数）+ 共享记忆 + 私有记忆。
+        """
+        tid = str(msg.get("cid") or "")
+        hub = getattr(self, "im_hub", None)
+        if hub is not None and tid:
+            try:
+                from ..im import policy as _impolicy
+                thread = self.im_store.thread(tid) or {}
+                msgs = self.im_store.messages(tid, thread.get("ctx_limit") or 20)
+                # ★ v9.20.0：用户在「设置」里填的身份背景是回答的最高依据
+                try:
+                    ident = str((self.im_store.settings() or {}).get("identity") or "")
+                except Exception:
+                    ident = ""
+                ctx = _impolicy.build_messages(
+                    thread, msgs, me_name=self._ding_self_name(),
+                    shared_memory=self.im_store.memory(),
+                    thread_memory=self.im_store.thread_memory(tid),
+                    identity=ident)
+                return ctx[0]["content"], ctx[1:]
+            except Exception as exc:
+                self._safe_asst_log(f"组上下文失败（退回默认提示）：{exc}")
+        return (self.settings.get("system_prompt") or config.SYSTEM_PROMPT), []
 
     def _asst_start(self, msgid):
         msg = self.page_assistant.msgs.get(msgid)
         if not msg:
+            # ★ v9.20.0：绝不静默丢弃 —— 老写法这里直接 return，队列项就永远没了
+            self._safe_asst_log(f"找不到消息 {msgid}（可能已被清空），跳过这条")
+            QTimer.singleShot(0, self._asst_pump)
             return
+        # ★ v9.20.0：延时到了再看一眼 —— 这期间我自己在钉钉里回过就不代回了
+        try:
+            recv_ts = float(msg.get("recv_ts") or 0)
+            last = 0.0
+            if getattr(self, "im_store", None) is not None and msg.get("cid"):
+                last = float(self.im_store.last_manual_out(str(msg.get("cid"))) or 0)
+            if recv_ts and last > recv_ts:
+                self.page_assistant.update_status(
+                    msgid, "已回复", "（你已经自己回过了，这条没让 AI 代回）")
+                self._safe_asst_log(
+                    f"你已经自己回过「{msg.get('name') or ''}」，这条跳过")
+                self._asst_done()
+                return
+        except Exception:
+            pass
         self._asst_cur = msg
+        self._asst_started = time.time()
+        # ★ v9.20.0：手动点了就发 —— 不走「等 60 秒」那套
+        self._asst_kind = "manual"
+        self._asst_cid = str(msg.get("cid") or "")
         self.page_assistant.update_status(msgid, "处理中")
-        system = self.settings.get("system_prompt") or config.SYSTEM_PROMPT
+        system, history = self._im_context_for(msg)
+        hist_txt = ""
+        if history:
+            lines = []
+            for h in history[-12:]:
+                tag = "我" if h.get("role") == "assistant" else "对方"
+                lines.append(f"{tag}：{h.get('content')}")
+            hist_txt = "【最近的对话（供参考，别复述）】\n" + "\n".join(lines) + "\n\n"
         prompt = (
-            "【助理模式】这是别人从钉钉发给我的消息，请当作我的助手来处理：\n"
+            "【钉钉收到的消息】你在替主人回复钉钉消息，请当作他的助手来处理：\n"
             "· 能直接做完的就做完（写文件、跑脚本、查资料都行，产出物放工作区 files/ 下）；\n"
             "· 做完后用**一段话**把最终结果说清楚——这就是要回给对方的原话，"
-            "不要客套、不要步骤流水账，涉及文件时带上完整路径；\n"
-            "· 消息里要文件/程序就真的生成，别只说怎么做。\n\n"
-            f"对方（{msg.get('conv') or msg.get('sender') or '钉钉'}）说：{msg.get('text')}"
+            "像真人发微信一样短，不要客套、不要步骤流水账，涉及文件时带上完整路径；\n"
+            "· 消息里要文件/程序就真的生成，别只说怎么做；\n"
+            "· 不确定的事别硬编，直接说「我确认一下」。\n\n"
+            + hist_txt +
+            f"【这次要回的】{msg.get('conv') or ''}"
+            f"{(' / ' + msg.get('sender')) if msg.get('sender') else ''}"
+            f"：{msg.get('text')}"
         )
         api_msgs = [{"role": "system", "content": system},
                     {"role": "user", "content": prompt}]
         self.page_assistant.log(f"开始处理：{str(msg.get('text'))[:50]}")
+        # ★ v9.19.0：runner 自己持一份 —— 收产物时不能读全局 `self.runner`，
+        #   用户中途切对话的话那是别人的 runner。
+        self._asst_runner = self._make_runner(self._conv_cid())
         self._asst_worker = ChatWorker(
-            self.bg_client, self.runner, api_msgs, True,
+            self.bg_client, self._asst_runner, api_msgs, True,
             model_sel=self.settings.get("selected_model") or "auto",
             enable_search=(bool(self.settings.get("enable_search"))
                            and agent_mod.needs_web_search(
@@ -3123,32 +4437,133 @@ class MainWindow(QMainWindow):
         self._asst_worker.notice.connect(lambda s: self.page_assistant.log(str(s)))
         self._asst_worker.start()
 
+    def _asst_recover(self, msg, why, bounced=False):
+        """处理失败/卡住时的兜底：**一定要给对方回一句话**。
+
+        ★ v9.20.0：用户原话「AI正在处理中，但是最后AI消息消失不见，不回复」。
+          根因就是 `_asst_error` / `_asst_finish` 里一旦异常，只写日志不发送 ——
+          对方永远等不到回复，界面上也只是一条"失败"。
+        """
+        if not msg:
+            return
+        text = ("这条我这边没处理完（%s），我回头补给你。"
+                % (str(why or "未知原因")[:60]))
+        mid = msg.get("msgid")
+        try:
+            self.page_assistant.update_status(mid, "失败", text)
+        except Exception:
+            pass
+        try:
+            self._asst_reply(msg, text, [])
+        except Exception as exc:
+            self._safe_asst_log(f"兜底回复也发不出去：{type(exc).__name__}: {exc}")
+        try:
+            hub = getattr(self, "im_hub", None)
+            if hub is not None and msg.get("cid"):
+                self.im_store.append_message(
+                    msg.get("cid"), direction="out", sender=self._ding_self_name(),
+                    text=text, ai=True, status="failed")
+        except Exception:
+            pass
+        self._safe_asst_log(f"已发送兜底回复：{text}")
+
+    def _asst_done(self, msg=None):
+        """不发送地收尾：复位状态 + 刷新列表 + 继续下一条。
+
+        ★ v9.20.0：给「AI 拿不准，按设置不代回」和「你自己已经回过了」这两条路径用。
+          它们都**不能发消息**，但也绝不能把队列卡死。
+        """
+        self._asst_worker = None
+        self._asst_cur = None
+        self._asst_runner = None
+        self._asst_started = 0.0
+        try:
+            self._im_refresh_views()
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._asst_pump)
+
     def _asst_error(self, msg, err):
         self.page_assistant.update_status(msg.get("msgid"), "失败", f"[处理出错] {err}")
         self._asst_worker = None
         self._asst_cur = None
+        self._asst_runner = None
+        self._asst_started = 0.0
+        # ★ 绝不静默收场：出错了也要给对方回一句
+        self._asst_recover(msg, err)
         self._asst_pump()
 
     def _asst_finish(self, msg, out_messages):
+        answer = ""
+        files = []
         try:
-            answer = ""
             for m in reversed(out_messages or []):
                 if m.get("role") == "assistant" and (m.get("content") or "").strip():
-                    answer = m["content"].strip()
+                    answer = config.strip_stream_reset(m["content"].strip())
                     break
-            if not answer:
-                answer = "（这轮没有产出可回复的内容）"
+            # ★ v9.19.0：用**这一轮自己的** runner 收产物
+            _r = self._asst_runner if self._asst_runner is not None else self.runner
             files = [f.get("path") if isinstance(f, dict) else str(f)
-                     for f in (getattr(self.runner, "written", None) or [])]
+                     for f in (getattr(_r, "written", None) or [])]
             files = [p for p in files if p and os.path.isfile(p)]
+            if not answer:
+                # 模型一个字都没给：也要回一句，不能就这么没了
+                answer = "这条我这边没生成出内容，你再发一次我马上处理。"
+            # ★ v9.20.0：AI 拿不准（身份背景里查不到、也推不出来）时，
+            #   模型只吐一个 [[UNCERTAIN]] 哨兵。回不回由用户在「设置」里决定。
+            if "[[UNCERTAIN]]" in answer:
+                answer = answer.replace("[[UNCERTAIN]]", "").strip()
+                st = {}
+                try:
+                    if getattr(self, "im_store", None) is not None:
+                        st = self.im_store.settings() or {}
+                except Exception:
+                    st = {}
+                if not st.get("reply_uncertain", True):
+                    self.page_assistant.update_status(msg.get("msgid"), "需人工", "")
+                    self._safe_asst_log(
+                        "这条 AI 拿不准（身份背景里没有），按你的设置不代回，留给你自己回")
+                    self._asst_done()
+                    return
+                answer = (str(st.get("uncertain_text") or "").strip()
+                          or "消息已纳入收件箱，加急处理中，主人正在赶来的路上，"
+                             "此消息由AI代回")
+                self._safe_asst_log("AI 拿不准，已按兜底话术代回")
             self.page_assistant.update_status(msg.get("msgid"), "已回复", answer)
+        except Exception as e:
+            self._safe_asst_log(f"收尾失败：{e}")
+            self._asst_worker = None
+            self._asst_cur = None
+            self._asst_runner = None
+            self._asst_started = 0.0
+            self._asst_recover(msg, f"收尾异常：{e}")
+            self._asst_pump()
+            return
+        try:
             if self.assistant.cfg.get("auto_reply"):
                 self._asst_reply(msg, answer, files)
+            # 记录到 IM 流水（可审查）
+            hub = getattr(self, "im_hub", None)
+            if hub is not None and msg.get("cid"):
+                self.im_store.append_message(
+                    msg.get("cid"), direction="out", sender=self._ding_self_name(),
+                    text=answer, ai=True, status="sent")
+                # 顺手把"这个人让我做什么"记进本会话记忆，下次有上下文
+                try:
+                    self.im_store.remember(
+                        f"对方让我：{str(msg.get('text'))[:60]}", msg.get("cid"),
+                        scope="conv")
+                except Exception:
+                    pass
+                self._im_refresh_views()
         except Exception as e:
-            self.page_assistant.log(f"收尾失败：{e}")
+            self._safe_asst_log(f"发送/记录失败：{e}")
+            self._asst_recover(msg, f"发送失败：{e}")
         finally:
             self._asst_worker = None
             self._asst_cur = None
+            self._asst_runner = None
+            self._asst_started = 0.0
             self._asst_pump()
 
     def _asst_reply(self, msg, answer, files):
@@ -3452,7 +4867,16 @@ class MainWindow(QMainWindow):
         themes.set_font_scale(self.settings.get("font_scale", 100))
         self.client.set_keys(self.settings.get("api_keys", {}))
         self.client.policy = self.settings.get("model_policy", "strict")
-        self.runner.keys = dict(self.settings.get("api_keys", {}))
+        # ★ v9.19.0：runner 现在是"每个对话一份"，改设置要**全部**刷一遍，
+        #   否则只在用的那个对话拿到了新 key，其它还在跑的对话拿的还是旧的。
+        try:
+            _keys = dict(self.settings.get("api_keys", {}))
+            for _r in list(getattr(self, "_runs", {}).values()):
+                if getattr(_r, "runner", None) is not None:
+                    _r.runner.keys = dict(_keys)
+            self.runner.keys = dict(_keys)     # 当前对话兜底（可能还没建过）
+        except Exception:
+            pass
         self.speaker.engine = self.settings.get("tts_engine", "sapi")
         self.speaker.edge_voice = self.settings.get("tts_voice") or tts_mod.DEFAULT_EDGE_VOICE
         self.speaker.rate = int(self.settings.get("tts_rate", 0) or 0)
@@ -3639,6 +5063,10 @@ class MainWindow(QMainWindow):
             content = m.get("content", "")
             if not isinstance(content, str) or not role:
                 continue
+            # ★ v9.19.0：历史里的「作废重来」标记必须清掉再喂模型。
+            #   DeepSeek 网页通道曾把它当正文拼进回答，模型看到后会照着抄，
+            #   于是用户就收到「第一步：…␜AWB-RESET␝我先看一下」这种鬼东西。
+            content = config.strip_stream_reset(content)
             if role in ("user", "assistant", "system"):
                 extra = m.get("attached") if role == "user" else None
                 if extra:
@@ -3649,7 +5077,13 @@ class MainWindow(QMainWindow):
                             "content": "（上一步工具执行的真实结果）\n" + content})
         return out
 
-    def _build_system_prompt(self):
+    def _build_system_prompt(self, cid=None):
+        """拼这一轮的系统提示。
+
+        ★ v9.19.0：`cid` 决定带上**哪个对话**的记忆。老写法直接读
+          `workspace.conv_memory_file()`（= 全局"当前对话"），用户在一轮发起后
+          立刻切走，这一轮挂上来的就是**另一个对话**的记忆 —— 典型的"记忆串台"。
+        """
         parts = [self.settings.get("system_prompt", "") or ""]
         try:
             block = self.memory.prompt_block()
@@ -3660,7 +5094,7 @@ class MainWindow(QMainWindow):
         # ★ v9.17.0：本对话自己的记忆也要带上（用户要求「每个对话一个文件夹，
         #   分别存放产物和记忆，还要有主记忆」——上面那块是主记忆，这块是本对话的）。
         try:
-            cm = self.workspace.conv_memory_file()
+            cm = self.workspace.conv_memory_file(cid)
             if cm and os.path.isfile(cm):
                 with open(cm, "r", encoding="utf-8") as f:
                     _txt = f.read().strip()
@@ -3723,7 +5157,8 @@ class MainWindow(QMainWindow):
             wd = "一二三四五六日"[n.weekday()]
             parts.append(
                 f"# 六、当前环境\n现在的时间是 {n.strftime('%Y-%m-%d %H:%M:%S')}（星期{wd}）。"
-                f"工作区目录：{self.workspace.path}；文件沙箱：{self.workspace.files_dir}。"
+                f"工作区目录：{self.workspace.path}；"
+                f"文件沙箱：{self.workspace.files_dir_for(cid) if cid else self.workspace.files_dir}。"
                 f"\n当前选择模型：{self._model_label_short().replace('模型：', '')}；"
                 f"联网搜索：{'开' if self.settings.get('enable_search', True) else '关'}；"
                 f"钉钉推送：{'可用' if self.ding.configured() else '未配置'}；"
@@ -3816,10 +5251,14 @@ class MainWindow(QMainWindow):
         if _tid:
             self._send_team(text, _tid, cid, note)
             return
-        api_messages = ([{"role": "system", "content": self._build_system_prompt()}]
+        api_messages = ([{"role": "system", "content": self._build_system_prompt(cid)}]
                         + self._api_messages(self.conv["messages"]))
+        # ★ v9.19.0：这一轮用**绑定到本对话**的 runner（产物/记忆都锁在 cid 上）。
+        #   不这么做的话，用户切走对话后，这一轮的产物会写进另一个对话的文件夹。
+        _runner = self._make_runner(cid)
+        run.runner = _runner           # 存进**这个对话**的运行态（不是全局共享的那份）
         self.worker = ChatWorker(
-            self.client, self.runner, api_messages,
+            self.client, _runner, api_messages,
             agent_mode=bool(self.settings.get("agent_mode", True)),
             model_sel=self.settings.get("selected_model", "auto"),
             # 联网门控：设置里允许联网 + 这一轮看起来真的需要外部实时信息，
@@ -4071,7 +5510,17 @@ class MainWindow(QMainWindow):
         """一轮跑完：结果写回**它自己的**对话（哪怕用户已经切走了）。"""
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
-        msgs = [dict(m) for m in (new_messages or [])]
+        # ★ v9.19.0：落盘前先清掉「作废重来」标记残骸 —— 否则它会留在历史里，
+        #   下一轮又原样喂给模型（实测 DeepSeek 网页通道会把它当正文抄回来）。
+        msgs = []
+        for _m in (new_messages or []):
+            _m = dict(_m)
+            if isinstance(_m.get("content"), str):
+                _m["content"] = config.strip_stream_reset(_m["content"])
+            if not (_m.get("content") or "").strip() and _m.get("role") in (
+                    "tool", "thinking"):
+                continue
+            msgs.append(_m)
         try:
             label = self.client.last_used_label()
         except Exception:
@@ -4114,7 +5563,7 @@ class MainWindow(QMainWindow):
                 last_ai = next((m["content"] for m in reversed(msgs)
                                 if m.get("role") == "assistant"), "")
                 if last_ai:
-                    self.speaker.speak(last_ai)
+                    self.speaker.speak(config.strip_stream_reset(last_ai))
 
     def _on_error(self, msg, cid=None):
         cid = self._conv_cid() if cid is None else cid
@@ -4371,6 +5820,56 @@ class MainWindow(QMainWindow):
             return ("obj", id(msg), str(role))
         return ("idx", int(index), str(role))
 
+    # ---------- 分页渲染（v9.20.0，见 CHAT_PAGE_SIZE） ----------
+    def _page_fold_for(self, n):
+        """算这次渲染要在开头折掉多少条（0 = 全部显示）。
+
+        `_fold_auto` 只在"刚切进/新建一个对话"时置 True：那时按"只显示最近
+        一页"算一次 fold，之后就一直沿用用户当前的窗口（点过"加载更早"就更大），
+        不会因为来了一条新消息就把用户刚展开的历史又收回去。
+        """
+        if getattr(self, "_fold_auto", False):
+            self._fold_auto = False
+            self._fold_n = max(0, int(n) - CHAT_PAGE_SIZE)
+        fold = int(getattr(self, "_fold_n", 0) or 0)
+        # 兜底：不越界；也不允许把最后一条都折掉（否则界面空白）
+        fold = max(0, min(fold, max(0, int(n) - 1)))
+        self._fold_n = fold
+        return fold
+
+    def _make_load_earlier(self, fold):
+        """顶部「△ 加载更早的 N 条」按钮（折起来的消息数 = fold）。"""
+        t = themes.tokens()
+        n = min(CHAT_PAGE_SIZE, fold)
+        btn = QPushButton(f"△ 加载更早的 {n} 条（还有 {fold} 条）")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            f"QPushButton{{background:{t['chip_bg']};color:{t['text_muted']};"
+            f"border:1px solid {t['border']};border-radius:10px;"
+            f"font-size:{themes.fs(12)};padding:5px 12px;}}"
+            f"QPushButton:hover{{color:{t['accent_text']};"
+            f"border:1px solid {t['accent']};}}")
+        btn.clicked.connect(self._load_earlier)
+        host = QWidget()
+        lay = QHBoxLayout(host)
+        lay.setContentsMargins(0, 4, 0, 6)
+        lay.addStretch(1)
+        lay.addWidget(btn)
+        lay.addStretch(1)
+        return host
+
+    def _load_earlier(self):
+        """往前再铺一批，并**保持当前看到的位置**（不能跳到顶）。
+
+        做法：记住"距底部还有多远"，插入更早的内容后按同样距离还原 ——
+        上面的内容变高了，但用户视线里那几条消息仍在原地。
+        """
+        self._fold_n = max(
+            0, int(getattr(self, "_fold_n", 0) or 0) - CHAT_PAGE_SIZE)
+        sb = self.chat_scroll.verticalScrollBar()
+        self._pending_scroll_off = max(0, sb.maximum() - sb.value())
+        self._render_full(stick=False)
+
     def _render_full(self, stick=None):
         # 重建前先记住滚动状态：stick=True 强制贴底；否则沿用"当前是否贴底"。
         # 这就是「一发新消息就跳到最上面」的根因修复 —— 重建后延后一帧再恢复。
@@ -4385,6 +5884,11 @@ class MainWindow(QMainWindow):
         live_shown = strip_tool_markup(self.live_text) if self.live_text else ""
         # ★ v9.18.0（需求 17）：正在实时滚动的思维链，和正文一样参与渲染指纹
         reason_shown = (self.live_reason or "").strip() if self.running else ""
+        # ★★ v9.20.0 分页渲染（见 CHAT_PAGE_SIZE）：只铺最近一页，开头折起来的部分
+        #   由顶部「加载更早」按钮按批放出。`_fold_auto` 只在"刚切进一个对话"时
+        #   为 True，之后新增消息不会把用户已展开的窗口重新收回去。
+        fold = self._page_fold_for(len(display))
+        visible = display[fold:]
 
         # ★★ v9.17.0 渲染短路 + 流式增量 —— 修用户反馈的「一执行任务就很卡、
         #    弹一堆小窗口」。
@@ -4394,9 +5898,9 @@ class MainWindow(QMainWindow):
         #    现在两道拦截：
         #      ① 整块内容一模一样 → 直接什么都不做；
         #      ② 只有流式正文 / 实时思考在长、其余没变 → 只原地刷新那两张卡。
-        base_sig = tuple((m.get("role"), m.get("content", "")) for m in display)
+        base_sig = tuple((m.get("role"), m.get("content", "")) for m in visible)
         sig = (base_sig, bool(self.running),
-               live_shown if self.running else "", str(plan), reason_shown)
+               live_shown if self.running else "", str(plan), reason_shown, fold)
         prev = getattr(self, "_render_sig", None)
         if prev == sig:
             return
@@ -4428,13 +5932,18 @@ class MainWindow(QMainWindow):
             self._render_sig = sig
             return
 
+        # ★ v9.20.0：还有更早的消息没铺 → 顶部先放一个"加载更早"的按钮。
+        #   它不是卡片，不进 `_cards`（不需要 refit），点一次往前放一批。
+        if fold > 0:
+            self.chat_layout.addWidget(self._make_load_earlier(fold))
+
         # ★ v9.18.0（需求 9）：相邻的**过程消息**（工具调用 / 普通思考）合并成
         #   一个 ProcessGroup，默认隐藏，只留一行「⚙ 过程 · N 步」。
         #   带结论的关键中间块（emphasis）仍然单独留在外面可见 —— 兼顾
         #   "过程都藏起来"与"重点结论要留着"这两条要求。
         group = None
 
-        for i, m in enumerate(display):
+        for i, m in enumerate(visible, fold):
             role = m.get("role")
             content = m.get("content", "") or ""
             emphasis = bool(role == "thinking" and agent_mod.is_key_progress(content))
@@ -4570,6 +6079,12 @@ class MainWindow(QMainWindow):
 
     def _restore_scroll(self):
         sb = self.chat_scroll.verticalScrollBar()
+        # ★ v9.20.0：点了「加载更早」→ 按"距底部距离"还原，视线不跳
+        off = getattr(self, "_pending_scroll_off", None)
+        if off is not None:
+            self._pending_scroll_off = None
+            sb.setValue(max(0, sb.maximum() - int(off)))
+            return
         at_bottom, old = getattr(self, "_pending_scroll", (True, 0))
         if at_bottom:
             sb.setValue(sb.maximum())

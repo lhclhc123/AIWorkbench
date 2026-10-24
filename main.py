@@ -10,6 +10,28 @@ import sys
 import tempfile
 import traceback
 
+# ★ v9.20.0：助理「独立子进程拿回复」必须在 **任何 Qt / 浏览器内核导入之前** 分流。
+#   子进程只读一个请求 JSON、调一次模型、写一个响应 JSON 就退出 ——
+#   绝不加载 Qt（否则每个子进程多吃 1~2 秒初始化，还可能因为无显示环境弹窗/崩）。
+#   主进程把模型调用扔到这里，卡住了就能直接 kill，不拖累界面。
+if len(sys.argv) >= 3 and sys.argv[1] == "--im-reply":
+    try:
+        from app.im import replyproc
+        sys.exit(replyproc.worker_main(sys.argv[2]))
+    except SystemExit:
+        raise
+    except Exception:                       # noqa: BLE001
+        # 子进程里不能再依赖任何 GUI 日志，只能退回一个失败码
+        sys.exit(2)
+
+# ★ v9.18.0 内嵌浏览器宿主：必须在**任何 GUI/内核模块导入之前**把 CDP 调试口打开。
+#   QtWebEngine 只在 QApplication 创建时启动 Chromium，环境变量此刻设好就来得及。
+#   端口常量只在 app/webengine.py 里维护一份，这里不重复写数字。
+#   （注意：这一行要留在 `app.gui.main_window` 等导入语句之前。）
+from app.webengine import enable_remote_debugging as _enable_remote_debugging
+
+_enable_remote_debugging()
+
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt
@@ -85,7 +107,7 @@ def selftest():
         "agent", "asr", "assistant", "config", "dingtalk", "docread",
         "docwrite", "folders", "hotkey", "knowledge", "llm_client",
         "markdown_render", "mcp_client", "memory", "plan", "scheduler",
-        "security", "skills", "taskman", "team", "team_presets",
+        "security", "single_instance", "skills", "taskman", "team", "team_presets",
         "themes", "trace",
         "tts", "updater", "version", "webcap", "winproc", "worklog",
         "workspace",
@@ -307,7 +329,8 @@ def selftest():
         from PyQt6.QtWidgets import QApplication
         from app import workspace as ws_mod, themes
         from app.gui.main_window import MainWindow
-        app = QApplication.instance() or QApplication([])
+        # 不能传空列表：argv[0] 缺失时，后面一建 QWebEngineProfile 就静默 exit 127。
+        app = QApplication.instance() or QApplication(sys.argv[:1] or ["AIWorkbench"])
         themes.apply(app, "light")
         w = ws_mod.Workspace(tmp).ensure()
         win = MainWindow(w, w.load_settings())
@@ -404,6 +427,19 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("AI 工作台")
+
+    # ★ v9.20.0 单实例保护：主窗口只允许开一个。
+    #   必须在建主窗口（以及启动对话框）之前抢；抢不到就把「用户又点了一次」
+    #   捎给已有实例，然后安静退出（退出码 0）。
+    from app.single_instance import InstanceGuard
+    inst = InstanceGuard()
+    if not inst.try_acquire():
+        if inst.degraded:
+            inst = None            # 保护机制本身起不来 -> 放行，不能因为保护把程序也弄挂
+        else:
+            inst.notify_existing()
+            sys.exit(0)
+
     try:
         from app.gui.main_window import _make_icon
         app.setWindowIcon(_make_icon())
@@ -437,6 +473,22 @@ def main():
     settings = ws.load_settings()
     win = MainWindow(ws, settings)
     win.show()
+
+    # 已有实例被再次点击 -> 只把窗口叫回前台，不新开窗口、不新建对话。
+    if inst is not None:
+        def _bring_to_front():
+            try:
+                win.showNormal()        # 已最小化 / 收进托盘 都能还原
+                win.raise_()
+                win.activateWindow()
+            except Exception:
+                pass
+
+        inst.pinged.connect(_bring_to_front)
+        # 启动期间（窗口还没建好）收到的点击攒在队列里，这里补一次 —— 不会丢。
+        if inst.take_pending():
+            _bring_to_front()
+
     sys.exit(app.exec())
 
 

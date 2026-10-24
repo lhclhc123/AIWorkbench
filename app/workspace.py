@@ -371,6 +371,30 @@ class Workspace:
             pass
         return d
 
+    def files_dir_for(self, cid):
+        """**指定对话**的产物目录（不改变"当前对话"）。
+
+        ★ v9.19.0 为什么要这个（用户报「切换对话就乱」的根因之一）：
+          `files_dir` 读的是全局 `_cur_folder`，于是一个还在跑的对话，只要用户切到
+          另一个对话，它后面写出来的文件就会落到**别人的** `chats/<NN>/files` 里。
+          运行中必须锁定"发起时那个对话"，所以这里按 cid 直接解析。
+        """
+        cid = str(cid or "").strip()
+        if not cid:
+            return self.files_dir
+        try:
+            folder = self.conv_folder(cid, create=True)
+        except Exception:
+            folder = ""
+        if not folder:
+            return self.files_dir
+        d = os.path.join(folder, "files")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return self.files_dir
+        return d
+
     @staticmethod
     def _safe_name(text, limit=14):
         s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(text or "")).strip(" ._")
