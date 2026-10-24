@@ -425,6 +425,15 @@ def main():
     # 全局中文字体，确保 QTextBrowser / QPlainTextEdit 能显示中文
     QApplication.setFont(QFont("Microsoft YaHei", 11))
 
+    # ★ v9.21.0 Web UI 一期：awb:// scheme 必须在 QApplication 创建之前注册，
+    #   否则 QWebEngineView 加载 awb://ui/ 会静默崩（exit 127）。
+    #   无条件注册（不启用 web 引擎也注册，无副作用）。
+    try:
+        from app.webui_host import register_scheme as _register_awb_scheme
+        _register_awb_scheme()
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("AI 工作台")
 

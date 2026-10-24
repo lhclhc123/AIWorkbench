@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 工作台</title>
+<script>
+  /* 首屏前定主题，避免闪白：默认跟随系统 */
+  (function () {
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  })();
+</script>
+<link rel="stylesheet" href="./css/tokens.css">
+<link rel="stylesheet" href="./css/base.css">
+<link rel="stylesheet" href="./css/chat.css">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= 标题条 ================= -->
+  <header class="titlebar">
+    <span class="grid-ico" aria-hidden="true">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2.6" y="2.6" width="4.6" height="4.6" rx="1.1"/>
+        <rect x="8.8" y="2.6" width="4.6" height="4.6" rx="1.1"/>
+        <rect x="2.6" y="8.8" width="4.6" height="4.6" rx="1.1"/>
+        <rect x="8.8" y="8.8" width="4.6" height="4.6" rx="1.1"/>
+      </svg>
+    </span>
+    <span class="brand-name">对话</span>
+    <span class="brand-ver" id="verLabel">v9.21</span>
+    <span class="tb-spacer"></span>
+    <button class="win-btn" id="themeBtn" title="切换深色 / 浅色">
+      <svg class="ico-moon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13.2 9.4A5.6 5.6 0 0 1 6.6 2.8a5.6 5.6 0 1 0 6.6 6.6z"/>
+      </svg>
+      <svg class="ico-sun" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+        <circle cx="8" cy="8" r="2.9"/>
+        <path d="M8 1.6v1.5M8 12.9v1.5M1.6 8h1.5M12.9 8h1.5M3.5 3.5l1 1M11.5 11.5l1 1M12.5 3.5l-1 1M4.5 11.5l-1 1"/>
+      </svg>
+    </button>
+    <button class="win-btn" id="listBtn" title="显示 / 隐藏对话列表">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+        <path d="M2.6 4.4h10.8M2.6 8h10.8M2.6 11.6h10.8"/>
+      </svg>
+    </button>
+  </header>
+
+  <div class="shell">
+
+    <!-- ================= 侧栏：会话列表 ================= -->
+    <aside class="sidebar" id="sidebar">
+      <div class="side-head">
+        <span>对话列表</span>
+        <span class="spacer"></span>
+        <button class="side-add" id="newConvBtn" title="新建对话">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></svg>
+        </button>
+      </div>
+      <div class="conv-list" id="convList"></div>
+      <div class="side-foot">
+        <span class="ws-dot"></span>
+        <span class="ws-name" id="wsName">本地工作区</span>
+      </div>
+    </aside>
+
+    <!-- ================= 主区域：对话页 ================= -->
+    <main class="main">
+      <section class="page" id="page-chat">
+
+        <div class="thread-wrap" id="threadWrap">
+          <div class="thread" id="thread">
+            <div class="welcome" id="welcome">
+              <div class="welcome-mark">
+                <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M8 1.6l1.5 4.1 4.1 1.5-4.1 1.5L8 12.8 6.5 8.7 2.4 7.2l4.1-1.5L8 1.6z"/>
+                </svg>
+              </div>
+              <div class="welcome-title">你好，我是 AI 工作台</div>
+              <div class="welcome-sub">本地模型驱动的桌面 Agent，直接告诉我你想做什么。<br>例如：整理一份材料、写一段代码、拆解一个任务。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="thread-fade"></div>
+
+        <div class="composer-wrap">
+          <div class="composer-inner">
+            <div class="state-line">
+              <span class="pulse" id="stateDot"></span>
+              <span id="stateText">就绪</span>
+            </div>
+
+            <div class="attachments" id="attachments" hidden></div>
+
+            <div class="composer" id="composer">
+              <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift + Enter 换行"></textarea>
+              <div class="composer-bar">
+                <button class="ibtn" id="fileBtn" title="选择文件">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3.4v9.2M3.4 8h9.2"/></svg>
+                </button>
+                <span class="spacer"></span>
+                <div class="model-wrap">
+                  <button class="model-pill" id="modelBtn">
+                    <span id="modelLabel">模型</span>
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m4 6.5 4 4 4-4"/></svg>
+                  </button>
+                  <div class="model-menu" id="modelMenu" hidden></div>
+                </div>
+                <button class="ibtn" id="micBtn" title="语音输入">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="6" y="2.4" width="4" height="7" rx="2"/><path d="M3.8 7.4a4.2 4.2 0 0 0 8.4 0M8 11.6v2"/>
+                  </svg>
+                </button>
+                <button class="send" id="sendBtn" title="发送" disabled>
+                  <svg class="ico-send" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.8V3.6M4.3 7.1 8 3.4l3.7 3.7"/></svg>
+                  <svg class="ico-stop" width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.6"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="composer-hint">文件 / 图片可以直接拖进窗口 · 生成中再点一次是停止</div>
+          </div>
+        </div>
+
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- QWebChannel 运行时：由宿主把 Qt 资源 :/qtwebchannel/qwebchannel.js 映射到 ./js/vendor/qwebchannel.js，
+     前端不引 CDN、不手工维护第三方文件。缺失时页面进入离线演示模式，不影响静态预览。 -->
+<script src="./js/vendor/qwebchannel.js"></script>
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>

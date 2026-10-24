@@ -660,7 +660,7 @@ class AssistantPage(QWidget):
 
         brow = QHBoxLayout()
         brow.setSpacing(8)
-        self.btn_del = QPushButton("🗑 删除选中")
+        self.btn_del = QPushButton("⊘ 删除选中")
         self.btn_del.setStyleSheet(DEL_BTN_QSS)
         self.btn_del.setEnabled(False)
         self.btn_del.clicked.connect(self._delete_checked)
@@ -670,7 +670,7 @@ class AssistantPage(QWidget):
         b_all.clicked.connect(self.process_all.emit)
         brow.addWidget(b_all)
 
-        b_more = QPushButton("🗂 更多管理")
+        b_more = QPushButton("▥ 更多管理")
         b_more.clicked.connect(self._on_more)
         brow.addWidget(b_more)
 
@@ -847,7 +847,7 @@ class AssistantPage(QWidget):
         b_wl_add = QPushButton("＋ 添加")
         b_wl_add.clicked.connect(self._add_whitelist)
         wl_row.addWidget(b_wl_add)
-        b_wl_del = QPushButton("🗑 移除选中")
+        b_wl_del = QPushButton("⊘ 移除选中")
         b_wl_del.clicked.connect(self._remove_whitelist)
         wl_row.addWidget(b_wl_del)
         g2v.addLayout(wl_row)
@@ -917,7 +917,7 @@ class AssistantPage(QWidget):
         g6v.addWidget(self.ck_auto)
         sv.addWidget(g6)
 
-        b_save = QPushButton("💾 保存设置")
+        b_save = QPushButton("⇩ 保存设置")
         b_save.clicked.connect(self._emit_settings)
         sv.addWidget(b_save)
         sv.addStretch(1)
@@ -963,7 +963,7 @@ class AssistantPage(QWidget):
         self.ed_tag = QLineEdit()
         self.ed_tag.setPlaceholderText("比如：同班同学 / 班主任 / 妈妈 / 家长群")
         brow.addWidget(self.ed_tag, 1)
-        b_save = QPushButton("💾 保存标签")
+        b_save = QPushButton("⇩ 保存标签")
         b_save.clicked.connect(self._save_tag)
         brow.addWidget(b_save)
         tv.addLayout(brow)
@@ -3473,7 +3473,7 @@ class IMDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("🗂 钉钉助手 · 消息管理")
+        self.setWindowTitle("▥ 钉钉助手 · 消息管理")
         self.resize(980, 660)
         self._threads = {}
         self._tasks = []
@@ -3635,7 +3635,7 @@ class IMDialog(QDialog):
         row = QHBoxLayout()
         b_add = QPushButton("＋ 添加定时消息")
         b_add.clicked.connect(self._add_task)
-        b_del = QPushButton("🗑 删除选中")
+        b_del = QPushButton("⊘ 删除选中")
         b_del.clicked.connect(self._del_task)
         b_tog = QPushButton("⏸ 启用/停用")
         b_tog.clicked.connect(self._toggle_task)
@@ -3703,7 +3703,7 @@ class IMDialog(QDialog):
         row.addWidget(QLabel("按人查："))
         self.ed_log_who = QLineEdit()
         row.addWidget(self.ed_log_who, 1)
-        b = QPushButton("🔍 查询")
+        b = QPushButton("⊙ 查询")
         b.clicked.connect(self.refresh_requested.emit)
         row.addWidget(b)
         v.addLayout(row)
@@ -3729,7 +3729,7 @@ class IMDialog(QDialog):
             "我不喜欢别人叫我全名。\n最近在准备信息学奥赛，周三下午有课。")
         v.addWidget(self.tx_mem, 1)
         row = QHBoxLayout()
-        b = QPushButton("💾 保存共享记忆")
+        b = QPushButton("⇩ 保存共享记忆")
         b.clicked.connect(lambda: self.memory_saved.emit(self.tx_mem.toPlainText()))
         row.addWidget(b)
         row.addStretch(1)
@@ -3762,7 +3762,7 @@ class IMDialog(QDialog):
             self._tasks = list(tasks)
             self.list_tasks.clear()
             for t in self._tasks:
-                on = "✅" if t.get("enabled", True) else "⏸"
+                on = "✓" if t.get("enabled", True) else "⏸"
                 it = QListWidgetItem(
                     f"{on} {t.get('title')}　·{_im_desc(t)}　→ "
                     f"{(self._threads.get(t.get('thread')) or {}).get('name') or t.get('thread')}")

@@ -1,0 +1,79 @@
+/* ============================================================
+   tokens.css —— 唯一改色的地方（两套主题变量）
+   对齐 docs/ui/mockup-v921.html 的视觉 token，色值一字不差。
+   圆角 3 档 / 间距 4 的倍数 / 字阶 11·12·13.5·15·20。
+   ============================================================ */
+:root{
+  --font: "Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  --mono: "Cascadia Mono","Consolas","Courier New",monospace;
+
+  --bg:#f5f6f8;
+  --surface:#ffffff;
+  --surface-2:#eef0f3;
+  --sidebar:#fafbfc;
+  --border:#e4e7eb;
+  --border-strong:#d5dae0;
+
+  --text:#191c1f;
+  --text-2:#5b6470;
+  --text-3:#8b95a1;
+
+  --accent:#2f6feb;
+  --accent-hover:#255ed1;
+  --accent-weak:#e8f0fe;
+  --accent-ring:rgba(47,111,235,.16);
+  --user:#2f6feb;
+
+  --ok:#17864a;
+  --warn:#b4741a;
+  --danger:#d13b3b;
+  --danger-weak:#fdecec;
+
+  --shadow-1:0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.04);
+  --shadow-2:0 10px 28px -12px rgba(16,24,40,.22), 0 2px 6px rgba(16,24,40,.05);
+
+  --scroll:#cfd5dc;
+  --row-hover:#f2f5f9;
+  --desk:#e9ecf1;
+  --code-bg:#f7f8fa;
+
+  --r-sm:6px;
+  --r-md:9px;
+  --r-lg:14px;
+
+  color-scheme: light;
+}
+
+html[data-theme="dark"]{
+  --bg:#16181c;
+  --surface:#1f2329;
+  --surface-2:#262b32;
+  --sidebar:#1a1d22;
+  --border:#2b3138;
+  --border-strong:#3a414a;
+
+  --text:#e7ebf0;
+  --text-2:#a3adb9;
+  --text-3:#77818d;
+
+  --accent:#5b8ef7;
+  --accent-hover:#6f9cff;
+  --accent-weak:rgba(91,142,247,.14);
+  --accent-ring:rgba(91,142,247,.22);
+  --user:#3468cf;
+
+  --ok:#3fb950;
+  --warn:#d29922;
+  --danger:#f85149;
+  --danger-weak:rgba(248,81,73,.12);
+
+  --shadow-1:0 1px 2px rgba(0,0,0,.45);
+  --shadow-2:0 12px 32px -14px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.35);
+
+  --scroll:#3a414a;
+  --row-hover:#232830;
+  --desk:#0d0f12;
+  --code-bg:#171a1f;
+
+  color-scheme: dark;
+}

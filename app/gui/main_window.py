@@ -353,6 +353,12 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.workspace = workspace
         self.settings = settings
+        # ★ v9.21.0 Web UI 一期：对话页用网页（QWebEngineView）还是 Qt 版。
+        # 三重回退开关：设置 ui_engine=web 开启；--ui-engine=qt 强制关；
+        # AWB_WEBUI=0 环境变量再兜一层。默认 qt（保持老行为）。
+        self._web_engine = self._want_web_engine()
+        self._web_bridge = None          # WebUIBridge（web 引擎激活时才建）
+        self._web_view = None            # QWebEngineView
         # GitHub Token 生效（v9.15.0）
         try:
             config.GITHUB_TOKEN = str(settings.get("github_token", "") or "")
@@ -504,6 +510,26 @@ class MainWindow(QMainWindow):
         if (isinstance(_sel, str) and "deepseek" in _sel and "web" in _sel) or \
                 self.settings.get("deepseek_web_auto"):
             QTimer.singleShot(0, self._dsw_boot)
+
+    # ================= Web UI 一期（v9.21.0，方案 B：QWebEngineView 嵌网页） =================
+    def _want_web_engine(self):
+        """对话页是否用 Web 引擎。三重回退，任一「关」都回 Qt 版。
+
+        1. 环境变量 ``AWB_WEBUI=0`` —— 最外层保险；
+        2. 命令行 ``--ui-engine=qt`` —— 防止设置写坏导致打不开；
+        3. 设置 ``ui_engine == "web"`` —— 才开启。
+        默认（无任何开关）= qt，保持老行为。
+        """
+        import os
+        import sys as _sys
+        _argv = list(getattr(_sys, "argv", []) or [])
+        if os.environ.get("AWB_WEBUI", "").strip() == "0":
+            return False
+        if "--ui-engine=qt" in _argv:
+            return False
+        if "--ui-engine=web" in _argv:
+            return True
+        return str(self.settings.get("ui_engine", "qt")) == "web"
 
     # ================= DeepSeek 网页版（v9.14.0 / v9.14.2 免手动） =================
     def _dsw_sync_prefs(self):
@@ -986,6 +1012,21 @@ class MainWindow(QMainWindow):
         self.page_chat = self._build_chat_page()
         self.stack.addWidget(self.page_chat)
 
+        # ★ v9.21.0 Web UI 一期：若开了 web 引擎，另建一个网页版对话页，
+        #   作为 Qt 版「对话页」的替代塞进 stack 同一位（index 0）。
+        #   其余页面（助理/浏览器/工具…）保持不变；开关可随时切回。
+        self._web_page = None
+        if self._web_engine:
+            try:
+                self._web_page = self._build_chat_page_web()
+                self._swap_in_web_page()
+            except Exception:
+                # 加载失败自动回退 Qt，绝不把主程序带崩（方案 §8 风险清单）
+                self._web_page = None
+                self._web_engine = False
+                self._web_bridge = None
+                self._web_view = None
+
         self.page_assistant = AssistantPage()
         self.stack.addWidget(self.page_assistant)
         self.page_assistant.toggle.connect(self._assistant_toggle)
@@ -1285,6 +1326,158 @@ class MainWindow(QMainWindow):
         # 由 `_tune_live_interval` 按上一次渲染的真实耗时自适应升降。
         self._live_interval = 110
         return page
+
+    # ================= Web UI 一期（v9.21.0）：网页版对话页 =================
+    def _build_chat_page_web(self):
+        """建一个 QWebEngineView 承载的对话页（方案 B），返回该 view。
+
+        只做「建 view + 建桥 + 连信号」，业务逻辑复用现有 _send / ChatWorker。
+        网页加载失败时抛异常，由调用方（__init__）自动回退 Qt 版。
+        """
+        import sys as _sys
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from app import webui_host, webui_bridge
+
+        view = webui_host.create_view()
+        self._web_view = view
+        bridge = webui_bridge.WebUIBridge(view)
+        self._web_bridge = bridge
+
+        # 页面加载完成 → 把桥注册进页面（QWebChannel 只对当前页面实例有效）
+        view.loadFinished.connect(lambda ok: self._web_on_loaded(ok, view))
+
+        # 上行命令 → 已有槽
+        bridge.cmd_send.connect(self._web_send)
+        bridge.cmd_stop.connect(self._interrupt)
+        bridge.cmd_regenerate.connect(self._web_regenerate)
+        bridge.cmd_pick_file.connect(self._pick_file)
+        bridge.cmd_set_model.connect(self._web_set_model)
+        bridge.cmd_set_theme.connect(self._web_set_theme)
+        bridge.cmd_new_conv.connect(self._new_conversation)
+        bridge.cmd_select_conv.connect(self._web_select_conv)
+        return view
+
+    def _swap_in_web_page(self):
+        """用网页版对话页替换 stack 里 index 0 的 Qt 版对话页。
+
+        ⚠ 关键：Qt 版对话页**不能销毁**——它内部有 `self.plan_panel`、
+        `self.state_line`、`self.input` 等一堆字段，`__init__` 后半段
+        （`_open_workspace`、`_apply_theme` 等）还会引用它们。所以这里只
+        「移出 stack 但保留引用」，用 `self._qt_chat_page` 存住，避免被 GC。
+        """
+        self._qt_chat_page = self.page_chat       # 保住引用，防止 GC 连带销毁子控件
+        self.stack.removeWidget(self.page_chat)   # 只移出 stack，不销毁 widget
+        self._qt_chat_page.hide()
+        self.stack.insertWidget(0, self._web_page)
+        self.page_chat = self._web_page
+
+    def _web_on_loaded(self, ok, view):
+        """网页加载完成 → 注册桥 + 推送初始状态。
+
+        注意：即使 ``ok=False`` 也要 attach —— 在软件渲染/offscreen 下
+        ``loadFinished`` 的 ok 常为 False（GPU 上下文起不来），但页面 url
+        已经正确、QWebChannel 仍可注册；前端 JS 自己判断通道是否可用。
+        真正的「加载失败回退」由 __init__ 的 try/except 兜底（构造期抛异常）。
+        """
+        if self._web_bridge is not None:
+            self._web_bridge.attach(view.page())
+            self._web_push_init()
+
+    def _web_push_init(self):
+        """把初始状态推给网页：主题 / 会话列表 / 模型列表。"""
+        if self._web_bridge is None:
+            return
+        try:
+            theme = str(self.settings.get("theme", "light") or "light")
+            convs = []
+            for c in (self.workspace.list_conversations() or []):
+                convs.append({
+                    "id": c.get("id", ""),
+                    "title": c.get("title", ""),
+                    "preview": c.get("preview", ""),
+                    "time": c.get("time", ""),
+                })
+            self._web_bridge.send_init({
+                "theme": theme,
+                "convs": convs,
+                "currentConvId": self._conv_cid(),
+                "selectedModel": str(self.settings.get("selected_model", "auto")),
+            })
+        except Exception:
+            pass
+
+    def _web_send(self, text):
+        """网页发来的消息：复用 _send 核心，但文本来自桥参数（网页没有 Qt 输入框）。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        # 直接把文本塞进 Qt 输入框再走 _send —— 最省事、复用全部逻辑
+        self.input.setPlainText(text)
+        self._send()
+
+    def _web_regenerate(self):
+        # 重新生成：暂时复用「把上一条用户消息重发」的语义，一期限定简单处理
+        self._on_send_clicked() if not self.running else self._interrupt()
+
+    def _web_set_model(self, choice):
+        choice = (choice or "").strip()
+        if not choice:
+            return
+        self.settings["selected_model"] = choice
+        try:
+            self._fill_model_combo()
+        except Exception:
+            pass
+
+    def _web_set_theme(self, theme):
+        theme = (theme or "").strip()
+        if theme in ("light", "dark"):
+            self.settings["theme"] = theme
+            self._apply_theme()
+
+    def _web_select_conv(self, conv_id):
+        conv_id = (conv_id or "").strip()
+        if not conv_id:
+            return
+        # 在会话列表里找到对应 item，复用 _on_conv_selected 选中逻辑
+        for i in range(self.conv_list.count()):
+            item = self.conv_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == conv_id:
+                self._on_conv_selected(item)
+                return
+
+    def _web_conv_messages(self, cid=None):
+        """把 cid 对话的消息列表转成网页渲染用的格式。
+
+        返回 [{id, role, text, meta}]，role 映射到前端认识的
+        user / assistant / tool / think。
+        """
+        cid = cid or self._conv_cid()
+        try:
+            conv = self.workspace.load_conversation(cid) or {}
+        except Exception:
+            conv = {}
+        out = []
+        for m in (conv.get("messages") or []):
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if role == "user":
+                r = "user"
+            elif role == "tool":
+                r = "tool"
+            elif role == "thinking":
+                r = "think"
+            else:
+                r = "assistant"
+            out.append({
+                "id": str(m.get("id", "") or ""),
+                "role": r,
+                "text": str(content),
+                "meta": {
+                    "model": m.get("_model", ""),
+                },
+            })
+        return out
 
     def _style_input_area(self):
         """按当前主题给输入卡片与图标按钮上色（跟随浅色 / 深色切换）。"""
@@ -2622,6 +2815,13 @@ class MainWindow(QMainWindow):
             #   真渲染，前一轮直接丢掉（否则白烧一遍 CPU）。
             self._conv_gen = int(getattr(self, "_conv_gen", 0)) + 1
             gen = self._conv_gen
+            # ★ v9.21.0 web 版：切对话直接把消息列表推给网页，不走 Qt 渲染
+            if self._web_engine and self._web_bridge is not None:
+                self._web_bridge.send_messages({
+                    "convId": cid,
+                    "messages": self._web_conv_messages(cid),
+                })
+                return
             if len(conv.get("messages") or []) > CHAT_PAGE_SIZE:
                 self._show_loading()
             QTimer.singleShot(0, lambda g=gen: self._render_conv_async(g))
@@ -5365,6 +5565,10 @@ class MainWindow(QMainWindow):
         try:
             if kind == "tool":
                 detail = tool_verb(detail)
+            # ★ v9.21.0 web 版：阶段推给网页（状态行文字）
+            if self._web_engine and self._web_bridge is not None:
+                self._web_bridge.send_phase(kind, detail or "")
+                return
             self.state_line.set_phase(kind, detail or "")
         except Exception:
             pass
@@ -5390,6 +5594,9 @@ class MainWindow(QMainWindow):
             # 否则重试后新推理会叠在旧推理后面（就是那条"内容重复"的老毛病）。
             run.live_reason = ""
             run.reason_card = None
+            if self._web_engine and self._web_bridge is not None:
+                # web 版：作废重来 → 前端也要清掉正在滚的正文/思考
+                self._web_bridge.emit_event("stream_reset", {})
             if self._is_current(cid):
                 self._render_sig = None          # 指纹失效，防止被渲染短路挡掉
                 self._render()
@@ -5398,6 +5605,10 @@ class MainWindow(QMainWindow):
         run.live_text += delta
         if not self._is_current(cid):
             return          # 用户已经切到别的对话了 —— 收着，别去动界面
+        # ★ v9.21.0 web 版：流式增量直接推给网页（桥里 50ms 合批），不走 Qt 渲染
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_token(delta)
+            return
         if not self._render_timer.isActive():
             self._render_timer.start(self._live_interval)
 
@@ -5418,6 +5629,10 @@ class MainWindow(QMainWindow):
             return
         run.live_reason += delta
         if not self._is_current(cid):
+            return
+        # ★ v9.21.0 web 版：思维链增量推给网页
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_reason(delta)
             return
         if not self._render_timer.isActive():
             self._render_timer.start(self._live_interval)
@@ -5484,6 +5699,10 @@ class MainWindow(QMainWindow):
     def _on_tool_start(self, desc, cid=None):
         if cid is not None and not self._is_current(cid):
             return
+        # ★ v9.21.0 web 版：工具开始推给网页（工具胶囊）
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_tool_start(desc)
+            return
         self.statusBar().showMessage("正在执行工具：" + desc[:130])
 
     def _on_tool_result(self, result, cid=None):
@@ -5500,6 +5719,10 @@ class MainWindow(QMainWindow):
         run.live_card = None
         run.pending_tool.append({"role": "tool", "content": result})
         if not self._is_current(cid):
+            return
+        # ★ v9.21.0 web 版：工具结果推给网页（工具胶囊收起）
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_tool_result(result)
             return
         self.statusBar().clearMessage()
         self._refresh_chips()
@@ -5559,6 +5782,9 @@ class MainWindow(QMainWindow):
         self._finish_run(cid)
         if self._is_current(cid):
             self._maybe_rename()
+            # ★ v9.21.0 web 版：整轮结束，把最终消息列表推给网页渲染
+            if self._web_engine and self._web_bridge is not None:
+                self._web_bridge.send_finished(self._web_conv_messages(cid))
             if self.settings.get("tts_enabled"):
                 last_ai = next((m["content"] for m in reversed(msgs)
                                 if m.get("role") == "assistant"), "")
@@ -5577,6 +5803,9 @@ class MainWindow(QMainWindow):
         run.reason_card = None
         run.pending_tool.append({"role": "tool", "content": "出错了：" + str(msg)})
         self._finish_run(cid)
+        # ★ v9.21.0 web 版：错误推给网页
+        if self._web_engine and self._web_bridge is not None:
+            self._web_bridge.send_error(str(msg))
 
     def _finish_run(self, cid=None):
         cid = self._conv_cid() if cid is None else cid
