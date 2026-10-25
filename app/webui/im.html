@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>钉钉助手</title>
+<script>
+  (function () {
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  })();
+</script>
+<link rel="stylesheet" href="./css/tokens.css">
+<link rel="stylesheet" href="./css/base.css">
+<link rel="stylesheet" href="./css/im.css">
+</head>
+<body>
+
+<div class="app">
+  <div class="im-head">
+    <button class="btn btn-ghost" id="backBtn" title="返回对话" style="flex:0 0 auto;">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.2 5.2 8l4.8 4.8"/></svg>
+      返回对话
+    </button>
+    <div class="im-title">
+      <h1>钉钉助手</h1>
+      <span class="pill-live" id="livePill"><i></i><span id="liveText">未运行</span></span>
+    </div>
+    <span class="head-spacer"></span>
+    <span class="im-head-extra" id="dingStatus">检查中…</span>
+    <button class="btn" id="toggleBtn">启动助理</button>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab is-active" data-tab="msgs">消息 <span class="tab-count" id="tabCount">0</span></button>
+    <button class="tab" data-tab="settings">设置</button>
+    <button class="tab" data-tab="tags">标签</button>
+  </div>
+
+  <div class="tab-panels">
+
+    <!-- ============ 面板①：消息 ============ -->
+    <div class="panel is-active" data-panel="msgs">
+      <div class="im-cols">
+        <div class="im-col">
+          <div class="col-head">新消息（未回复）<span class="count" id="leftCount">0</span></div>
+          <div class="col-scroll" id="colLeft"></div>
+        </div>
+        <div class="im-col">
+          <div class="col-head">已处理<span class="count" id="rightCount">0</span></div>
+          <div class="col-scroll" id="colRight"></div>
+        </div>
+      </div>
+      <div class="im-foot">
+        <button class="btn btn-danger" id="delBtn" disabled>
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.6h10M6.2 4.6V3.2h3.6v1.4M4.4 4.6l.6 8.2h6l.6-8.2"/></svg>
+          <span id="delLabel">删除选中</span>
+        </button>
+        <button class="btn" id="allBtn">全部交给 AI</button>
+        <span class="spacer"></span>
+        <span class="sel-info" id="selInfo">未选择</span>
+      </div>
+    </div>
+
+    <!-- ============ 面板②：设置 ============ -->
+    <div class="panel" data-panel="settings">
+      <div class="panel-scroll">
+        <div class="form">
+
+          <div class="form-card">
+            <div class="form-head">钉钉 CLI 配置</div>
+            <div class="form-body">
+              <div class="cli-status" id="cliStatus">检查中…</div>
+              <div class="cli-actions">
+                <button class="btn" id="cliSetupBtn">一键配置钉钉 CLI</button>
+                <button class="btn btn-ghost" id="cliLoginBtn">登录</button>
+              </div>
+              <p class="hint">没装会自动装 Node.js + dws（钉钉工作台 CLI），装完引导你扫码/设备码登录。</p>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">自动回复范围<span>不在范围内的消息只在左栏提醒，不会代回。</span></div>
+            <div class="form-body">
+              <label class="check-row">
+                <input class="cb" type="checkbox" id="scopeGroup" checked>
+                <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                <span class="check-main"><span class="check-title">群聊</span><span class="check-desc">家长群、班委群这类多人群里的消息</span></span>
+              </label>
+              <label class="check-row">
+                <input class="cb" type="checkbox" id="scopeP2p" checked>
+                <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                <span class="check-main"><span class="check-title">单聊</span><span class="check-desc">一对一的会话</span></span>
+              </label>
+              <label class="check-row">
+                <input class="cb" type="checkbox" id="scopeAtMe">
+                <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                <span class="check-main"><span class="check-title">群里只有 @我 的消息才回</span><span class="check-desc">勾上之后，群里没叫到你的消息一律不动</span></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">白名单<span>这些会话不受上面的范围限制，每条都回。</span></div>
+            <div class="form-body">
+              <div class="wl-list" id="wlList"></div>
+              <div class="inline-form">
+                <input class="input grow" id="wlInput" placeholder="群名 或 对方姓名">
+                <select class="input" id="wlKind" style="width:82px;padding:0 6px;">
+                  <option value="群聊">群聊</option>
+                  <option value="单聊">单聊</option>
+                </select>
+                <button class="btn" id="wlAdd">添加</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">什么时候代我回</div>
+            <div class="form-body">
+              <div class="num-row">我
+                <input class="input num" id="delay" type="number" min="0" max="3600" value="60">
+                秒没自己回，才由 AI 代回
+              </div>
+              <p class="hint">填 0 表示收到就回。设成 60 秒的话，这一分钟内你本人在钉钉里回了，AI 就不会再插话。</p>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">AI 拿不准的时候</div>
+            <div class="form-body">
+              <div class="switch-row">
+                <label class="switch"><input type="checkbox" id="uncertainSw" checked><span class="track"></span></label>
+                <span class="switch-label">拿不准也要回（回下面这句话）</span>
+              </div>
+              <input class="input" id="uncertainText" value="消息已纳入收件箱，加急处理中，主人正在赶来的路上，此消息由AI代回">
+              <p class="hint">关掉的话，拿不准的消息会留在左栏并标成「需人工」，等你自己回，不会瞎编。</p>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">我的身份背景<span>AI 替你回消息时会以它为准，写得越具体越像你。</span></div>
+            <div class="form-body">
+              <textarea class="textarea" id="identity"></textarea>
+            </div>
+          </div>
+
+          <div class="form-card">
+            <div class="form-head">其它</div>
+            <div class="form-body">
+              <div class="num-row">检查钉钉新消息的间隔
+                <input class="input num" id="interval" type="number" min="10" max="600" value="25">
+                秒
+              </div>
+              <div class="switch-row">
+                <label class="switch"><input type="checkbox" id="autoReply" checked><span class="track"></span></label>
+                <span class="switch-label">启用自动回复</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-foot">
+            <span class="hint">改动会在下一次轮询时生效，不用重启。</span>
+            <span class="spacer"></span>
+            <button class="btn btn-primary" id="saveBtn">保存设置</button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 面板③：标签 ============ -->
+    <div class="panel" data-panel="tags">
+      <div class="tags-head">
+        <div>
+          <div style="font-size:12.5px;font-weight:600;">会话标签</div>
+          <div class="scan-state" id="scanState">尚未扫描</div>
+        </div>
+        <span class="head-spacer" style="flex:1;"></span>
+        <button class="btn" id="scanBtn">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.6-3.7M13.2 2.8v2.9h-2.9"/></svg>
+          扫描并打标签
+        </button>
+      </div>
+      <div class="tags-list" id="tagsList"></div>
+      <div class="tags-foot">
+        <input class="input grow" id="tagInput" placeholder="比如：同班同学、家长、篮球队友（顿号分隔可打多个）">
+        <button class="btn btn-primary" id="tagSave">保存标签</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="./js/vendor/qwebchannel.js"></script>
+<script type="module" src="./js/im.js"></script>
+</body>
+</html>

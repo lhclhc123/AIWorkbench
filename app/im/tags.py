@@ -267,7 +267,7 @@ def collect(ding, max_convs=MAX_CONVS, per_conv=MAX_SAMPLE_PER_CONV):
 _SYSTEM = """你在帮一个人整理他的钉钉联系人关系。给他一段聊天记录，你判断【对方是谁 / 跟他什么关系】。
 
 规则：
-1. 只输出**一个**标签，2~8 个汉字，例如：同班同学、班主任、妈妈、表哥、家长群、数学老师、篮球队友、客户张总。
+1. 可以输出**1~3 个**标签，每个 2~8 个汉字，多个标签用顿号「、」分隔，例如：同班同学、家长。
 2. 群聊就输出这个群是什么群（如：班级群、家长群、项目群、游戏群）。
 3. **证据不足就只输出两个字：不知道**。绝对不许瞎猜、不许编。
 4. 不要输出标点、引号、解释、序号，只输出标签本身。"""
@@ -304,13 +304,31 @@ def build_prompt(conv, me_name=""):
 # ----------------------------------------------------------------------
 # 解析
 # ----------------------------------------------------------------------
-def parse_tag(text):
-    """严格解析模型输出。返回 "" 代表"不打标签"。**永远不会超过 12 字**。"""
+def _split_tags(text):
+    """把候选串按顿号/逗号/空格切成标签段，去空、截断 12 字、去重（保持顺序）。"""
     if text is None:
-        return ""
+        return []
+    parts = re.split(r"[、,，\s]+", str(text))
+    out, seen = [], set()
+    for p in parts:
+        p = p.strip(_PUNCT)
+        if not p:
+            continue
+        p = p[:TAG_MAX_LEN].strip(_PUNCT)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def parse_tags(text):
+    """把模型输出解析成标签列表（0~N 个）。空则 []。"""
+    if text is None:
+        return []
     cand = _first_line(text).strip(_PUNCT)
     if not cand:
-        return ""
+        return []
     # 去掉「标签：」这类前缀（可能连着写了两层）
     for _ in range(2):
         m = _PREFIX_RE.match(cand)
@@ -318,19 +336,18 @@ def parse_tag(text):
             break
         cand = cand[m.end():].strip(_PUNCT)
     if not cand:
-        return ""
+        return []
     low = cand.replace(" ", "")
     for w in _UNKNOWN_WORDS:
         if w in low:
-            return ""
-    if len(cand) > TAG_MAX_LEN:
-        cand = cand[:TAG_MAX_LEN]
-    cand = cand.strip(_PUNCT)
-    # 截断后可能又拼出"不确定"之类的尾巴，再查一次
-    for w in _UNKNOWN_WORDS:
-        if w in cand:
-            return ""
-    return cand[:TAG_MAX_LEN]
+            return []
+    return _split_tags(cand)
+
+
+def parse_tag(text):
+    """严格解析模型输出。返回 "" 代表"不打标签"。**永远不会超过 12 字**。"""
+    tags = parse_tags(text)
+    return tags[0] if tags else ""
 
 
 # ----------------------------------------------------------------------
@@ -382,12 +399,12 @@ def scan_and_tag(store, ding, llm_fn, progress=None, max_convs=MAX_CONVS):
             errors.append("%s：%s: %s" % (name or cid, type(e).__name__, e))
             continue
 
-        tag = parse_tag(res)
-        if not tag:
+        tag_list = parse_tags(res)
+        if not tag_list:
             continue                      # 模型说"不知道" → 不打标签
 
         try:
-            store.set_tag(cid, tag, note="AI 扫描", auto=True)
+            store.set_tag(cid, tag_list, note="AI 扫描", auto=True)
         except Exception as e:
             errors.append("%s：写标签失败 %s: %s" % (name or cid, type(e).__name__, e))
             continue

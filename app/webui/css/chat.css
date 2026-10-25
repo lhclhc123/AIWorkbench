@@ -453,6 +453,12 @@ html[data-theme="dark"] .win-btn .ico-sun{display:block;}
 }
 .toast.show{opacity:.96;transform:translate(-50%,0);}
 
+/* —— 嵌入模式：网页作为主窗口的一个页面内嵌时，隐藏自带标题条与侧栏 ——
+ * 主窗口有 Qt 全局侧栏承载导航与对话列表，网页再显示自己那套会造成
+ * 「左侧两个任务栏」。后端 init 里推 embedded=true，app.js 给 body 打 is-embedded。 */
+body.is-embedded .titlebar{display:none;}
+body.is-embedded .sidebar{display:none;}
+
 @media (max-width:1100px){
   .sidebar{flex-basis:214px;}
   .thread{padding:18px 18px 10px;}

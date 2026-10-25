@@ -1,0 +1,172 @@
+/* ============================================================
+   pages.css —— v9.21.2 全 Web 导航 + 各功能页通用样式
+   对齐 chat.css 的视觉 token，深/浅色自适应。
+   ============================================================ */
+
+/* ============ 导航区（sidebar 顶部）============ */
+.nav-rail{
+  padding:10px 12px 8px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+.nav-chip{
+  flex:0 0 calc((100% - 12px) / 3);
+  height:34px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:var(--surface);
+  color:var(--text-2);
+  font-size:12px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:4px;
+  cursor:pointer;
+  transition:background-color .15s ease, color .15s ease, border-color .15s ease;
+  white-space:nowrap;
+  overflow:hidden;
+}
+.nav-chip:hover{background:var(--row-hover);color:var(--text);}
+.nav-chip.is-active{
+  background:var(--accent-weak);
+  border-color:var(--accent);
+  color:var(--accent);
+  font-weight:600;
+}
+/* 「对话」占整行 */
+.nav-chip.nav-chat{flex-basis:100%;height:36px;font-size:13px;}
+
+/* ============ 页面容器 ============ */
+.page{
+  padding:18px 22px;
+  overflow-y:auto;
+  gap:14px;
+}
+.page-head{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  flex:0 0 auto;
+}
+.page-head h2{
+  font-size:16px;
+  font-weight:650;
+  margin:0;
+  color:var(--text);
+}
+.page-head .spacer{flex:1;}
+.page-hint{font-size:12px;color:var(--text-3);flex:0 0 auto;}
+
+/* ============ 通用卡片 / 表单 ============ */
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-lg);
+  padding:14px 16px;
+  box-shadow:var(--shadow-1);
+}
+.card + .card{margin-top:12px;}
+.card-title{
+  font-size:13px;font-weight:600;color:var(--text);
+  margin-bottom:10px;display:flex;align-items:center;gap:8px;
+}
+.card-title .spacer{flex:1;}
+
+/* 通用按钮 */
+.btn{
+  height:32px;padding:0 14px;
+  border-radius:8px;border:1px solid var(--border);
+  background:var(--surface);color:var(--text-2);
+  font-size:12.5px;display:inline-flex;align-items:center;gap:6px;
+  cursor:pointer;transition:background-color .15s,color .15s,border-color .15s;
+}
+.btn:hover{background:var(--row-hover);color:var(--text);}
+.btn:disabled{opacity:.45;cursor:not-allowed;}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:#fff;}
+.btn-danger{color:var(--danger);border-color:var(--danger);}
+.btn-danger:hover{background:var(--danger-weak);color:var(--danger);}
+.btn-ghost{border-color:transparent;background:transparent;}
+
+/* 输入 */
+.input{
+  height:32px;padding:0 10px;
+  border:1px solid var(--border);border-radius:8px;
+  background:var(--surface);color:var(--text);
+  font-size:13px;outline:none;
+  transition:border-color .15s;
+}
+.input:focus{border-color:var(--accent);}
+textarea.input{height:auto;padding:8px 10px;line-height:1.6;resize:vertical;min-height:80px;}
+select.input{appearance:auto;}
+
+/* 行内表单 */
+.inline-form{display:flex;gap:8px;align-items:center;}
+.inline-form .grow{flex:1;}
+
+/* 列表（通用） */
+.simple-list{display:flex;flex-direction:column;gap:6px;}
+.simple-row{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 12px;border:1px solid var(--border);border-radius:9px;
+  background:var(--surface);cursor:pointer;
+  transition:background-color .15s,border-color .15s;
+}
+.simple-row:hover{background:var(--row-hover);}
+.simple-row.is-active{border-color:var(--accent);background:var(--accent-weak);}
+.simple-row .grow{flex:1;min-width:0;}
+.simple-row .row-title{font-size:13px;font-weight:600;color:var(--text);}
+.simple-row .row-sub{font-size:11.5px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+/* 表格（通用） */
+.data-table{width:100%;border-collapse:collapse;font-size:12.5px;}
+.data-table th,.data-table td{
+  text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);
+}
+.data-table th{font-size:11px;color:var(--text-3);font-weight:600;letter-spacing:.02em;}
+.data-table tr:hover td{background:var(--row-hover);}
+.data-table .row-select{cursor:pointer;}
+
+/* 状态胶囊 */
+.pill{
+  display:inline-flex;align-items:center;gap:5px;
+  font-size:11px;padding:2px 9px;border-radius:999px;
+  border:1px solid var(--border);color:var(--text-2);
+}
+.pill.on{color:var(--ok);border-color:var(--ok);background:var(--surface);}
+.pill.off{color:var(--text-3);}
+
+/* 空状态 */
+.empty{
+  padding:28px 16px;text-align:center;
+  color:var(--text-3);font-size:12.5px;
+}
+
+/* 复选框行 */
+.check-row{display:flex;align-items:center;gap:10px;padding:8px 0;cursor:pointer;}
+.check-row .check-main{display:flex;flex-direction:column;gap:1px;}
+.check-row .check-title{font-size:13px;color:var(--text);}
+.check-row .check-desc{font-size:11.5px;color:var(--text-3);}
+.check-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);flex:0 0 auto;}
+
+/* 开关 */
+.switch-row{display:flex;align-items:center;gap:10px;padding:8px 0;}
+.switch-row .switch-label{font-size:13px;color:var(--text);}
+
+/* 提示文字 */
+.hint{font-size:11.5px;color:var(--text-3);line-height:1.5;}
+
+/* 代码/正文只读区 */
+.readonly-body{
+  flex:1;min-height:0;overflow-y:auto;
+  font-family:var(--mono);font-size:12px;line-height:1.6;
+  color:var(--text-2);white-space:pre-wrap;word-break:break-word;
+  background:var(--surface-2);border:1px solid var(--border);
+  border-radius:var(--r-md);padding:12px;
+}
+.readonly-body.rich{font-family:inherit;color:var(--text);}
+.readonly-body.rich h1,.readonly-body.rich h2,.readonly-body.rich h3{margin:.4em 0;}
+.readonly-body.rich pre{background:var(--code-bg);padding:10px;border-radius:8px;overflow-x:auto;}
+.readonly-body.rich code{white-space:pre-wrap;}

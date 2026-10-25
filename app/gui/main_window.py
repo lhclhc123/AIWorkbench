@@ -359,6 +359,7 @@ class MainWindow(QMainWindow):
         self._web_engine = self._want_web_engine()
         self._web_bridge = None          # WebUIBridge（web 引擎激活时才建）
         self._web_view = None            # QWebEngineView
+        self._im_bridge = None           # 钉钉助手页的独立 WebUIBridge（v9.21.1）
         # GitHub Token 生效（v9.15.0）
         try:
             config.GITHUB_TOKEN = str(settings.get("github_token", "") or "")
@@ -1020,6 +1021,10 @@ class MainWindow(QMainWindow):
             try:
                 self._web_page = self._build_chat_page_web()
                 self._swap_in_web_page()
+                # ★ v9.21.2 彻底全 Web 化：web 模式下隐藏 Qt 左栏（NavRail+对话列表），
+                #   改由 Web SPA 自带的侧栏（导航 + 对话列表）承担导航。这样「左侧两个
+                #   任务栏」彻底消失。Qt 侧栏仅 qt 模式 / 浏览器页仍需要。
+                self.side.hide()
             except Exception:
                 # 加载失败自动回退 Qt，绝不把主程序带崩（方案 §8 风险清单）
                 self._web_page = None
@@ -1058,6 +1063,22 @@ class MainWindow(QMainWindow):
         self.assistant.outgoing.connect(self._assistant_on_outgoing)
         self.assistant.log.connect(lambda s: self.page_assistant.log(str(s)))
         self.assistant.state.connect(self.page_assistant.set_running)
+
+        # ★ v9.21.1：web 引擎开启时，钉钉助手页也换成网页（awb://ui/im.html）。
+        #   Qt 版 AssistantPage 保留引用（它连了一堆后端信号，且 log()/set_im_data()
+        #   等方法仍被其它逻辑调用），只是从 stack 里移出隐藏。
+        self._web_assistant_page = None
+        if self._web_engine:
+            try:
+                self._web_assistant_page = self._build_im_page_web()
+                self._qt_assistant_page = self.page_assistant
+                self.stack.removeWidget(self.page_assistant)
+                self.page_assistant.hide()
+                # 钉钉页在 stack 的下标是 1（chat=0 之后）
+                self.stack.insertWidget(1, self._web_assistant_page)
+                # 保持 page_assistant 字段名仍指 Qt 版（供后端 log/set_im_data 用）
+            except Exception:
+                self._web_assistant_page = None
 
         self.page_skills = SkillsPage()
         self.stack.addWidget(self.page_skills)
@@ -1356,6 +1377,8 @@ class MainWindow(QMainWindow):
         bridge.cmd_new_conv.connect(self._new_conversation)
         bridge.cmd_select_conv.connect(self._web_select_conv)
         bridge.cmd_ready.connect(self._web_push_init)   # 前端连接成功后才推 init
+        bridge.rpc_request.connect(
+            lambda method, args_json, req_id: self._web_handle_rpc(method, args_json, req_id, bridge))
         return view
 
     def _swap_in_web_page(self):
@@ -1371,6 +1394,42 @@ class MainWindow(QMainWindow):
         self._qt_chat_page.hide()
         self.stack.insertWidget(0, self._web_page)
         self.page_chat = self._web_page
+
+    def _build_im_page_web(self):
+        """建一个承载 awb://ui/im.html 的 QWebEngineView 作为钉钉助手页。
+
+        复用同一套 webui_host/webui_bridge，但用**独立的 bridge 实例**（每个
+        QWebChannel 只对当前页面有效）。im 页主要通过通用 rpc 通信，所以这里
+        只连 rpc_request + ready；ready 时推一个空的 init（im 页自己用 rpc 拉数据）。
+        """
+        from app import webui_host, webui_bridge
+        view = webui_host.create_view()
+        # 加载 im.html（而非 index.html）
+        from PyQt6.QtCore import QUrl
+        view.setUrl(QUrl("awb://ui/im.html"))
+        bridge = webui_bridge.WebUIBridge(view)
+        self._im_bridge = bridge
+        # ★ rpc 结果要发回「发起请求的那个 bridge」（im 页用 _im_bridge，chat 页用 _web_bridge）
+        bridge.rpc_request.connect(
+            lambda method, args_json, req_id: self._web_handle_rpc(method, args_json, req_id, bridge))
+        bridge.cmd_ready.connect(lambda: self._im_push_init(bridge, view))
+        view.loadFinished.connect(lambda ok: self._im_on_loaded(bridge, view))
+        return view
+
+    def _im_on_loaded(self, bridge, view):
+        """im 页加载完成 → attach（无条件，软件渲染 ok 常为 False）。"""
+        try:
+            bridge.attach(view.page())
+        except Exception:
+            pass
+
+    def _im_push_init(self, bridge, view):
+        """im 页前端连接成功后，推一个带主题的 init（数据由前端 rpc 主动拉）。"""
+        try:
+            theme = str(self.settings.get("theme", "light") or "light")
+            bridge.send_init({"theme": theme, "embedded": True})
+        except Exception:
+            pass
 
     def _web_on_loaded(self, ok, view):
         """网页加载完成 → 注册桥 + 推送初始状态。
@@ -1416,6 +1475,7 @@ class MainWindow(QMainWindow):
                 "currentConvId": self._conv_cid(),
                 "selectedModel": str(self.settings.get("selected_model", "auto")),
                 "models": models,
+                "embedded": False,  # ★ v9.21.2：网页自带导航（侧栏格子），不再隐藏自带侧栏
             })
         except Exception:
             pass
@@ -1510,6 +1570,767 @@ class MainWindow(QMainWindow):
                 },
             })
         return out
+
+    # ================= Web UI 通用 RPC 分发（v9.21.1） =================
+    def _web_handle_rpc(self, method, args_json, req_id, bridge=None):
+        """通用 RPC 分发：前端 call('rpc', {method, args, reqId}) 到这里。
+
+        只做「解析参数 → 调对应方法 → send_rpc_result 回结果」，业务逻辑复用
+        现有 _im_* / assistant / workspace 方法，绝不在桥里另写一套。
+        bridge 是发起请求的那个桥（chat 页 _web_bridge / im 页 _im_bridge），
+        结果要发回它。
+        """
+        if bridge is None:
+            bridge = self._web_bridge
+        import json as _json
+        try:
+            args = _json.loads(args_json or "{}")
+            if not isinstance(args, dict):
+                args = {}
+        except Exception:
+            args = {}
+        try:
+            data = self._web_rpc_dispatch(method, args)
+            bridge.send_rpc_result(req_id, True, data)
+        except Exception as exc:
+            bridge.send_rpc_result(
+                req_id, False, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _web_rpc_dispatch(self, method, args):
+        """按 method 分发到具体实现。返回结果 dict（会被 send_rpc_result 打包）。"""
+        def _mask(v):
+            """密钥/Token 脱敏：非空字符串 -> 前 4 位 + ****。"""
+            if isinstance(v, str) and v:
+                return v[:4] + "****"
+            return v
+
+        def _secret_key(k):
+            """判断字段名是否是密钥类字段（secret/token/webhook）。"""
+            k = str(k).lower()
+            return any(x in k for x in ("secret", "token", "webhook"))
+
+        # ---- 钉钉助手（IM）----
+        if method == "im_get_state":
+            return self._web_im_state()
+        if method == "im_set_settings":
+            return self._web_im_set_settings(args)
+        if method == "im_whitelist_add":
+            return self._web_im_whitelist(args, remove=False)
+        if method == "im_whitelist_remove":
+            return self._web_im_whitelist(args, remove=True)
+        if method == "im_set_tag":
+            return self._web_im_set_tag(args)
+        if method == "im_delete_msgs":
+            return self._web_im_delete(args)
+        if method == "im_process_all":
+            self._assistant_process_all()
+            return {"ok": True}
+        if method == "im_process_one":
+            self._assistant_process_one(str(args.get("msgid", "")))
+            return {"ok": True}
+        if method == "im_scan_tags":
+            self._im_tag_scan()
+            return {"ok": True}
+        if method == "im_toggle":
+            self._assistant_toggle(bool(args.get("start", False)))
+            return {"ok": True}
+        if method == "im_cli_setup":
+            return self._web_im_cli_setup()
+        if method == "im_cli_login":
+            return self._web_im_cli_login()
+        # ---- 通用：模型列表 / 主题（供各页面共用）----
+        if method == "get_models":
+            models = [{"label": "[自动] 免费优先", "choice": "auto"}]
+            for m in config.all_models_sorted():
+                badge = "[免费]" if m.get("free") else "[付费]"
+                vision = " · 看图" if m.get("vision") else ""
+                models.append({
+                    "label": f"{badge} {m['name']}{vision}",
+                    "choice": m.get("choice", m.get("id", "")),
+                })
+            return {"models": models}
+        # ---- 技能 skills ----
+        if method == "skills.list":
+            try:
+                return {"skills": list(self.skills.list_all())}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "skills": []}
+        if method == "skills.get_body":
+            try:
+                key = str(args.get("slug") or args.get("name") or "").strip()
+                if not key:
+                    return {"ok": False, "error": "缺少 slug/name"}
+                item = None
+                for s in self.skills.list_all():
+                    if str(s.get("slug", "")) == key:
+                        item = s
+                        break
+                if item is None:
+                    for s in self.skills.list_all():
+                        if str(s.get("name", "")) == key:
+                            item = s
+                            break
+                if item is None:
+                    return {"ok": False, "error": f"未找到技能 {key}"}
+                return {"body": self.skills.body_of(item)}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "skills.create":
+            try:
+                slug = str(args.get("slug", "")).strip()
+                text = str(args.get("text", ""))
+                if not slug:
+                    return {"ok": False, "error": "缺少 slug"}
+                self.skills.install(slug, text)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "skills.delete":
+            try:
+                slug = str(args.get("slug", "")).strip()
+                if not slug:
+                    return {"ok": False, "error": "缺少 slug"}
+                item = None
+                for s in self.skills.list_all():
+                    if str(s.get("slug", "")) == slug:
+                        item = s
+                        break
+                if item is None:
+                    return {"ok": False, "error": f"未找到技能 {slug}"}
+                if item.get("source") != "user":
+                    return {"ok": False, "error": "内置技能不可删除"}
+                p = item.get("path")
+                if not p or not os.path.isfile(p):
+                    return {"ok": False, "error": "技能目录不存在"}
+                d = os.path.abspath(os.path.dirname(p))
+                base = os.path.abspath(getattr(self.skills, "dir", "") or "")
+                if base and not (d == base or d.startswith(base + os.sep)):
+                    return {"ok": False, "error": "拒绝删除工作区之外的技能目录"}
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    import shutil
+                    shutil.rmtree(d, ignore_errors=True)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "skills.open_dir":
+            try:
+                d = getattr(self.skills, "dir", None)
+                if not d:
+                    return {"ok": False, "error": "未绑定工作区"}
+                os.makedirs(d, exist_ok=True)
+                os.startfile(d)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 定时任务 tasks ----
+        if method == "tasks.list":
+            try:
+                tasks = list(self.scheduler.list_all())
+                for t in tasks:
+                    try:
+                        t["describe"] = _sched_mod.describe(t)
+                    except Exception:
+                        t["describe"] = ""
+                    try:
+                        t["next"] = _sched_mod.next_text(t)
+                    except Exception:
+                        t["next"] = ""
+                return {"tasks": tasks}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "tasks": []}
+        if method == "tasks.enums":
+            try:
+                return {
+                    "kinds": list(getattr(_sched_mod, "KINDS", [])),
+                    "kind_labels": dict(getattr(_sched_mod, "KIND_LABELS", {})),
+                }
+            except Exception as e:
+                return {"ok": False, "error": str(e), "kinds": [], "kind_labels": {}}
+        if method == "tasks.create":
+            try:
+                allowed = ("name", "prompt", "kind", "at", "weekdays",
+                           "interval_min", "run_at", "notify_dingtalk")
+                payload = {k: v for k, v in args.items() if k in allowed}
+                t = self.scheduler.add(**payload)
+                tid = t.get("id") if isinstance(t, dict) else t
+                return {"ok": True, "id": tid}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "tasks.update":
+            try:
+                task_id = args.get("id")
+                patch = {k: v for k, v in args.items() if k != "id"}
+                self.scheduler.update(task_id, **patch)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "tasks.delete":
+            try:
+                self.scheduler.remove(args.get("id"))
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "tasks.run_now":
+            try:
+                self._run_task_now(str(args.get("id", "")))
+                return {"ok": True, "async": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 记忆 memory ----
+        if method == "memory.get_text":
+            try:
+                text = self.memory.load_text() or ""
+            except Exception:
+                text = ""
+            stats = {}
+            try:
+                stats = self.memory.parse()
+            except Exception:
+                stats = {}
+            return {"text": text, "stats": stats}
+        if method == "memory.save_text":
+            try:
+                self.memory.save_text(str(args.get("text", "")))
+                try:
+                    self._on_memory_saved()
+                except Exception:
+                    pass
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "memory.clear":
+            try:
+                self.memory.clear()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "memory.auto_logs":
+            try:
+                recs = memory_mod.recent_auto_log(self.workspace.path, 60)
+            except Exception:
+                recs = []
+            lines = []
+            for r in (recs or []):
+                if not isinstance(r, dict):
+                    continue
+                t = r.get("t", "")
+                src = r.get("source", "")
+                for it in (r.get("items") or []):
+                    if not isinstance(it, dict):
+                        continue
+                    cat = it.get("cat") or ""
+                    text = it.get("text") or ""
+                    if text:
+                        lines.append(f"[{t}]（{src}）{('[' + cat + '] ') if cat else ''}{text}")
+            return {"logs": "\n".join(lines)}
+        if method == "memory.worklog":
+            try:
+                ws_path = self.workspace.path
+                today = _worklog_mod.today_stats(ws_path)
+                days = _worklog_mod.list_days(ws_path)
+                text = _worklog_mod.read_day(ws_path)
+            except Exception:
+                today, days, text = {"total": 0, "ok": 0, "day": ""}, [], ""
+            return {"today": today, "days": days, "text": text}
+        if method == "memory.open_worklog_dir":
+            try:
+                d = ws_mod.internal_dir(self.workspace.path, "worklog")
+                os.startfile(d)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 工具调用记录 tools（Trace）----
+        if method == "trace.list":
+            try:
+                limit = args.get("limit", 200)
+                try:
+                    limit = int(limit)
+                except Exception:
+                    limit = 200
+                return {"items": list(self.trace.tail(limit))}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "items": []}
+        if method == "trace.stats":
+            try:
+                return {"stats": self.trace.stats()}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "stats": {}}
+        if method == "trace.clear":
+            try:
+                self.trace.clear()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 关于 about ----
+        if method == "app.about_info":
+            return {
+                "name": getattr(ver, "APP_NAME", ""),
+                "version": getattr(ver, "VERSION", ""),
+                "build_date": getattr(ver, "BUILD_DATE", ""),
+                "homepage": getattr(ver, "HOMEPAGE", ""),
+                "releases": getattr(ver, "RELEASES_PAGE", ""),
+            }
+        if method == "app.diag_info":
+            import platform
+            import sys as _sys
+            lines = [
+                f"{getattr(ver, 'APP_NAME', '')} v{getattr(ver, 'VERSION', '')} "
+                f"(build {getattr(ver, 'BUILD_DATE', '')})",
+                f"Python {_sys.version.split()[0]}",
+                f"系统 {platform.platform()}",
+                f"冻结运行: {getattr(_sys, 'frozen', False)}",
+            ]
+            try:
+                from .. import security
+                lines.append(f"dpapi: {security.DPAPI_AVAILABLE}")
+            except Exception:
+                lines.append("dpapi: (未知)")
+            try:
+                lines.append(f"edge-tts: {'有' if 'edge' in tts_mod.Speaker().available_engines else '无'}")
+            except Exception:
+                lines.append("edge-tts: (未知)")
+            try:
+                from .. import asr as asr_mod
+                lines.append(f"语音引擎: {', '.join(asr_mod.available_backends(config.DEFAULT_API_KEYS)) or '无'}")
+            except Exception:
+                lines.append("语音引擎: (未知)")
+            try:
+                lines.append(f"钉钉 stream: {'有' if dt_mod.DingTalkClient().stream_available() else '无'}")
+            except Exception:
+                lines.append("钉钉 stream: (未知)")
+            return {"text": "\n".join(lines)}
+        if method == "app.check_update":
+            try:
+                self._do_update_check(False)
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+
+        # ---- 设置 settings ----
+        if method == "settings.get":
+            s = dict(self.settings or {})
+            try:
+                ak = s.get("api_keys")
+                if isinstance(ak, dict):
+                    s["api_keys"] = {k: _mask(v) for k, v in ak.items()}
+            except Exception:
+                pass
+            try:
+                if isinstance(s.get("github_token"), str):
+                    s["github_token"] = _mask(s["github_token"])
+            except Exception:
+                pass
+            try:
+                dt = s.get("dingtalk")
+                if isinstance(dt, dict):
+                    s["dingtalk"] = {k: (_mask(v) if _secret_key(k) else v)
+                                     for k, v in dt.items()}
+            except Exception:
+                pass
+            return {"settings": s}
+        if method == "settings.save":
+            patch = dict(args.get("patch", {}) or {})
+            if not patch:
+                return {"ok": True}
+            try:
+                self._on_settings_saved(patch)
+            except Exception:
+                try:
+                    self.settings.update(patch)
+                    self.workspace.save_settings(self.settings)
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+            return {"ok": True}
+        if method == "settings.enums":
+            out = {
+                "providers": config.PROVIDERS,
+                "asr_backends": {},
+                "tts_engines": config.TTS_ENGINES,
+                "edge_voices": tts_mod.EDGE_VOICES,
+            }
+            try:
+                from .. import asr as _asr
+                out["asr_backends"] = _asr.BACKEND_LABELS
+            except Exception:
+                pass
+            return out
+        if method == "settings.probe_providers":
+            try:
+                self._probe_providers()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "settings.tts_test":
+            try:
+                engine = str(args.get("engine", "") or
+                             self.settings.get("tts_engine", "sapi"))
+                self._tts_test(engine)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "settings.gh_test":
+            try:
+                self._gh_do_test(str(args.get("token", "")))
+                return {"ok": True, "async": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "dsw.status":
+            try:
+                dsw = getattr(self, "dsw", None)
+                if dsw is None:
+                    return {"status": {"ok": False, "detail": "DeepSeek 网页服务未初始化"}}
+                return {"status": dsw.status()}
+            except Exception as e:
+                return {"status": {"ok": False, "detail": str(e)}}
+        if method == "dsw.launch":
+            try:
+                self._dsw_do_launch()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dsw.selftest":
+            try:
+                self._dsw_do_selftest()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dsw.retry":
+            try:
+                self._dsw_do_retry()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dsw.show":
+            try:
+                self._dsw_do_show()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dsw.hide":
+            try:
+                self._dsw_do_hide()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+
+        # ---- 集成 integrations ----
+        if method == "dingtalk.get_config":
+            try:
+                cfg = dict(dt_mod.config_from_settings(self.settings or {}))
+                for k in list(cfg.keys()):
+                    if _secret_key(k):
+                        cfg[k] = _mask(cfg[k])
+                return {"config": cfg}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "config": {}}
+        if method == "dingtalk.save_config":
+            try:
+                self._save_dingtalk(dict(args.get("config", {}) or {}))
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "dingtalk.test":
+            try:
+                self._test_dingtalk(dict(args.get("config", {}) or {}))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dingtalk.selftest":
+            try:
+                self._dingtalk_selftest(dict(args.get("config", {}) or {}))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dingtalk.contacts":
+            try:
+                self._dingtalk_contacts(dict(args.get("config", {}) or {}))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dingtalk.login":
+            try:
+                self._dingtalk_login(dict(args.get("config", {}) or {}))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dingtalk.group_send":
+            try:
+                self._dingtalk_group_send(dict(args.get("config", {}) or {}),
+                                          str(args.get("text", "")))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dingtalk.stream_toggle":
+            try:
+                self._toggle_dingtalk_stream(dict(args.get("config", {}) or {}),
+                                             bool(args.get("enable", False)))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dws.login":
+            try:
+                self._dingtalk_dws_login(bool(args.get("device", False)))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dws.conversations":
+            try:
+                self._dingtalk_dws_conversations()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dws.messages":
+            try:
+                self._dingtalk_dws_messages(str(args.get("cid", "")))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "dws.send":
+            try:
+                self._dingtalk_dws_send(str(args.get("target", "")),
+                                        str(args.get("content", "")))
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "update.get_config":
+            return {"config": {
+                "repo": self.settings.get("update_repo", "")
+                        or getattr(ver, "GITHUB_REPO", ""),
+                "check_on_start": bool(self.settings.get("check_update_on_start", True)),
+                "token": _mask(self.settings.get("github_token", "")),
+            }}
+        if method == "update.save_config":
+            try:
+                cfg = dict(args.get("config", {}) or {})
+                mapped = {}
+                repo = cfg.get("repo", cfg.get("update_repo"))
+                if repo is not None:
+                    mapped["update_repo"] = str(repo).strip() or getattr(ver, "GITHUB_REPO", "")
+                cs = cfg.get("check_on_start", cfg.get("check_update_on_start"))
+                if cs is not None:
+                    mapped["check_update_on_start"] = bool(cs)
+                tok = cfg.get("token", cfg.get("github_token"))
+                if tok is not None:
+                    tok = str(tok)
+                    if tok and "****" not in tok:
+                        mapped["github_token"] = tok
+                if mapped:
+                    self._save_update_settings(mapped)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "update.check":
+            try:
+                self._do_update_check(False)
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "update.apply":
+            try:
+                self._update_apply()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True}
+        if method == "mcp.path":
+            return {"path": os.path.join(self.workspace.path, "mcp.json")}
+        if method == "mcp.reload":
+            try:
+                self.mcp.reload()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "mcp.scan":
+            try:
+                self.mcp.reload()
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "async": True,
+                    "message": "已重载 MCP 配置（完整工具拉取请在集成页执行）"}
+        if method == "mcp.open_file":
+            try:
+                path = os.path.join(self.workspace.path, "mcp.json")
+                if not os.path.exists(path):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write('{\n  "mcpServers": {\n  }\n}\n')
+                os.startfile(path)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 导航 nav ----
+        if method == "nav_to":
+            try:
+                self._open_page(str(args.get("key", "")))
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        raise KeyError(f"未知 RPC 方法：{method}")
+
+    def _web_im_state(self):
+        """钉钉助手页全量状态：消息双栏 + 设置 + 标签 + 钉钉登录态。"""
+        if getattr(self, "im_store", None) is None:
+            return {"ready": False, "reason": "IM 底座未初始化"}
+        st = self.im_store.settings()
+        rows = self.im_store.rows()
+        tags = self.im_store.tags()
+        # tags 是 {tid: {...}}，转成前端好渲染的列表
+        tag_list = []
+        for tid, t in (tags or {}).items():
+            tag_list.append({
+                "id": tid,
+                "name": t.get("name", ""),
+                "kind": t.get("kind", "group"),
+                "tag": t.get("tag", ""),
+                "tags": t.get("tags", []),
+                "tag_auto": t.get("tag_auto", False),
+                "msg_count": t.get("msg_count", 0),
+            })
+        return {
+            "ready": True,
+            "running": bool(getattr(self, "assistant", None)
+                            and self.assistant.running),
+            "ding_status": self._asst_ding_status_text(),
+            "rows": rows,
+            "settings": st,
+            "tags": tag_list,
+            "whitelist": st.get("whitelist", []),
+        }
+
+    def _web_im_set_settings(self, args):
+        if getattr(self, "im_store", None) is None:
+            return {"ok": False, "error": "IM 底座未初始化"}
+        allowed = ("scope_group", "scope_p2p", "scope_at_me", "delay_seconds",
+                   "uncertain_reply", "uncertain_text", "identity",
+                   "interval", "auto_reply")
+        patch = {k: v for k, v in args.items() if k in allowed}
+        st = self.im_store.set_settings(**patch)
+        # 同步到老轮询服务（间隔/范围）
+        try:
+            ap = {}
+            if st.get("interval"):
+                ap["interval"] = int(st["interval"])
+            g = bool(st.get("scope_group", True))
+            p = bool(st.get("scope_p2p", True))
+            ap["scope"] = ("at_me" if (g and not p)
+                           else ("all" if (g or p) else "self"))
+            self.assistant.apply_cfg(ap)
+        except Exception:
+            pass
+        return {"ok": True, "settings": st}
+
+    def _web_im_whitelist(self, args, remove):
+        if getattr(self, "im_store", None) is None:
+            return {"ok": False, "error": "IM 底座未初始化"}
+        if remove:
+            wl = self.im_store.whitelist_remove(str(args.get("cid", "")))
+        else:
+            wl = self.im_store.whitelist_add(
+                str(args.get("cid", "")),
+                name=str(args.get("name", "")),
+                kind=str(args.get("kind", "group")))
+        return {"ok": True, "whitelist": wl}
+
+    def _web_im_set_tag(self, args):
+        if getattr(self, "im_store", None) is None:
+            return {"ok": False, "error": "IM 底座未初始化"}
+        raw = args.get("tags")
+        if raw is None:
+            raw = args.get("tag", "")
+        self.im_store.set_tag(
+            str(args.get("thread_id", "")),
+            raw)
+        return {"ok": True, "tags": self.im_store.tags()}
+
+    def _web_im_delete(self, args):
+        mids = args.get("msgids", [])
+        if isinstance(mids, str):
+            mids = [mids]
+        self._im_delete_msgs([str(m) for m in mids])
+        return {"ok": True}
+
+    def _web_im_cli_setup(self):
+        """一键配置钉钉 CLI：检测 → 缺 node/dws 就自动装 → 报告结果。
+
+        返回 {ok, message, available, authenticated}。装在用户目录下的独立目录，
+        不污染系统全局环境（沙箱/普通权限都能跑）。
+        """
+        from ..dingtalk import find_dws, _find_node
+        node, dws = find_dws()
+        if dws:
+            # 已有 dws，看登录态
+            authed = False
+            try:
+                st = self.ding.dws_auth_status() or {}
+                authed = bool(st.get("authenticated"))
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "message": "钉钉 CLI 已就绪" + ("，且已登录" if authed else "，还需登录"),
+                "available": True,
+                "authenticated": authed,
+            }
+        # 没找到 dws：尝试自动安装
+        try:
+            node_exe = _find_node()
+            if not node_exe:
+                return {"ok": False, "error": "没找到 Node.js，请先安装 Node.js 后再试"}
+            import subprocess
+            import shutil
+            # 装到用户目录下独立 prefix，避免 -g 全局污染
+            target = os.path.join(os.path.expanduser("~"), ".awb", "dws-cli")
+            os.makedirs(target, exist_ok=True)
+            npm = shutil.which("npm")
+            npm_cmd = []
+            if npm:
+                npm_cmd = [npm]
+            else:
+                # 没有 npm 命令，用 node 直接跑 npm-cli.js（若存在）
+                npm_cli = os.path.join(os.path.dirname(node_exe), "..", "node_modules", "npm", "bin", "npm-cli.js")
+                if os.path.exists(npm_cli):
+                    npm_cmd = [node_exe, npm_cli]
+                else:
+                    return {"ok": False, "error": "没找到 npm，无法自动安装 dws"}
+            cmd = npm_cmd + ["install", "--prefix", target, "dingtalk-workspace-cli"]
+            import app.winproc as _wp
+            p = _wp.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                        errors="ignore", timeout=300)
+            if p.returncode != 0:
+                return {"ok": False, "error": "安装失败：" + (p.stderr or p.stdout or "")[:300]}
+            # 装完后设环境变量，让 find_dws 能找到
+            dws_js = os.path.join(target, "node_modules", "dingtalk-workspace-cli", "bin", "dws.js")
+            if not os.path.exists(dws_js):
+                return {"ok": False, "error": "安装完成但没找到 dws.js，请重启后重试"}
+            os.environ["AIWORKBENCH_NODE_PATH"] = node_exe
+            os.environ["AIWORKBENCH_DWS_JS"] = dws_js
+            return {
+                "ok": True,
+                "message": "钉钉 CLI 已自动安装完成，请点「登录」授权",
+                "available": True,
+                "authenticated": False,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"自动安装失败：{type(exc).__name__}: {exc}"}
+
+    def _web_im_cli_login(self):
+        """发起钉钉 CLI 登录（设备码方式，沙箱里浏览器扫码可能被拦，用设备码最稳）。"""
+        from ..dingtalk import find_dws
+        node, dws = find_dws()
+        if not dws:
+            return {"ok": False, "error": "还没装 dws，请先点「一键配置钉钉 CLI」"}
+        try:
+            # 设备码登录最稳（本地回环扫码在沙箱可能被拦）
+            self.ding.dws_login_start(device=True)
+            return {"ok": True, "message": "已发起设备码登录，请在弹窗/终端按提示完成授权"}
+        except Exception as exc:
+            return {"ok": False, "error": f"登录失败：{type(exc).__name__}: {exc}"}
 
     def _style_input_area(self):
         """按当前主题给输入卡片与图标按钮上色（跟随浅色 / 深色切换）。"""
@@ -3785,31 +4606,51 @@ class MainWindow(QMainWindow):
             self.page_assistant.set_ding_status(self._asst_ding_status_text())
         except Exception as exc:
             self._safe_asst_log(f"刷新助手页失败：{type(exc).__name__}: {exc}")
+        # ★ v9.21.1：web 版钉钉页激活时，推 im_refresh 让前端重新拉数据
+        if self._web_engine and getattr(self, "_im_bridge", None) is not None:
+            try:
+                self._im_bridge.emit_event("im_refresh", {})
+            except Exception:
+                pass
 
     # ---------- 钉钉连接（在助理「设置」页里配）----------
     def _asst_ding_status_text(self):
-        """读登录状态（带 60 秒缓存 —— `dws auth status` 是一次子进程，别每次刷都跑）。"""
+        """读登录状态（带 60 秒缓存 —— `dws auth status` 是一次子进程，别每次刷都跑）。
+
+        ★ v9.21.2 启动提速：第一次（缓存 miss）也**不同步跑子进程**，先返回
+        「检查中…」占位并起后台线程查一次填缓存；下次调用（10s 定时器）自动拿到
+        真实登录态。避免启动时被 dws 子进程卡约 1.2s。
+        """
         now = time.time()
         cache = getattr(self, "_ding_status_cache", None)
         if cache and now - cache[0] < 60:
             return cache[1]
-        text = ""
-        try:
-            if not self.ding.dws_available():
-                text = ("没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
-                        "或自行 npm i -g dingtalk-workspace-cli。")
-            else:
-                st = self.ding.dws_auth_status() or {}
-                if st.get("authenticated"):
-                    who = st.get("user_name") or "（已登录）"
-                    corp = st.get("corp_name") or ""
-                    text = "✓ 已登录：%s%s" % (who, ("（%s）" % corp) if corp else "")
-                else:
-                    text = "✗ 还没登录 —— 点下面的「扫码授权登录」或「设备码登录」"
-        except Exception as exc:
-            text = "状态读取失败：%s: %s" % (type(exc).__name__, exc)
-        self._ding_status_cache = (now, text)
-        return text
+        # 缓存 miss → 后台补查，本次先给占位
+        if not getattr(self, "_ding_status_loading", False):
+            self._ding_status_loading = True
+
+            def _probe():
+                text = ""
+                try:
+                    if not self.ding.dws_available():
+                        text = ("没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
+                                "或自行 npm i -g dingtalk-workspace-cli。")
+                    else:
+                        st = self.ding.dws_auth_status() or {}
+                        if st.get("authenticated"):
+                            who = st.get("user_name") or "（已登录）"
+                            corp = st.get("corp_name") or ""
+                            text = "✓ 已登录：%s%s" % (who, ("（%s）" % corp) if corp else "")
+                        else:
+                            text = "✗ 还没登录 —— 点下面的「扫码授权登录」或「设备码登录」"
+                except Exception as exc:
+                    text = "状态读取失败：%s: %s" % (type(exc).__name__, exc)
+                finally:
+                    self._ding_status_loading = False
+                self._ding_status_cache = (time.time(), text)
+            threading.Thread(target=_probe, daemon=True,
+                             name="awb-ding-status").start()
+        return "检查钉钉登录状态中…"
 
     def _asst_ding_login(self, device):
         self._safe_asst_log("已发起 dws 授权登录（%s），请按提示完成授权…"
@@ -4843,11 +5684,37 @@ class MainWindow(QMainWindow):
         self._asst_reply(m, m["result"], [p for p in files if p and os.path.isfile(p)])
 
     def _ding_self_name(self):
+        """钉钉里「我自己」的显示名（dws 登录态里有）。
+
+        ★ v9.21.2 启动提速：dws 状态是子进程调用（≈1.1s），启动时连调多次会拖慢。
+        这里改成「只读缓存 + 后台刷新」：**绝不同步跑子进程**。缓存里有真名就直接
+        返回；缓存 miss 就先返回「我」占位，同时起后台线程查一次填缓存，下次调用
+        （真正要发钉钉时）就能拿到真名，不阻塞启动。
+        """
+        # 1) 先读缓存（纯读，绝不跑子进程）
         try:
-            st = self.ding.dws_auth_status()
-            return (st.get("user_name") or "").strip() or "我"
+            st = self.ding._dws_status_cache
+            if st:
+                name = (st.get("user_name") or "").strip()
+                if name:
+                    return name
         except Exception:
-            return "我"
+            pass
+        # 2) 缓存 miss / 没查到名 → 后台补查一次，本次先返回「我」
+        try:
+            if not getattr(self, "_ding_name_loading", False):
+                self._ding_name_loading = True
+
+                def _probe():
+                    try:
+                        self.ding.dws_auth_status(force=True)
+                    finally:
+                        self._ding_name_loading = False
+                threading.Thread(target=_probe, daemon=True,
+                                 name="awb-ding-name").start()
+        except Exception:
+            pass
+        return "我"
 
     # ---------- 硬保障：用户要「发钉钉」但 AI 没真发 -> 程序自动补发 ----------
     def _wants_dingtalk(self, text):

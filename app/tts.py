@@ -70,13 +70,22 @@ class Speaker:
         self.edge_voice = DEFAULT_EDGE_VOICE
         self.rate = DEFAULT_RATE
         self.volume = DEFAULT_VOLUME
-        self.available_engines = ["sapi"]
-        if _has_edge():
-            self.available_engines.append("edge")
+        # ★ v9.21.2 启动提速：edge-tts 的 import 会同步加载 SSL 证书（load_verify_locations
+        #   78 次 ≈ 1.8s），老代码在 __init__ 里就 `_has_edge()` 把这段开销提到启动关键路径。
+        #   现在改成懒加载：available_engines 首次被访问时才检测 edge，启动不再阻塞。
+        self._engines = None
         self._sapi = None
         self._thread = None
         self._stop = threading.Event()
         self._mci_alias = None
+
+    @property
+    def available_engines(self):
+        if self._engines is None:
+            self._engines = ["sapi"]
+            if _has_edge():
+                self._engines.append("edge")
+        return self._engines
 
     # ---------------- SAPI（离线）----------------
     def _get_sapi(self):

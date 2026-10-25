@@ -54,6 +54,42 @@ export async function call(name, args) {
   return t;
 }
 
+// 通用 RPC：请求-响应式调用后端方法。返回 Promise，resolve 后端结果。
+// 后端契约：call('rpc', {method, args, reqId}) → 事件 rpc_result {reqId, ok, data}。
+let _rpcSeq = 0;
+const _rpcPending = new Map(); // reqId -> {resolve, reject, timer}
+
+function _onRpcResult(payload) {
+  const reqId = payload && payload.reqId;
+  const p = _rpcPending.get(reqId);
+  if (!p) return;
+  _rpcPending.delete(reqId);
+  clearTimeout(p.timer);
+  if (payload && payload.ok) p.resolve(payload.data);
+  else p.reject(new Error((payload && payload.data && payload.data.error) || 'RPC 失败'));
+}
+
+// 在 start() 里注册一次 rpc_result 监听（幂等，用标志位避免重复注册）
+let _rpcWired = false;
+
+export async function rpc(method, args, timeoutMs = 30000) {
+  const t = await ensure();
+  if (!t) throw new Error('未连接到后端桥');
+  if (!_rpcWired) {
+    _rpcWired = true;
+    on('rpc_result', _onRpcResult);
+  }
+  const reqId = 'r' + (++_rpcSeq) + '_' + Date.now();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      _rpcPending.delete(reqId);
+      reject(new Error(`RPC 超时: ${method}`));
+    }, timeoutMs);
+    _rpcPending.set(reqId, { resolve, reject, timer });
+    t.invoke('rpc', { method, args: args || {}, reqId });
+  });
+}
+
 // 页面卸载时把通道标记失效，避免「永远转圈」的未完成请求
 window.addEventListener('beforeunload', () => {
   transport = null;

@@ -45,19 +45,42 @@ import sys
 import threading
 
 # --------------------------------------------------------------------------
-# 内核初始化：这两个环境变量必须在 Chromium 启动前设好
+# 内核初始化：这些开关必须在 Chromium 启动前设好
 # --------------------------------------------------------------------------
-# 这两个开关是**实测必需**的（Windows 下）：
+# 各开关的实测结论（Windows 下，改动前先看这里）：
 #   · --no-sandbox         Chromium 的渲染沙箱在本机环境起不来，不加则每个页面
-#                          loadFinished 都是 False（渲染进程一启动就被干掉）。
-#   · --disable-gpu        离屏渲染不需要 GPU，关掉能少一堆显卡驱动相关的白屏/崩溃。
-# 另外三个是 v9.18.0 内嵌 DeepSeek 宿主加的：内嵌页面以
-# WA_DontShowOnScreen 的形式常驻后台，默认会被 Chromium 判为"被遮挡/后台"而降频，
-# 定时器被节流后输入框的防抖、流式回答的轮询都会变慢，所以全部关掉。
+#                          loadFinished 都是 False（渲染进程一启动就被干掉）。**必须保留**。
+#   · --disable-gpu        ★ v9.21.1 修复：老代码无条件加它，把正常桌面运行也拖进了
+#                          软件渲染（SwiftShader），网页打开慢、点按钮/滚动全卡 ——
+#                          这就是用户反馈「内置浏览器跟谷歌差远了」的真凶。
+#                          现在改成**按场景**：只有离屏/无头（QT_QPA_PLATFORM=offscreen，
+#                          例如自动化测试、DeepSeek 后台无头页）才禁 GPU；正常桌面运行
+#                          **开启 GPU 硬件加速**（滚动/合成/动画都交给显卡）。
+#   · 另外三个是 v9.18.0 内嵌 DeepSeek 宿主加的：内嵌页面以
+#     WA_DontShowOnScreen 的形式常驻后台，默认会被 Chromium 判为"被遮挡/后台"而降频，
+#     定时器被节流后输入框的防抖、流式回答的轮询都会变慢，所以全部关掉。
 # 用户可用环境变量 QTWEBENGINE_CHROMIUM_FLAGS 覆盖这里的默认值。
+def _gpu_flags():
+    """按运行场景决定是否开 GPU 加速。
+
+    离屏（offscreen）没有真实 GPU 上下文，开 GPU 会白屏/崩溃（探针里见过
+    `Failed to create GLES3 context`），所以离屏才禁 GPU；正常桌面运行要开满。
+    """
+    offscreen = os.environ.get("QT_QPA_PLATFORM", "") == "offscreen"
+    if offscreen:
+        return "--disable-gpu"
+    # 正常桌面：开硬件加速。ignore-gpu-blocklist 让老驱动/双显卡机器也尽量走 GPU，
+    # 而不是被 Chromium 的 GPU 黑名单一票否决降回软件渲染。
+    return (
+        "--ignore-gpu-blocklist "
+        "--enable-gpu-rasterization "
+        "--enable-accelerated-2d-canvas "
+        "--enable-accelerated-video-decode")
+
+
 os.environ.setdefault(
     "QTWEBENGINE_CHROMIUM_FLAGS",
-    "--disable-gpu --no-sandbox "
+    _gpu_flags() + " --no-sandbox "
     "--disable-background-timer-throttling "
     "--disable-renderer-backgrounding "
     "--disable-backgrounding-occluded-windows")

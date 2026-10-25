@@ -334,6 +334,10 @@ class DingTalkClient:
         self._stream_thread = None
         self._stream_handler = None
         self._stream_running = False
+        # ★ v9.21.2 启动提速：dws 登录态检查是子进程（node dws auth status ≈1.1s/次），
+        #   启动时会被 _ding_self_name 连调多次拖慢约 3s。加 TTL 缓存，30s 内复用。
+        self._dws_status_cache = None
+        self._dws_status_ts = 0.0
 
     # ---------------- 配置 ----------------
     def update(self, cfg):
@@ -1020,12 +1024,24 @@ class DingTalkClient:
             raise DingTalkError("dws 报错：" + (p.stderr or "")[:400])
         return out
 
-    def dws_auth_status(self):
-        """返回 dws 登录状态 dict：含 authenticated / user_name / corp_name。"""
+    def dws_auth_status(self, force=False):
+        """返回 dws 登录状态 dict：含 authenticated / user_name / corp_name。
+
+        ★ v9.21.2：结果带 30s TTL 缓存。dws 状态是子进程调用（≈1.1s/次），
+        启动时连调多次会拖慢约 3s；`force=True` 或缓存过期才真正跑子进程。
+        """
+        import time as _time
+        now = _time.time()
+        if (not force and self._dws_status_cache is not None
+                and now - self._dws_status_ts < 30.0):
+            return self._dws_status_cache
         try:
-            return self._run_dws(["auth", "status", "--format", "json"])
+            st = self._run_dws(["auth", "status", "--format", "json"])
         except DingTalkError:
-            return {"authenticated": False, "error": "dws 不可调用"}
+            st = {"authenticated": False, "error": "dws 不可调用"}
+        self._dws_status_cache = st
+        self._dws_status_ts = now
+        return st
 
     def dws_login_start(self, device=False, on_line=None):
         """后台启动 dws 授权登录（浏览器或设备流），把输出实时回调给 GUI。

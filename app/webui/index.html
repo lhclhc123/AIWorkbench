@@ -14,6 +14,7 @@
 <link rel="stylesheet" href="./css/tokens.css">
 <link rel="stylesheet" href="./css/base.css">
 <link rel="stylesheet" href="./css/chat.css">
+<link rel="stylesheet" href="./css/pages.css">
 </head>
 <body>
 
@@ -30,7 +31,7 @@
       </svg>
     </span>
     <span class="brand-name">对话</span>
-    <span class="brand-ver" id="verLabel">v9.21.1</span>
+    <span class="brand-ver" id="verLabel">v9.21.2</span>
     <span class="tb-spacer"></span>
     <button class="win-btn" id="themeBtn" title="切换深色 / 浅色">
       <svg class="ico-moon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
@@ -50,8 +51,11 @@
 
   <div class="shell">
 
-    <!-- ================= 侧栏：会话列表 ================= -->
+    <!-- ================= 侧栏：导航 + 会话列表 ================= -->
     <aside class="sidebar" id="sidebar">
+      <!-- ★ v9.21.2 全 Web 导航：第一行「对话」常显，下面 3 列小格子放其余页。
+           与 Qt 版 NavRail 对齐（tools/team 不画格子，团队已收进对话 TeamBar）。 -->
+      <div class="nav-rail" id="navRail"></div>
       <div class="side-head">
         <span>对话列表</span>
         <span class="spacer"></span>
@@ -125,6 +129,40 @@
         </div>
 
       </section>
+
+      <!-- ============ 钉钉助手页（assistant）============ -->
+      <section class="page" id="page-assistant" data-page="assistant" hidden></section>
+
+      <!-- ============ 技能（skills）============ -->
+      <section class="page" id="page-skills" data-page="skills" hidden></section>
+
+      <!-- ============ 定时任务（tasks）============ -->
+      <section class="page" id="page-tasks" data-page="tasks" hidden></section>
+
+      <!-- ============ 记忆（memory）============ -->
+      <section class="page" id="page-memory" data-page="memory" hidden></section>
+
+      <!-- ============ 工具调用记录（tools）============ -->
+      <section class="page" id="page-tools" data-page="tools" hidden></section>
+
+      <!-- ============ 并行任务（bg）============ -->
+      <section class="page" id="page-bg" data-page="bg" hidden></section>
+
+      <!-- ============ 团队（team）============ -->
+      <section class="page" id="page-team" data-page="team" hidden></section>
+
+      <!-- ============ 集成（integrations）============ -->
+      <section class="page" id="page-integrations" data-page="integrations" hidden></section>
+
+      <!-- ============ 设置（settings）============ -->
+      <section class="page" id="page-settings" data-page="settings" hidden></section>
+
+      <!-- ============ 关于（about）============ -->
+      <section class="page" id="page-about" data-page="about" hidden></section>
+
+      <!-- ============ 浏览器（browser，Qt 版，导航时切回 Qt stack）============ -->
+      <section class="page" id="page-browser" data-page="browser" hidden></section>
+
     </main>
   </div>
 </div>

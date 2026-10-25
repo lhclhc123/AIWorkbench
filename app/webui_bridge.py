@@ -59,6 +59,10 @@ class WebUIBridge(QObject):
     cmd_new_conv = pyqtSignal()         # new_conv()
     cmd_select_conv = pyqtSignal(str)   # select_conv(convId)
     cmd_ready = pyqtSignal()            # ready() —— 前端连接成功后主动上报
+    # ★ v9.21.1 通用 RPC：前端 call('rpc', {method, args, reqId}) → 后端
+    #   dispatch(method) → 结果通过 webui_event('rpc_result', {reqId, ok, data})
+    #   返回。这样每个新页面（钉钉/技能/定时/记忆…）只需注册 method，不用改 call 签名。
+    rpc_request = pyqtSignal(str, str, str)   # (method, args_json, req_id)
 
     def __init__(self, view):
         super().__init__()
@@ -108,6 +112,18 @@ class WebUIBridge(QObject):
             self.cmd_select_conv.emit(str(args.get("convId", "")))
         elif name == "ready":
             self.cmd_ready.emit()
+        elif name == "rpc":
+            # 通用 RPC：method + args + reqId，结果走 rpc_result 事件返回
+            method = str(args.get("method", ""))
+            req_id = str(args.get("reqId", ""))
+            rpc_args = args.get("args", {})
+            if not isinstance(rpc_args, dict):
+                rpc_args = {}
+            self.rpc_request.emit(
+                method,
+                json.dumps(rpc_args, ensure_ascii=False),
+                req_id,
+            )
 
     # ------------------------------------------------------------------
     # 下行：Python -> 网页。
@@ -164,6 +180,14 @@ class WebUIBridge(QObject):
 
     def send_theme(self, theme):
         self.emit_event("theme", theme)
+
+    def send_rpc_result(self, req_id, ok, data):
+        """通用 RPC 的返回通道。前端 call('rpc', {reqId}) 后据此关联结果。"""
+        self.emit_event("rpc_result", {
+            "reqId": str(req_id or ""),
+            "ok": bool(ok),
+            "data": data,
+        })
 
     # ------------------------------------------------------------------
     # 流式合批内部实现

@@ -72,6 +72,31 @@ def _safe(name):
     return (s[:40] or "thread")
 
 
+# 解析标签时要去掉的包裹符号（首尾都去，同 tags.py 的 _PUNCT）
+_PUNCT = " \t\r\n\u3000。．.,，、:：;；!！?？\"'“”‘’「」『』【】[]()（）《》<>"
+
+
+def _split_tags(raw):
+    """把字符串/列表解析成去重、去空、逐个截断到 12 字的标签列表（保持顺序）。"""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x) for x in raw]
+    else:
+        parts = re.split(r"[、,，\s]+", str(raw))
+    out, seen = [], set()
+    for p in parts:
+        p = str(p).strip(_PUNCT)
+        if not p:
+            continue
+        p = p[:12].strip(_PUNCT)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 class IMStore:
     """IM 数据仓库。所有路径都落在工作区的 `.awb/im/` 下。"""
 
@@ -500,15 +525,17 @@ class IMStore:
     # 会话标签（写进 thread 档案，不另开文件）
     # ------------------------------------------------------------------
     def set_tag(self, thread_id, tag, note="", auto=False):
-        """给会话打标签。`tag=""` 表示"不知道"（等于清空）。"""
+        """给会话打标签（支持单标签字符串或标签列表）。`tag=""` 表示"不知道"（等于清空）。"""
         tid = str(thread_id or "").strip()
         if not tid:
             return None
+        tags_list = _split_tags(tag)
         all_t = self.threads()
         t = all_t.get(tid)
         if t is None:
             t = self.thread(tid, create=True) or {}
-        t["tag"] = str(tag or "").strip()[:20]
+        t["tags"] = tags_list
+        t["tag"] = "、".join(tags_list)
         t["tag_note"] = str(note or "")[:120]
         t["tag_auto"] = bool(auto)
         all_t[tid] = t
@@ -516,15 +543,20 @@ class IMStore:
         return t
 
     def tags(self):
-        """{tid: {id,name,kind,tag,tag_note,tag_auto,last_ts,msg_count}}（只读）。"""
+        """{tid: {id,name,kind,tag,tags,tag_note,tag_auto,last_ts,msg_count}}（只读）。"""
         out = {}
         for tid, t in (self.threads() or {}).items():
             t = t or {}
+            tags_list = t.get("tags")
+            if not isinstance(tags_list, list):
+                tag = str(t.get("tag") or "")
+                tags_list = [tag] if tag else []
             out[str(tid)] = {
                 "id": str(t.get("id") or tid),
                 "name": str(t.get("name") or ""),
                 "kind": str(t.get("kind") or "group"),
                 "tag": str(t.get("tag") or ""),
+                "tags": tags_list,
                 "tag_note": str(t.get("tag_note") or ""),
                 "tag_auto": bool(t.get("tag_auto")),
                 "last_ts": float(t.get("last_ts") or 0.0),
