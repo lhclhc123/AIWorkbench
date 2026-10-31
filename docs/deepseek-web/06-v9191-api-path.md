@@ -149,3 +149,76 @@ if self.api_mode == "auto":
 2. **`ref_file_ids`**：直发通道目前不传附件（老链路也没有附件能力，属同一水平）。
 3. **`thinking_enabled` / `search_enabled`**：默认 false，可用
    `driver.api_thinking = True` / `driver.api_search = True` 打开。
+
+---
+
+## 八、v9.22 现状：直发已被官方加固，**默认关闭**
+
+真机核对（2026-10-31，内嵌 QtWebEngine / Chrome 134，已登录账号）结论：
+**这条接口直发通道在当前 DeepSeek 网页版本上 100% 不可用**，因此 v9.22 起
+`WebDriver.api_mode` 的**默认值改为 `off`**，主链路回到「驱动真实界面点击」。
+
+### 8.1 实测现象
+
+| 请求构造 | 服务端响应 |
+|---|---|
+| `authorization` + `x-ds-pow-response` | HTTP 200，**纯 JSON** `{"code":40300,"msg":"MISSING_HEADER"}` |
+| 再补齐 `x-client-bundle-id/-platform/-version/-locale/-timezone-offset`、`x-device-id/-model` | HTTP 200，**纯 JSON** `{"code":40301,"msg":"INVALID_POW_RESPONSE"}` |
+| 再补 `x-hif-dliq` / `x-hif-leim`（腾讯防水墙 token） | 仍是 `40301 INVALID_POW_RESPONSE` |
+
+注意：加固后**不再回 SSE**，而是回一行纯 JSON。老解析器只认 `data:` 前缀行，
+会把这一行整个跳过 → 表现为"2.9 秒后没拿到任何正文"再默默降级 → 用户只看到
+60 秒超时。v9.22 已在读取器里识别这种"非 SSE 的 JSON 拒绝"，立刻抛
+`api-blocked-<code>:<msg>`，秒级降级。
+
+### 8.2 40301 不是 PoW 算错了
+
+用 Python `hashlib.sha3_256` 对页面算出的 nonce 做独立复算：
+
+- `salt` / `expireAt` / `nonce` 拼接格式正确；
+- `difficulty = 144000` 正常下发；
+- `sha3_256(salt_expireAt_nonce) < 2^256 / difficulty` 成立；
+- 且该 nonce 是**最小解**（小于它的候选都不满足阈值）。
+
+所以拒绝来自服务端的**额外绑定校验**（challenge 与设备指纹 / 会话绑定，
+前端用 `static/sha3_wasm_bg.*.wasm` 生成 + 防水墙 token），不是算法或盐值变更。
+要修必须逆向 wasm 与防水墙，成本远超收益 —— **放弃直发，保留点击链路**。
+
+### 8.3 为什么默认关闭（而不是留着"试一下再降级"）
+
+直发是「**先建会话，再发**」：`/api/v0/chat_session/create` 成功后才发 completion。
+既然 completion 必然 40301，每次进程启动的第一条消息都会在用户 DeepSeek
+侧边栏留下一个空会话（`is_empty: true, title: null`）—— 这是**污染用户账号数据**，
+比"省 2.9 秒"重要得多。
+
+开关：
+
+| `AWB_DSW_API` | 行为 |
+|---|---|
+| 不设 / `off` / `0` / `false` | **默认**：完全不走直发，直接点击链路 |
+| `auto` / `on` / `1` / `true` / `yes` | 先试直发，失败永久降级（供以后复测） |
+
+### 8.4 主链路可用性（真机 E2E）
+
+`WebDriver.submit("只回复两个字：好的")` 在已登录的内嵌宿主上
+**8.7 秒返回「好的」**，无 10053、无 60 秒干等。点击链路本来就不经过直发，
+所以「默认 `off`」不影响正常使用。
+
+### 8.5 一并修掉的 CDP 根因：本地调试口被系统代理劫持
+
+用户报"网页版根本不能用"的真凶不在 DeepSeek，而在**本机 `http_proxy`**：
+`urllib` 与 `websocket-client` 默认都读该环境变量，于是
+`ws://127.0.0.1:<调试端口>/devtools/...` 被塞进代理隧道，代理一断流就是
+`[WinError 10053]`，每 2.5 秒一条，所有 CDP 命令全废。
+
+修复：`cdp_client.local_urlopen()` 用空 `ProxyHandler` 访问本地调试口；
+`websocket.create_connection(..., http_no_proxy=["127.0.0.1", ...])`。
+另外 `CDPClient` 新增 `_dead` 标记（`.connected` 在对端 abort 后仍为 True，
+不能作为存活依据）与 `ping()`，并让 `service` 在连接确实已死时自动重连 / 重建宿主。
+
+### 8.6 回归
+
+| 探针 | 结果 |
+|---|---|
+| `tests/probe_ds_api_path_v919.py` | **40/40**（含"默认 off"与"显式 auto 能力不变"两条） |
+| `tests/probe_ratelimit_v920.py` | **67/67**（含默认 off 断言，限流不降级能力保持不变） |

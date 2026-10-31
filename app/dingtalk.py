@@ -33,6 +33,9 @@ from . import winproc as _winproc  # noqa: E402
 IS_WIN = sys.platform.startswith("win")
 UA = "AIWorkbench/9.0"
 TIMEOUT = 15
+# dws（node 子进程）默认超时。状态/会话列表这类查询命令给 20s 足够；
+# 发文件/大消息单独传更大的 timeout（见 dws_send_file 的 300s）。
+DWS_TIMEOUT = 20
 
 # 自定义机器人限流：每分钟最多 20 条
 _RATE_LIMIT = 20
@@ -992,9 +995,17 @@ class DingTalkClient:
         node, dws = find_dws()
         return bool(dws)
 
-    def _run_dws(self, args, timeout=60, want_json=True, cwd=None):
+    def _run_dws(self, args, timeout=DWS_TIMEOUT, want_json=True, cwd=None):
         """统一跑 dws 命令。want_json=True 时解析并返回 Python 对象。cwd 用于
-        发文件等场景（dws 的 --file 只接受其工作目录内的相对路径）。"""
+        发文件等场景（dws 的 --file 只接受其工作目录内的相对路径）。
+
+        ★ v9.21.3 关键修复：不再用 ``subprocess.run(...)``。Windows 下 dws
+        （node 再 spawn 出的 cmd/浏览器辅助进程）一旦死等，``subprocess.run``
+        超时后杀掉的只是直接子进程，随后它还会再 ``communicate()`` 去排空管道——
+        只要有个孙进程还占着 stdout 管道，这一步就会**永久阻塞**，表现就是
+        「自动检测一直卡住」。这里改成：手动 Popen + 有界读线程 + 超时 kill 整棵
+        进程树，保证一定在 timeout 内返回（要么成功，要么抛 DingTalkError）。
+        """
         node, dws = find_dws()
         if not dws:
             raise DingTalkError(
@@ -1003,32 +1014,81 @@ class DingTalkClient:
                 "若你本机装了 WorkBuddy 可直接用。也可手动安装："
                 "npm i -g dingtalk-workspace-cli")
         cmd = ([node, dws] if node else [dws]) + list(args)
-        kw = dict(capture_output=True, text=True, encoding="utf-8",
-                  errors="ignore", timeout=timeout,
+        kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  text=True, encoding="utf-8", errors="ignore",
                   stdin=subprocess.DEVNULL)   # 见下方说明：绝不让子进程死等 stdin
         if cwd:
             kw["cwd"] = cwd
         try:
-            p = _winproc.run(cmd, **kw)
+            p = _winproc.popen(cmd, **kw)
         except FileNotFoundError as e:
             raise DingTalkError(f"执行 dws 失败：{e}")
-        out = p.stdout or ""
+        except OSError as e:
+            raise DingTalkError(f"执行 dws 失败：{type(e).__name__}: {e}")
+
+        out_chunks = []
+        err_chunks = []
+
+        def _reader(fh, sink):
+            try:
+                while True:
+                    chunk = fh.read(8192)
+                    if not chunk:
+                        break
+                    sink.append(chunk)
+            except Exception:
+                pass
+
+        t1 = threading.Thread(target=_reader, args=(p.stdout, out_chunks), daemon=True)
+        t2 = threading.Thread(target=_reader, args=(p.stderr, err_chunks), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout)
+        t2.join(timeout)
+
+        # 判定「超时」只看读线程是否还没读完（管道没 EOF = 子进程还没收尾）。
+        # 不能看 p.poll()：Windows 下子进程打印完、管道已 EOF 后可能还在做
+        # 退出收尾，poll() 仍可能短暂返回 None，误判成超时会杀掉已完成的进程。
+        timed_out = t1.is_alive() or t2.is_alive()
+        if not timed_out:
+            try:
+                p.wait(timeout=5)   # 管道已 EOF，进程应马上收尾；留宽限防极慢退出
+            except Exception:
+                timed_out = True
+        if timed_out:
+            # 杀掉整棵进程树（node + 它 spawn 的 cmd/浏览器辅助进程），
+            # 并直接关闭本端管道，绝不再 communicate()，避免二次阻塞。
+            _winproc.kill_tree(p)
+            for stream in (p.stdout, p.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+            raise DingTalkError(
+                "dws 执行超时（>%ss），已强制结束进程：%s"
+                % (timeout, " ".join(map(str, args[:4]))))
+
+        out = "".join(out_chunks)
+        err = "".join(err_chunks)
         if want_json and "--format" in args:
             try:
                 return json.loads(_extract_json(out))
             except Exception:
                 if p.returncode != 0:
-                    raise DingTalkError("dws 返回：" + (out or p.stderr)[:400])
+                    raise DingTalkError("dws 返回：" + (out or err)[:400])
                 raise DingTalkError("无法解析 dws 输出：" + out[:400])
         if p.returncode != 0 and not out.strip():
-            raise DingTalkError("dws 报错：" + (p.stderr or "")[:400])
+            raise DingTalkError("dws 报错：" + (err or "")[:400])
         return out
 
-    def dws_auth_status(self, force=False):
+    def dws_auth_status(self, force=False, timeout=DWS_TIMEOUT):
         """返回 dws 登录状态 dict：含 authenticated / user_name / corp_name。
 
         ★ v9.21.2：结果带 30s TTL 缓存。dws 状态是子进程调用（≈1.1s/次），
         启动时连调多次会拖慢约 3s；`force=True` 或缓存过期才真正跑子进程。
+        ★ v9.21.3：dws 子进程带强制超时；超时/失败一律返回
+        ``{"authenticated": False, "error": ...}``，绝不抛异常、绝不卡调用方。
         """
         import time as _time
         now = _time.time()
@@ -1036,17 +1096,72 @@ class DingTalkClient:
                 and now - self._dws_status_ts < 30.0):
             return self._dws_status_cache
         try:
-            st = self._run_dws(["auth", "status", "--format", "json"])
-        except DingTalkError:
-            st = {"authenticated": False, "error": "dws 不可调用"}
+            st = self._run_dws(["auth", "status", "--format", "json"], timeout=timeout)
+            if not isinstance(st, dict):
+                st = {"authenticated": False, "error": "dws 返回格式异常", "raw": st}
+        except Exception as e:
+            st = {"authenticated": False, "error": "dws 不可调用：" + str(e)[:200]}
         self._dws_status_cache = st
         self._dws_status_ts = now
         return st
 
-    def dws_login_start(self, device=False, on_line=None):
+    def dws_auth_status_async(self, callback, force=False, timeout=DWS_TIMEOUT):
+        """后台线程查 dws 登录状态，结果经 ``callback(st)`` 回调，不阻塞调用线程。
+
+        GUI 的「自动检测/一键配置」应优先用本方法（或 :meth:`self_test_async`），
+        避免把 dws 子进程的等待压到 UI 线程上。
+        """
+        import threading
+
+        def _run():
+            try:
+                st = self.dws_auth_status(force=force, timeout=timeout)
+            except Exception as e:
+                st = {"authenticated": False, "error": str(e)[:200]}
+            try:
+                callback(st)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t
+
+    def self_test_async(self, on_done, on_error=None):
+        """后台线程跑 :meth:`self_test`（含 dws 子进程，带超时兜底），不阻塞 UI。
+
+        ``on_done(items)``：无论成败都回调，items = [(项目, ok, 说明)]。
+        ``on_error(e)``：可选，仅在 self_test 整体抛异常时额外回调。
+        """
+        import threading
+
+        def _run():
+            items = None
+            try:
+                items = self.self_test()
+            except Exception as e:
+                if on_error:
+                    try:
+                        on_error(e)
+                    except Exception:
+                        pass
+                items = [("自检异常", False, "%s: %s" % (type(e).__name__, e))]
+            try:
+                on_done(items)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t
+
+    def dws_login_start(self, device=False, on_line=None, max_seconds=600):
         """后台启动 dws 授权登录（浏览器或设备流），把输出实时回调给 GUI。
 
         返回 subprocess.Popen 对象（登录完成后进程会自动退出）。
+        ``max_seconds``：看门狗兜底时间（默认 600s）。扫码登录本来就可能要等
+        用户操作，所以不能像状态查询那样几秒就杀；但若用户始终不扫码、进程
+        一直挂着，看门狗会杀掉整棵进程树，避免留下孤儿进程。
         """
         node, dws = find_dws()
         if not dws:
@@ -1072,7 +1187,21 @@ class DingTalkClient:
             except Exception:
                 pass
 
+        def _watchdog():
+            try:
+                p.wait(timeout=max_seconds)
+            except Exception:
+                # 超时：用户一直没完成授权 → 杀掉整棵进程树，别留孤儿进程
+                _winproc.kill_tree(p)
+                try:
+                    if on_line:
+                        on_line("授权登录超时（>%ss），已自动结束，请重试。"
+                                % int(max_seconds))
+                except Exception:
+                    pass
+
         threading.Thread(target=_reader, daemon=True).start()
+        threading.Thread(target=_watchdog, daemon=True).start()
         return p
 
     def dws_list_conversations(self, n=10):

@@ -22,7 +22,7 @@ import urllib.request
 from .. import config
 from .. import winproc
 from . import errors
-from .cdp_client import CDPClient
+from .cdp_client import CDPClient, local_urlopen
 from .local_server import LocalServer
 from .web_driver import WebDriver
 
@@ -105,6 +105,9 @@ class DeepSeekWebService:
         self._last_detail = ""
         self._poll_thread = None
         self._poll_stop = threading.Event()
+        # ★ v9.22：CDP 连接自动恢复（渲染进程崩溃 / 调试端口上游断开 / 10053）
+        self._recover_at = 0.0
+        self._recover_tries = 0
 
     # ---------- 宿主引擎选择 ----------
     @staticmethod
@@ -234,7 +237,92 @@ class DeepSeekWebService:
             kind, detail = drv.probe_state()
         except Exception as exc:
             kind, detail = errors.WebErrorKind.OTHER, str(exc)
+
+        # ★ v9.22：CDP 连接已死（内嵌渲染进程崩溃 / 调试端口上游断开 / WinError 10053）
+        #   时**自动恢复**。以前这里只会每 2.5 秒刷一条 warn、状态永久卡在"未启动"，
+        #   用户必须手动点「重试」—— 这正是"网页版根本不能用"的直接原因。
+        if kind == errors.WebErrorKind.NOT_STARTED and self._try_self_heal():
+            drv = self._driver
+            if drv is None:
+                return
+            try:
+                kind, detail = drv.probe_state()
+            except Exception as exc:
+                kind, detail = errors.WebErrorKind.OTHER, str(exc)
+
+        if kind in (errors.WebErrorKind.READY, errors.WebErrorKind.GENERATING):
+            self._recover_tries = 0
         self._set_state(kind, detail)
+
+    # ---------- CDP 自动恢复（v9.22）----------
+    #: 两次自动恢复之间的冷却（秒）与总次数上限，避免渲染进程反复崩溃时"狂重启"。
+    RECOVER_COOLDOWN = 15.0
+    RECOVER_MAX_TRIES = 4
+
+    def _try_self_heal(self):
+        """CDP 已死时尝试自动重连 / 重建宿主；返回 True 表示"已发起恢复"。"""
+        now = time.time()
+        if now < self._recover_at:
+            return False
+        if self._recover_tries >= self.RECOVER_MAX_TRIES:
+            self._set_state(
+                errors.WebErrorKind.OTHER,
+                "网页调试连接反复断开，自动恢复已停止。请点「重试」重新连接，"
+                "或改用 API 模型（DeepSeek 网页版当前不可用）。")
+            self._recover_at = now + 60.0
+            return False
+        alive = False
+        try:
+            alive = bool(self._driver and self._driver.cdp
+                         and self._driver.cdp.is_alive())
+        except Exception:
+            alive = False
+        if alive:
+            # ws 还活着，只是页面没就绪 —— 交给 probe_state 的正常判定，不重启
+            return False
+
+        self._recover_at = now + self.RECOVER_COOLDOWN
+        self._recover_tries += 1
+        port_ok = self._port_online()
+        self.log("warn", f"网页调试连接已断开（调试端口"
+                         f"{'在线' if port_ok else '上游已断开'}），自动恢复第 "
+                         f"{self._recover_tries}/{self.RECOVER_MAX_TRIES} 次")
+        self._set_state(errors.WebErrorKind.NOT_STARTED,
+                        "网页调试连接已断开，正在自动恢复…")
+        try:
+            if self._driver is not None:
+                try:
+                    self._driver.close()
+                except Exception:
+                    pass
+            self._driver = None
+            if self._engine == ENGINE_EMBEDDED:
+                if not port_ok:
+                    # DevTools 上游已死（渲染进程崩溃）：整只内嵌宿主重建
+                    self._stop_embedded()
+                    self._start_embedded()
+                elif self._embedded is not None and self._embedded.running:
+                    self._driver = self._embedded.attach()
+                    self._driver.embedded = True
+                else:
+                    self._start_embedded()
+            else:
+                if port_ok:
+                    self._connect()
+                elif self._find_browser():
+                    self._start_chrome(self._find_browser(), self._port)
+                    self._wait_port(self._port, wait=15.0)
+                    if self._port_online():
+                        self._connect()
+            self.log("info", "网页调试连接已自动恢复")
+        except Exception as exc:
+            self.log("warn", f"自动恢复失败（{type(exc).__name__}）：{exc}")
+            self._driver = None
+            self._set_state(
+                errors.WebErrorKind.NOT_STARTED,
+                "网页调试连接已断开，自动恢复失败。请点「重试」重新连接，"
+                "或改用 API 模型。")
+        return True
 
     # ---------- 浏览器 ----------
     def _find_browser(self):
@@ -246,8 +334,11 @@ class DeepSeekWebService:
     def _port_online(self, port=None, timeout=1.5):
         port = int(port or self._port)
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version",
-                                        timeout=timeout) as resp:
+            # ★ v9.22：走 local_urlopen 绕过系统代理；否则 http_proxy 会把
+            #   127.0.0.1:9333 转到远端节点 -> 永远返回"端口不通"，
+            #   状态就一直卡在"网页没启动"，用户怎么点重试都没用。
+            with local_urlopen(f"http://127.0.0.1:{port}/json/version",
+                               timeout=timeout) as resp:
                 return len(resp.read()) > 0
         except Exception:
             return False
@@ -846,6 +937,9 @@ class DeepSeekWebService:
 
     def reset(self):
         """「重试」：重连 CDP / 重载网页（**不重发**历史提问）。"""
+        # 用户手动重试 = 重新给自动恢复计数清零
+        self._recover_at = 0.0
+        self._recover_tries = 0
         if self._engine == ENGINE_EMBEDDED:
             self._reset_embedded()
             return

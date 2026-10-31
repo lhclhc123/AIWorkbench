@@ -202,8 +202,21 @@ def pick_asset(info, prefer=(".zip", ".exe")):
     return assets[0] if assets else None
 
 
-def download(url, dest, progress=None, timeout=30):
-    """下载更新包（多通道测速 + 镜像加速 + 断点续传）。"""
+def download(url, dest, progress=None, timeout=30, on_stage=None):
+    """下载更新包（多通道测速 + 镜像加速 + 断点续传 + 阶段提示）。
+
+    ``progress(done, total)``：下载字节进度回调（与旧版一致，向后兼容）。
+    ``on_stage(stage, detail)``：可选阶段回调，stage ∈
+        ``{"probing", "downloading", "downloaded"}``，用于 GUI 显示阶段提示。
+    """
+    def _stage(stage, detail=""):
+        try:
+            if on_stage:
+                on_stage(stage, detail)
+        except Exception:
+            pass
+
+    _stage("probing", "正在测速选择最快通道…")
     # ★ v9.19：GitHub Release 直连实测被限速到 ~24KB/s，镜像可快几十倍；
     #   先走 downloader 选最快通道，失败再落回下面的直连兜底。
     try:
@@ -212,17 +225,20 @@ def download(url, dest, progress=None, timeout=30):
         _dl = None
     if _dl is not None:
         try:
-            best, _lat = _dl.pick_fastest(url, timeout=min(6, timeout))
+            best, _stats = _dl.pick_fastest(url, timeout=min(6, timeout))
+            _stage("downloading", "正在下载（通道：%s）…" % _dl.describe_channel(best))
             _dl.download(url, dest, progress=progress,
                          timeout=(10, timeout), prefer=best)
+            _stage("downloaded", "下载完成")
             return dest
         except Exception:
-            pass
+            _stage("downloading", "加速通道失败，回退直连下载…")
     try:
         import requests
     except ImportError:
         requests = None
     if requests is not None:
+        _stage("downloading", "正在下载（直连）…")
         with requests.get(url, headers={"User-Agent": UA}, timeout=timeout,
                           stream=True, allow_redirects=True) as resp:
             resp.raise_for_status()
@@ -236,6 +252,7 @@ def download(url, dest, progress=None, timeout=30):
                     done += len(chunk)
                     if progress:
                         progress(done, total)
+        _stage("downloaded", "下载完成")
         return dest
     status, _final, _text = _req(url, timeout=timeout)
     if status >= 400:
@@ -254,7 +271,112 @@ def download(url, dest, progress=None, timeout=30):
                 done += len(chunk)
                 if progress:
                     progress(done, total)
+    _stage("downloaded", "下载完成")
     return dest
+
+
+def install_package(zip_path, app_dir=None, progress=None, on_stage=None,
+                    restart_exe="AIWorkbench.exe", dry_run=False):
+    """把下载好的更新包解压、覆盖安装目录并安排本程序退出后重启。
+
+    这就是「安装进度条/提示」的落点：GUI 下载完成后调本函数即可拿到
+    解压/覆盖/重启三个阶段的可视化回调，无需自己写 zipfile + PowerShell。
+
+    ``progress(done, total)``：解压字节进度回调（近似，total 为包内总字节）。
+    ``on_stage(stage, detail)``：阶段回调，stage ∈
+        ``{"extracting", "installing", "restarting", "done"}``。
+    ``dry_run=True``：只解压并定位 exe，不真正覆盖/重启（供自测）。
+
+    返回 dict：``{"ok": True, "src": 解压根目录, "app_dir": 安装目录,
+    "exe": 目标exe, "restarted": bool}``。
+    """
+    import base64
+    import os
+    import sys
+    import tempfile
+    import time as _time
+    import zipfile as _zf
+
+    def _stage(stage, detail=""):
+        try:
+            if on_stage:
+                on_stage(stage, detail)
+        except Exception:
+            pass
+
+    def _prog(done, total):
+        try:
+            if progress:
+                progress(done, total)
+        except Exception:
+            pass
+
+    zip_path = os.path.abspath(str(zip_path or ""))
+    if not os.path.isfile(zip_path):
+        raise RuntimeError("更新包不存在：" + zip_path)
+
+    if app_dir is None:
+        # frozen：本 exe 所在目录；开发态：仓库根目录
+        app_dir = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                   else os.path.dirname(os.path.dirname(os.path.dirname(
+                       os.path.abspath(__file__)))))
+    app_dir = os.path.abspath(app_dir)
+
+    tmp_root = os.path.join(tempfile.gettempdir(),
+                            "AIWorkbench_upd_%d" % int(_time.time()))
+    _stage("extracting", "正在解压更新包…")
+    with _zf.ZipFile(zip_path) as z:
+        infos = z.infolist()
+        total = sum(i.file_size for i in infos) or 1
+        done = 0
+        for info in infos:
+            z.extract(info, tmp_root)
+            done += info.file_size
+            _prog(done, total)
+
+    # 在解压结果里找「直接装着 restart_exe 的那一层」
+    target = restart_exe.lower()
+    src = None
+    for root, _dirs, files in os.walk(tmp_root):
+        if any(f.lower() == target for f in files):
+            src = root
+            break
+    if not src:
+        raise RuntimeError("压缩包里没找到 %s，无法自动安装" % restart_exe)
+
+    _stage("installing", "正在覆盖文件并准备重启…")
+    if dry_run:
+        return {"ok": True, "src": src, "app_dir": app_dir,
+                "exe": os.path.join(app_dir, restart_exe), "restarted": False}
+
+    # 用 -EncodedCommand（UTF-16LE base64）传脚本，彻底避开中文路径在
+    # bat/ps1 文件里的编码坑。本程序退出后由 PowerShell 覆盖安装并重启。
+    src_q = src.replace("'", "''")
+    dst_q = app_dir.replace("'", "''")
+    exe_q = os.path.join(app_dir, restart_exe).replace("'", "''")
+    ps = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "Start-Sleep -Seconds 2\n"
+        "$ok = $false\n"
+        "for ($i = 0; $i -lt 40; $i++) {\n"
+        f"  try {{ Copy-Item -Path '{src_q}\\*' -Destination '{dst_q}' -Recurse -Force\n"
+        "      $ok = $true; break }\n"
+        "  catch { Start-Sleep -Milliseconds 500 }\n"
+        "}\n"
+        "if ($ok) {\n"
+        "  Start-Sleep -Milliseconds 800\n"
+        f"  Start-Process -FilePath '{exe_q}'\n"
+        "}\n"
+        f"Remove-Item -LiteralPath '{tmp_root}' -Recurse -Force -ErrorAction SilentlyContinue\n"
+        f"Remove-Item -LiteralPath '{zip_path}' -Force -ErrorAction SilentlyContinue\n"
+    )
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    from . import winproc
+    winproc.popen(["powershell", "-NoProfile", "-EncodedCommand", encoded],
+                  creationflags=0x08000000)
+    _stage("restarting", "已安排重启（本程序即将退出）")
+    return {"ok": True, "src": src, "app_dir": app_dir,
+            "exe": os.path.join(app_dir, restart_exe), "restarted": True}
 
 def format_notes(notes, limit=1200):
     n = (notes or "").strip()

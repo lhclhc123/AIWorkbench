@@ -892,10 +892,14 @@ class ChatWorker(QThread):
                                                   "content": agent_mod.PART_NUDGE_HINT})
                         continue
                     # H) 计划还有步骤没标完成 -> 催它收尾，别让进度条停在半路（最多 1 次）
+                    # ★ v9.22.0：必须过「用户本轮真的派了活」这道闸——
+                    #   否则用户误触一句「1」、或模型自己顺手 update_plan，
+                    #   都会把**上一轮遗留**的计划翻出来重做一遍（误发钉钉事故同源）。
                     pending_steps = [s for s in (self.plan.get("steps") or [])
                                      if s.get("status") != "done"]
                     if (plan_done_nudges < 1 and tool_done > 0
-                            and "update_plan" in tools_used and pending_steps):
+                            and "update_plan" in tools_used and pending_steps
+                            and agent_mod.should_nudge_pending_plan(last_user, tools_used)):
                         plan_done_nudges += 1
                         self.api_messages.append({"role": "assistant", "content": text})
                         self.api_messages.append(

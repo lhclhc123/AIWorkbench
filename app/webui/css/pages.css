@@ -35,8 +35,8 @@
   color:var(--accent);
   font-weight:600;
 }
-/* 「对话」占整行 */
-.nav-chip.nav-chat{flex-basis:100%;height:36px;font-size:13px;}
+/* 注：不再有「对话」整行大按钮（nav-chat 已从导航区移除），
+   切换回对话页由「点左侧对话列表项」直达完成。 */
 
 /* ============ 页面容器 ============ */
 .page{

@@ -26,10 +26,49 @@ class CDPError(RuntimeError):
     """CDP 通道异常（连接、收发、脚本执行）。"""
 
 
-def _http_json(url, timeout=3.0, method="GET"):
-    """向 CDP 的 HTTP 发现口发一个请求并解析 JSON。"""
+# ---------------------------------------------------------------------------
+# ★ v9.22 根因修复：本地调试口**绝不能**走系统 HTTP 代理
+#
+# 真机踩坑（用户报"网页版根本不能用"）：机器上设了 `http_proxy=http://127.0.0.1:3033`
+# （Clash / V2Ray 之类的本地代理，国内极常见），于是：
+#   ① `urllib.request.urlopen("http://127.0.0.1:9333/json")` 默认**读环境变量**，
+#      把本地调试口塞进代理隧道；代理若按规则把 127.0.0.1 转到远端节点，
+#      远端节点的 9333 当然是关的 -> `HTTP 502 upstream connect failed (os error 10061)`；
+#   ② `websocket-client` 的 `create_connection()` 同样默认读 `http_proxy`
+#      （`get_proxy_info()` 里 `os.environ.get("http_proxy")`），
+#      对 `ws://127.0.0.1:9333/devtools/page/...` 先向代理发 CONNECT。
+#      代理一断流，就是 `[WinError 10053] 你的主机中的软件中止了一个已建立的连接`
+#      —— 日志里每 2.5 秒刷一条、所有 CDP 命令全废，用户看到的就是"根本不能用"。
+#
+# 结论：CDP 只可能在本机，必须显式禁用代理（既不看 env，也不看系统代理设置）。
+# ---------------------------------------------------------------------------
+
+#: 空的 ProxyHandler = 完全不使用任何代理（含环境变量与注册表设置）。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+#: 建立 DevTools WebSocket 时显式声明"这些主机不走代理"。
+#: websocket-client 的 `http_no_proxy` 参数会交给 `_is_no_proxy_host()` 判定。
+LOCAL_NO_PROXY = ["127.0.0.1", "localhost", "::1", "0.0.0.0"]
+
+
+def local_urlopen(url, timeout=3.0, method="GET"):
+    """访问**本机** HTTP 接口（CDP 调试口），强制绕过系统 / 环境代理。
+
+    Args:
+        url: 必须是 `http://127.0.0.1:<port>/...` 这类本地地址。
+        timeout: 超时（秒）。
+        method: HTTP 方法（Chrome 新建标签页要用 PUT）。
+
+    Returns:
+        `http.client.HTTPResponse`（调用方负责 with/close）。
+    """
     req = urllib.request.Request(url, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    return _LOCAL_OPENER.open(req, timeout=float(timeout))
+
+
+def _http_json(url, timeout=3.0, method="GET"):
+    """向 CDP 的 HTTP 发现口发一个请求并解析 JSON（绕过代理）。"""
+    with local_urlopen(url, timeout=timeout, method=method) as resp:
         body = resp.read().decode("utf-8", "replace")
     if not body:
         return None
@@ -49,6 +88,12 @@ class CDPClient:
         self._id = 0
         self._lock = threading.RLock()
         self._timeout = float(timeout or 25.0)
+        # ★ v9.22：websocket-client 的 `.connected` 在底层 TCP 已被对端 abort 时
+        #   仍可能保持 True（WinError 10053 就是这种：发得出去但连接早断了）。
+        #   所以自己维护一个"确定已死"的标记：任何一次 send/recv 失败都置位，
+        #   is_alive() 据此返回 False，让上层能立刻察觉并重连 ——
+        #   否则会一直以为"就绪"，每条命令都撞 10053，用户看到的就是"根本不能用"。
+        self._dead = False
 
     # ---------- 建立连接 ----------
     @classmethod
@@ -83,7 +128,13 @@ class CDPClient:
         if not ws_url:
             raise CDPError("页面缺少 webSocketDebuggerUrl（无法建立调试连接）")
         try:
-            ws = websocket.create_connection(ws_url, timeout=float(timeout))
+            # ★ v9.22：显式 http_no_proxy —— 否则 websocket-client 会把
+            #   ws://127.0.0.1:<port> 也塞进 http_proxy 隧道（见文件头注释）。
+            try:
+                ws = websocket.create_connection(
+                    ws_url, timeout=float(timeout), http_no_proxy=list(LOCAL_NO_PROXY))
+            except TypeError:  # pragma: no cover - 老版本 websocket-client 不认该参数
+                ws = websocket.create_connection(ws_url, timeout=float(timeout))
         except Exception as exc:  # pragma: no cover - 依赖真实浏览器
             raise CDPError(f"无法连接调试端口 {port}：{exc}")
         return cls(ws, timeout=timeout)
@@ -127,6 +178,7 @@ class CDPClient:
             try:
                 self._ws.send(payload)
             except Exception as exc:
+                self._dead = True
                 raise CDPError(f"发送 CDP 命令失败：{exc}")
             return mid
 
@@ -138,6 +190,7 @@ class CDPClient:
             try:
                 self._ws.send(payload)
             except Exception as exc:
+                self._dead = True
                 raise CDPError(f"发送 CDP 命令失败：{exc}")
             deadline = time.time() + (timeout if timeout is not None else self._timeout)
             while True:
@@ -151,6 +204,7 @@ class CDPClient:
                 try:
                     raw = self._ws.recv()
                 except Exception as exc:
+                    self._dead = True
                     raise CDPError(f"CDP 接收失败：{exc}")
                 if raw is None:
                     continue
@@ -201,10 +255,29 @@ class CDPClient:
                 pass
 
     def is_alive(self):
-        """WS 是否仍然连着。"""
+        """WS 是否仍然可用（已确认死亡 / 底层连接断开都返回 False）。"""
+        if self._dead:
+            return False
         try:
             return bool(getattr(self._ws, "connected", True))
         except Exception:
+            return False
+
+    def ping(self, timeout=3.0):
+        """轻量探活：发一条最短的 Runtime.evaluate 看是否还能收到回包。
+
+        `.connected` 不可靠（对端 abort 后仍可能为 True），所以这里真的发一条命令：
+        失败即置 `_dead`，供 status / 自愈逻辑立刻察觉。
+        """
+        if self._dead:
+            return False
+        try:
+            self.call("Runtime.evaluate",
+                      {"expression": "1", "returnByValue": True, "awaitPromise": False},
+                      timeout=timeout)
+            return True
+        except Exception:
+            self._dead = True
             return False
 
     def close(self):

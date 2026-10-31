@@ -20,6 +20,7 @@ class WebErrorKind(Enum):
     GENERATING = "generating"            # 网页正在生成
     TIMEOUT = "timeout"                  # 等待网页返回超时（不重发）
     SERVER_ERROR = "server_error"        # 网页自身报错（服务器暂时不可用/已停止）
+    API_BLOCKED = "api_blocked"          # DeepSeek 官方加固了网页接口，直发被拒绝
     PAGE_CHANGED = "page_changed"        # 网页改版，选择器失效
     DUPLICATE = "duplicate"              # 检测到重复请求，已阻止重发
     BUSY = "busy"                        # 通道忙（串行队列）
@@ -51,6 +52,9 @@ WEB_ERROR_TEXT = {
     WebErrorKind.SERVER_ERROR:
         "DeepSeek 网页自己报了服务器错误（如「服务器暂时不可用 / 服务已停止」）。"
         "这不是你账号的问题，程序也不会重复发送。请稍后到网页里刷新一下，再点「重试」。",
+    WebErrorKind.API_BLOCKED:
+        "DeepSeek 网页版接口被官方加固（校验未通过），已自动改用「驱动真实界面」的方式。\n"
+        "若仍失败，请换用 API 模型（如 GLM-4.7-Flash）。",
     WebErrorKind.PAGE_CHANGED:
         "网页结构可能已变，该功能暂不可用，已记录问题。"
         "请稍后升级程序版本后再试。",
@@ -74,6 +78,7 @@ WEB_STATE_LABEL = {
     WebErrorKind.GENERATING: "网页正在生成…",
     WebErrorKind.TIMEOUT: "等待超时",
     WebErrorKind.SERVER_ERROR: "网页服务器暂不可用",
+    WebErrorKind.API_BLOCKED: "网页接口已被官方加固",
     WebErrorKind.PAGE_CHANGED: "网页可能已改版",
     WebErrorKind.DUPLICATE: "已阻止重复发送",
     WebErrorKind.BUSY: "正在忙于上一条",

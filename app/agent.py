@@ -1067,6 +1067,123 @@ def looks_like_giveup(text):
     return any(p in t for p in _GIVEUP_PHRASES)
 
 
+# ---------- ★ v9.22.0：误触/寒暄输入 + 澄清工具 ≠ "这轮在派活/在干活" ----------
+# 真实事故：用户发「1」→ AI 调 ask_user 问"你是什么意思" → 用户回「误触了，
+# 忽略这条」→ AI 在 thinking 里明说"不该去做钉钉任务"，但系统级催办压过了
+# 用户指令，AI 还是把之前遗留的「打包文件夹发钉钉」4 步计划硬跑完，真把
+# 10GB 压缩包发到了用户钉钉。所以：澄清工具不算"动手"，无意义/取消输入不算"派活"。
+
+# 澄清/询问类工具：只把问题抛回给用户，不产生任何实质动作。
+_CLARIFY_TOOLS = frozenset({
+    "ask_user",
+})
+
+# ★ v9.22.0 补漏：只读自省 / 计划记账类工具。它们**跑了也不代表用户派了活**。
+#   真实事故同款：用户误触发「1」→ 模型顺手调 list_tasks / read_worklog /
+#   update_plan，旧判据「除了 ask_user 就算实质工具」立刻认定"这轮在干活"，
+#   于是拿残留 plan 催办，把历史任务又做一遍。
+_BOOKKEEPING_TOOLS = frozenset({
+    "update_plan", "read_worklog", "write_worklog",
+    "list_tasks", "task_list", "get_task", "system_info",
+    "recall", "build_index",
+})
+
+# 「跑了也证明不了用户派活」的工具全集
+_NON_TASK_TOOLS = _CLARIFY_TOOLS | _BOOKKEEPING_TOOLS
+
+# 用户明确表示"这条不算 / 不要做了"的信号词。命中即取消意图：
+# 残留 plan 应当被冻结，看门狗绝不允许再拿它催办。
+_CANCEL_PHRASES = (
+    "误触", "手滑", "点错", "发错了", "打错了", "发错", "按错",
+    "忽略这条", "忽略上一条", "忽略它", "忽略该条", "这条忽略",
+    "忽略上面", "忽略刚才", "忽略之前",
+    "不用了", "不用做了", "不要了", "不做了", "算了", "取消",
+    "作废", "撤回", "别做了", "别管了", "停下", "终止",
+)
+
+# 纯寒暄 / 纯应付：没有实义动词，不代表任何任务。
+_GREETING_WORDS = frozenset({
+    "你好", "您好", "hi", "hello", "嗨", "哈喽", "在吗", "在不在",
+    "哦", "嗯", "好的", "好", "收到", "谢谢", "谢谢啦", "谢谢哈",
+    "辛苦", "ok", "okay", "行", "可以", "没问题", "哈哈", "嘿嘿",
+    "嗯嗯", "哦哦", "好滴", "好嘞", "棒", "厉害", "早", "晚上好",
+})
+
+# 去除后若什么都不剩，就是纯标点 / 纯空白，必然无意义。
+_MEANINGLESS_RE = re.compile(r"[\s，。！？!?,.、；;：:\"'“”‘’()（）\[\]【】~～…·\-—_]+")
+
+
+def _is_meaningless_input(user_text):
+    """这句话是不是没有实质内容（误触 / 寒暄 / 纯应付）。
+
+    「1」「111」「你好」「哦」这类输入不构成任何新请求，
+    绝不能触发"历史残留计划还没做完"的催办。
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return True
+    core = _MEANINGLESS_RE.sub("", t)
+    if not core:
+        return True
+    # 纯数字 = 误触（「1」「111」）
+    if core.isdigit():
+        return True
+    # 纯寒暄 / 纯应付（「你好」「哦」「嗯」「收到」）
+    if core.lower() in _GREETING_WORDS:
+        return True
+    # 去掉标点后只剩一个字，基本是应付，不构成请求
+    if len(core) < 2:
+        return True
+    return False
+
+
+def has_cancel_intent(user_text):
+    """用户是否明确说"这条不算 / 不要做了"（取消意图）。
+
+    命中的话，历史残留计划必须被冻结——上层可据此把 conv["plan"] 清空或
+    全部标 done，看门狗（completion_gaps）也绝不拿残留计划催办。
+    """
+    t = (user_text or "")
+    return any(p in t for p in _CANCEL_PHRASES)
+
+
+def _has_substantive_tools(tools_used):
+    """本轮是否真的动过"实质工具"。
+    排除 ask_user（只澄清）+ update_plan / list_tasks / read_worklog 这类
+    只读自省与记账工具——它们跑起来并不等于用户派了活。
+    """
+    return bool(set(tools_used or []) - _NON_TASK_TOOLS)
+
+
+def should_nudge_pending_plan(user_text, tools_used):
+    """残留 plan 该不该催办 —— **唯一判据**，看门狗与 chat_worker 共用。
+
+    成立条件：用户没有说"取消/误触"，且（本轮真派了活 或 真动过实质工具）。
+    不成立时残留计划一律冻结，绝不再拿它催办历史任务。
+    """
+    t = user_text or ""
+    if has_cancel_intent(t):
+        return False
+    return _has_real_request(t) or _has_substantive_tools(tools_used)
+
+
+def _has_real_request(user_text):
+    """本轮用户是否真的提出了一个明确的新请求（= 派活）。
+
+    用既有的「动作意图」探测器判断，而不是只要"非空、非无意义"就算——
+    否则「你是谁」「今天天气怎么样」这类纯提问/闲聊也会被当成派活，
+    重新触发 v9.18.0 已经修掉的"残留计划误催办"。
+    """
+    if not (user_text or "").strip():
+        return False
+    return (wants_real_action(user_text)
+            or needs_write_action(user_text)
+            or needs_read_action(user_text)
+            or needs_exe(user_text)
+            or needs_project_flow(user_text)
+            or needs_remember(user_text))
+
+
 def completion_gaps(user_text, tools_used, write_done, verified_after_write,
                     plan_steps, final_text):
     """系统级「到底做完没有」检查，返回还没做到的事（字符串列表）。
@@ -1105,13 +1222,18 @@ def completion_gaps(user_text, tools_used, write_done, verified_after_write,
     #   带进新一轮，于是用户只是问一句「你是谁」，也被判定成"这轮没做完"，
     #   看门狗（chat_worker.py:908-919）拿它当欠账催办，模型跑去补完历史任务
     #   （真实事故：助手自作主张去写完洛谷 P1576，刷出几十条工具调用）。
-    #   现在：只有**这一轮确实在干/用户确实在派活**时才报——
-    #     · tools_used 非空（模型这轮已经动手了），**或**
-    #     · needs_project_flow(t)（用户这句话是要开发一个成品），**或**
-    #     · count_requests(t) >= 1（用户这句话确实提出了具体请求）
-    #   纯聊天/身份类消息（「你是谁」）三者都为假 → 不产生这个 gap，不许催办。
+    #
+    # ★ v9.22.0 加固（根因 B，本次最高优先级）：v9.18.0 没修干净——
+    #   旧条件 `tools_used 非空` 太宽松：用户发「1」→ AI 调 ask_user 澄清，
+    #   tools_used 里有了 ask_user 就误判成"这轮在干活"，催办残留计划；
+    #   而 `count_requests(t) >= 1` 又**永远不会**为单条请求成立（count_requests
+    #   只在「一条消息提了 >=2 个要求」时返回 >=2），既误报又漏报。
+    #   现在催办残留 plan 必须满足**下面二者之一**：
+    #     · _has_real_request(t)：本轮用户真的派了活（排除「1」「你好」「哦」），**或**
+    #     · _has_substantive_tools(tools_used)：本轮真动了实质工具（排除 ask_user 澄清）。
+    #   且一旦用户明确「误触/忽略/不用了/取消」，绝不催办残留 plan（冻结）。
     pending = [s for s in (plan_steps or []) if s.get("status") != "done"]
-    if pending and (tools_used or needs_project_flow(t) or count_requests(t) >= 1):
+    if pending and should_nudge_pending_plan(t, tools_used):
         gaps.append(f"任务清单里还有 {len(pending)} 步没标完成："
                     + "、".join(str(s.get("text"))[:14] for s in pending[:4]))
 

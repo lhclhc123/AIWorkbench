@@ -609,12 +609,23 @@ class WebDriver:
         self._agent_ready = False
         # ★ v9.19.0：接口直发（在页面上下文里 fetch，不走点击/打字）。
         #   "auto" = 先试直发，失败就永久降级回点击链路（用户无感）；
-        #   "off"  = 强制老链路（排查用：AWB_DSW_API=off）。
-        self.api_mode = "off" if str(
-            os.environ.get("AWB_DSW_API", "auto")).lower() in ("off", "0", "false", "") else "auto"
+        #   "off"  = 强制老链路（AWB_DSW_API=off）。
+        #
+        # ★ v9.22：**默认改成 off**。真机实测（2026-10-31）DeepSeek 已对 completion
+        #   接口加校验：补齐 x-client-* / x-device-* 指纹头后仍返回
+        #   `40301 INVALID_POW_RESPONSE`（PoW 答案本地复算完全正确，拒绝来自服务端
+        #   额外绑定校验，需逆向 wasm + 防水墙 token 才能破）。直发 100% 不可用，
+        #   而且它是"先建会话再发"—— 每次启动的第一条消息都会在用户 DeepSeek
+        #   侧边栏留下一个空会话，属于污染用户数据。所以发布版默认关掉；
+        #   需要复测时显式设 `AWB_DSW_API=auto`（或 on/1/true）即可恢复原行为。
+        _api_env = str(os.environ.get("AWB_DSW_API", "off")).strip().lower()
+        self.api_mode = "auto" if _api_env in ("auto", "on", "1", "true", "yes") else "off"
         self._api = None                # api_path.ApiPath（懒建）
         self._api_session_id = ""       # 直发模式下复用的网页对话 id
         self._api_fail_note = ""        # 降级原因（给界面/日志看）
+        # ★ v9.22：直发被 DeepSeek 官方加固拦截（MISSING_HEADER / INVALID_POW_RESPONSE）。
+        #   置真后，若点击链路也失败，就把错误升级成 API_BLOCKED，给出"改用 API 模型"的明确出路。
+        self._api_blocked = False
         # ★ v9.18.0：宿主是进程内 QtWebEngine（内嵌浏览器）时为 True。
         #   内嵌宿主是"被遮挡即 hidden"（WA_DontShowOnScreen），但实测 CDP 的
         #   Input.insertText / Enter / 点击**照常生效**，所以只有 embedded 模式下
@@ -1109,6 +1120,22 @@ class WebDriver:
                         time.sleep(wait)
                         continue
                     raise self._rate_limited_error(exc)
+                # ★ v9.22：直发已被官方加固拦掉，点击链路也失败了 —— 说明网页通道这一轮
+                #   确实走不通。把含糊的底层错误升级成 API_BLOCKED：文案直接给出
+                #   "先点重试 / 改用 API 模型"这条可操作的出路，而不是"等待网页返回超时"。
+                #   只对"说不清原因"的失败（超时/页面变化/其他）升级；窗口隐藏、未启动、
+                #   重复发送这类**本身就有明确指引**的错误保持原样，避免掩盖真正原因。
+                if self._api_blocked and exc.kind in (
+                        errors.WebErrorKind.TIMEOUT,
+                        errors.WebErrorKind.PAGE_CHANGED,
+                        errors.WebErrorKind.OTHER):
+                    # 用户只看人话；原始错误码只进日志，绝不甩到界面上。
+                    self._logf("warn",
+                               f"网页通道彻底不可用：直发被拒（{self._api_fail_note}）；"
+                               f"点击链路失败（{exc.kind.value}: {str(exc)[:160]}）")
+                    raise WebDriverError(
+                        errors.WebErrorKind.API_BLOCKED,
+                        errors.humanize(errors.WebErrorKind.API_BLOCKED))
                 raise
             finally:
                 ratelimit.release()
@@ -1158,6 +1185,34 @@ class WebDriver:
         except Exception:
             pass
 
+    #: 判定"直发被官方请求校验拦截"的错误特征（真机实测 2026-10-31）。
+    #:
+    #: completion 端点在请求校验不通过时**不再回 SSE**，而是回一行纯 JSON，
+    #: 因此 api_path 会把它们包成 `api-blocked-40300:...` / `api-blocked-40301:...`：
+    #:   - 40300 MISSING_HEADER       -> 缺 x-client-* / x-device-* 指纹头
+    #:   - 40301 INVALID_POW_RESPONSE -> PoW 答案未被服务端接受（算法/盐已变更）
+    #: 另外 x-hif-* 风控 token 校验失败会以 completion-code-403 形式出现。
+    #: 这几类都不是"用户账号/网络"问题，属于结构性走不通。
+    _API_BLOCKED_MARKS = (
+        "api-blocked-",
+        "MISSING_HEADER",
+        "INVALID_POW_RESPONSE",
+        "completion-code-403",
+    )
+
+    @classmethod
+    def _is_api_blocked(cls, err):
+        """直发失败是否属于「DeepSeek 官方加固」而非「未登录 / 网络抖动」。
+
+        Args:
+            err: `_submit_api` 抛出的异常（或字符串）。
+
+        Returns:
+            bool: True 表示属于官方请求校验拦截。
+        """
+        e = str(err or "")
+        return any(k in e for k in cls._API_BLOCKED_MARKS)
+
     def _submit_api_with_retry(self, prompt_text, *, on_progress=None,
                                answer_timeout=300.0):
         """接口直发 + 「输入过快」退避重试。
@@ -1195,8 +1250,14 @@ class WebDriver:
                 # 非限流 -> 老行为：永久降级回点击链路（本次调用立刻继续往下走）
                 self.api_mode = "off"
                 self._api_fail_note = str(err)[:300]
+                # ★ v9.22：区分「官方加固拦了直发」和「别的原因」（未登录 / 网络抖动 /
+                #   会话创建失败）。前者若连点击链路也失败，就要一路升级成 API_BLOCKED，
+                #   明确告诉用户"不是账号问题、请改用 API 模型"，而不是干等 60 秒只看到"超时"。
+                self._api_blocked = self._is_api_blocked(err)
                 self._logf("warn", f"接口直发不可用（{err}）—— 本会话改用模拟点击链路，"
-                                   "不再重试直发")
+                                   "不再重试直发"
+                                   + ("；判定为官方接口加固，如点击链路也失败将提示改用 API 模型"
+                                      if self._api_blocked else ""))
                 return False, None
 
             if self._answer_is_rate_limit(answer):

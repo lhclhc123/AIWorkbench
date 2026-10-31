@@ -30,12 +30,16 @@
 import json
 import time
 
+# 页面内脚本版本（单一来源）。改了 JS_HELPERS 里的逻辑必须 +1：
+# 页面会常驻旧的 window.__AWBAPI__，只有版本号变了才会被强制重注入。
+API_VERSION = 2
+
 # ---------------------------------------------------------------------------
 # 页面内脚本（在 chat.deepseek.com 的上下文里执行）
 # ---------------------------------------------------------------------------
 JS_HELPERS = r"""
 (function () {
-  if (window.__AWBAPI__ && window.__AWBAPI__.v === 1) return 'ok';
+  if (window.__AWBAPI__ && window.__AWBAPI__.v === __AWB_API_VERSION__) return 'ok';
 
   // ---------------- SHA3-256（32 位实现，Keccak-f[1600]） ----------------
   var RC = [
@@ -286,10 +290,18 @@ JS_HELPERS = r"""
   async function createSession() {
     var res = await jpost('/api/v0/chat_session/create', {character_id: null});
     var data = biz(res.json);
-    if (!data || !data.id) {
-      throw new Error('session-create-failed:' + (res.text || '').slice(0, 120));
+    // 真机实测(2026-10-31)：biz_data 形如 {chat_session:{id,...}, ttl_seconds}，
+    // 会话 id 在 chat_session.id，**不在顶层 data.id**。老代码按 data.id 取，
+    // 永远拿到 undefined -> 抛 session-create-failed -> 直发通道整体降级到点击链路。
+    // 这里兼容多种包裹形态，避免再次改版即失效。
+    var sid = (data && (data.id
+                        || (data.chat_session && data.chat_session.id)
+                        || (data.session && data.session.id)
+                        || (data.chat_session_id))) || '';
+    if (!sid) {
+      throw new Error('session-create-failed:' + (res.text || '').slice(0, 160));
     }
-    return data.id;
+    return sid;
   }
 
   function pushContent(o, kind, val) {
@@ -355,6 +367,39 @@ JS_HELPERS = r"""
       var reader = resp.body.getReader();
       var dec = new TextDecoder('utf-8');
       var pending = '';
+
+      // ★ v9.22：DeepSeek 加固后，completion 端点在"校验不通过"时**不再回 SSE**，
+      //   而是直接回一个纯 JSON：{"code":40300,"msg":"MISSING_HEADER"} /
+      //   {"code":40301,"msg":"INVALID_POW_RESPONSE"}。旧代码只认 `data:` 前缀行，
+      //   会把这行整个跳过 -> 表现为"2.9 秒后没拿到任何正文"再默默降级，
+      //   用户只看到 60 秒超时，根本不知道是接口被加固了。
+      //   这里把"非 SSE 的 JSON 拒绝"当面抛成 api-blocked-<code>，上层即可秒级降级。
+      function handleLine(raw) {
+        var line = String(raw || '').replace(/\r$/, '');
+        if (!line) { return; }
+        if (line.indexOf('data:') !== 0) {
+          var trimmed = line.trim();
+          if (trimmed.charAt(0) === '{') {
+            var ej = null;
+            try { ej = JSON.parse(trimmed); } catch (e2) { ej = null; }
+            if (ej && ej.code !== undefined && ej.code !== 0) {
+              throw new Error('api-blocked-' + ej.code + ':'
+                              + String(ej.msg || '').slice(0, 120));
+            }
+          }
+          return;
+        }
+        var payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') { return; }
+        var j = null;
+        try { j = JSON.parse(payload); } catch (e) { return; }
+        if (j && j.code !== undefined && j.code !== 0) {
+          throw new Error('completion-code-' + j.code + ':' + String(j.msg || '').slice(0, 120));
+        }
+        buf.chunks++;
+        applyChunk(buf, j);
+      }
+
       while (true) {
         var step = await reader.read();
         if (step.done) break;
@@ -362,20 +407,11 @@ JS_HELPERS = r"""
         var lines = pending.split('\n');
         pending = lines.pop();
         for (var i = 0; i < lines.length; i++) {
-          var line = lines[i].replace(/\r$/, '');
-          if (!line) continue;
-          if (line.indexOf('data:') !== 0) continue;
-          var payload = line.slice(5).trim();
-          if (!payload || payload === '[DONE]') continue;
-          var j = null;
-          try { j = JSON.parse(payload); } catch (e) { continue; }
-          if (j && j.code !== undefined && j.code !== 0) {
-            throw new Error('completion-code-' + j.code + ':' + String(j.msg || '').slice(0, 120));
-          }
-          buf.chunks++;
-          applyChunk(buf, j);
+          handleLine(lines[i]);
         }
       }
+      // 收尾：最后一行可能没有换行符（纯 JSON 拒绝正是这种形态）
+      if (pending) { handleLine(pending); }
       buf.done = true;
     } catch (e) {
       buf.error = String((e && e.message) || e);
@@ -385,7 +421,7 @@ JS_HELPERS = r"""
   }
 
   window.__AWBAPI__ = {
-    v: 1,
+    v: __AWB_API_VERSION__,
     buf: {text: '', reasoning: '', done: true, error: '', sessionId: '', messageId: null,
           powMs: 0, chunks: 0, startedAt: 0},
     // 供自检用
@@ -421,6 +457,9 @@ JS_HELPERS = r"""
 })()
 """
 
+# 把唯一版本号注入页面脚本（单一来源：只改上面 API_VERSION 这一行）。
+JS_HELPERS = JS_HELPERS.replace("__AWB_API_VERSION__", str(int(API_VERSION)))
+
 
 class ApiUnavailable(RuntimeError):
     """直发通道不可用（未登录 / 接口变了 / PoW 被拒）—— 调用方应降级到点击链路。"""
@@ -435,6 +474,9 @@ _HARD_FAILS = (
     "completion-http-401",
     "completion-http-403",
     "pow-not-solved",
+    # ★ v9.22：DeepSeek 加固后 completion 返回的纯 JSON 拒绝（MISSING_HEADER /
+    #   INVALID_POW_RESPONSE 等）。属于"结构性走不通"，立即永久降级到点击链路。
+    "api-blocked-",
 )
 
 
@@ -451,7 +493,8 @@ class ApiPath:
     """
 
     #: 页面内脚本是否已注入
-    READY_JS = "typeof window.__AWBAPI__ !== 'undefined' && window.__AWBAPI__.v === 1"
+    READY_JS = ("typeof window.__AWBAPI__ !== 'undefined' && "
+                "window.__AWBAPI__.v === %d" % int(API_VERSION))
 
     def __init__(self, cdp, log=None):
         self.cdp = cdp

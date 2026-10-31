@@ -516,7 +516,7 @@ _KEY_HINTS = {
     "zhipu": "智谱 Key（形如 xxxx.yyyy）——对话 / 看图 / 语音识别都用它，已内置一个",
     "scnet": "超算互联网 Key，形如 sk-…",
     "dashscope": "阿里百炼 Key，形如 sk-…（免费额度可跑 DeepSeek-V4.1 / Qwen 系列）",
-    "siliconflow": "硅基流动 Key，形如 sk-…（注册免费、实名后可用；★永久免费的 DeepSeek-R1 就在这一档，填了 Key 才能用）",
+    "siliconflow": "硅基流动 Key，形如 sk-…（⚠ 2026-10 起该平台已无免费对话模型，余额为 0 时连标 ¥0 的模型也返回 402；想用需先充值）",
 }
 
 
@@ -2280,7 +2280,10 @@ class SettingsPage(QWidget):
             color = "#9e9e9e"       # 灰
         elif name in ("window_hidden",):
             color = "#ef6c00"       # 橙：看着就绪，实际发不出去
-        elif name in ("timeout", "page_changed", "duplicate", "other"):
+        # ★ v9.22.0：api_blocked = 网页接口被官方加固 —— 必须红灯，
+        #   不能配绿灯让用户误以为网页版还能用。
+        elif name in ("timeout", "page_changed", "duplicate", "other",
+                      "api_blocked"):
             color = "#c62828"       # 红
         text = f"状态：{label}"
         detail = (detail or "").strip()
@@ -2575,7 +2578,7 @@ class AboutPage(QWidget):
 <h3>免费能力来源</h3>
 <ul>
 <li><b>对话模型</b>：智谱 GLM-4-Flash / GLM-4.7-Flash、超算互联网、百炼 Qwen-Flash（均有免费额度）</li>
-<li><b>语音识别</b>：智谱 GLM-ASR-2512（用现有 Key 即可）；可选硅基流动 SenseVoiceSmall（注册免费）</li>
+<li><b>语音识别</b>：智谱 GLM-ASR-2512（用现有 Key 即可，默认首选）；硅基流动 SenseVoiceSmall 需该平台有余额</li>
 <li><b>语音合成</b>：Windows 内置离线语音（零配置）+ 微软 Edge 在线语音（免费）</li>
 <li><b>更新检查</b>：GitHub Releases（免费）</li>
 </ul>
@@ -3396,6 +3399,10 @@ class BrowserPage(QWidget):
     """
 
     fetched = pyqtSignal(dict)      # 转发 BrowserPane.fetched（主窗口直接连这个）
+    # ★ v9.21.x（修「点开浏览器后回不到主界面」）：web 模式下 Qt 左栏被隐藏，
+    #   BrowserPage 是 Qt 页、没有 Web SPA 的导航栏 —— 必须自带一个返回入口，
+    #   否则用户进了这页就再也切不回对话页。
+    back_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3406,9 +3413,24 @@ class BrowserPage(QWidget):
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(8)
 
+        head_row = QHBoxLayout()
+        head_row.setSpacing(8)
+        self.back_btn = QPushButton("← 返回对话")
+        self.back_btn.setObjectName("cardBtn")
+        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_btn.setToolTip("切回对话页")
+        self.back_btn.setStyleSheet(
+            f"QPushButton{{background:{t['chip_bg']};color:{t['accent_text']};"
+            "border:none;border-radius:8px;padding:5px 12px;font-size:12px;"
+            f"font-weight:bold;}}QPushButton:hover{{color:{t['text']};}}")
+        self.back_btn.clicked.connect(self.back_requested.emit)
+        head_row.addWidget(self.back_btn)
+
         head = QLabel(f"{icons_mod.ic('web')} 内嵌浏览器")
         head.setStyleSheet(f"font-size:15px;font-weight:bold;color:{t['accent_text']};")
-        v.addWidget(head)
+        head_row.addWidget(head)
+        head_row.addStretch(1)
+        v.addLayout(head_row)
 
         # 占位（第一次显示时被真的 BrowserPane 顶掉）
         self._placeholder = QLabel("浏览器内核尚未启动，切换到本页时会自动就绪。")

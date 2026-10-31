@@ -155,7 +155,7 @@ class ConvRun:
 
     __slots__ = ("cid", "worker", "runner", "running", "live_text", "pending_tool",
                  "live_card", "last_model_label", "dsw_selected",
-                 "live_reason", "reason_card", "team_run")
+                 "live_reason", "reason_card", "team_run", "aborted")
 
     def __init__(self, cid=""):
         self.cid = cid
@@ -180,6 +180,11 @@ class ConvRun:
         #   放**每个对话自己**这份里，于是「A 对话的团队在跑、B 对话照常聊天」
         #   互不干扰，`_interrupt()` 也能精确停到当前对话那支队伍。
         self.team_run = None
+        # ★ v9.21.x（修「点停止后界面还显示思考中」）：本轮是否已被用户打断。
+        #   打断后 worker 可能还要在后台收一会儿尾（堵在工具/网络里），
+        #   期间排队中的 token/reason/tool 信号必须被丢弃，不能再把「思考中」
+        #   或半截正文重新画回界面。
+        self.aborted = False
 
 
 class MainWindow(QMainWindow):
@@ -202,6 +207,11 @@ class MainWindow(QMainWindow):
     _update_progress = pyqtSignal(int, int)
     _update_done = pyqtSignal(str)
     _update_fail = pyqtSignal(str)
+    # ★ v9.22.0：安装阶段提示 / 解压进度 / 安装完成
+    #   （update 的后台线程 -> UI 线程都要过信号，跨线程不碰控件）
+    _update_stage = pyqtSignal(str, str)             # (stage, detail) 阶段提示
+    _update_install_progress = pyqtSignal(int, int)  # 解压进度
+    _update_install_done = pyqtSignal(object)        # install_package 返回 dict
     # DeepSeek 网页版（v9.14.0）：后台线程 -> 界面
     _dsw_launch_ready = pyqtSignal(dict)
     _dsw_selftest_ready = pyqtSignal(list)
@@ -349,13 +359,24 @@ class MainWindow(QMainWindow):
     def _dsw_selected(self, value):
         self._run().dsw_selected = bool(value)
 
+    @property
+    def aborted(self):
+        """当前对话这一轮是否已被用户打断（修「点取消还显示思考中」）。"""
+        return self._run().aborted
+
+    @aborted.setter
+    def aborted(self, value):
+        self._run().aborted = bool(value)
+
     def __init__(self, workspace: ws_mod.Workspace, settings: dict, parent=None):
         super().__init__(parent)
         self.workspace = workspace
         self.settings = settings
         # ★ v9.21.0 Web UI 一期：对话页用网页（QWebEngineView）还是 Qt 版。
-        # 三重回退开关：设置 ui_engine=web 开启；--ui-engine=qt 强制关；
-        # AWB_WEBUI=0 环境变量再兜一层。默认 qt（保持老行为）。
+        # ★ v9.22.0：**默认走 Web UI**（用户要求「一打开就是 webUI」）。
+        # 三重回退开关：设置 ui_engine!=qt 即开启（缺省 web）；--ui-engine=qt 强制关；
+        # AWB_WEBUI=0 环境变量再兜一层。老用户想回 Qt 版可在设置里选 qt 或加
+        # --ui-engine=qt。
         self._web_engine = self._want_web_engine()
         self._web_bridge = None          # WebUIBridge（web 引擎激活时才建）
         self._web_view = None            # QWebEngineView
@@ -514,12 +535,12 @@ class MainWindow(QMainWindow):
 
     # ================= Web UI 一期（v9.21.0，方案 B：QWebEngineView 嵌网页） =================
     def _want_web_engine(self):
-        """对话页是否用 Web 引擎。三重回退，任一「关」都回 Qt 版。
+        """对话页是否用 Web 引擎。**默认 web**，三重回退任一「关」都回 Qt 版。
 
         1. 环境变量 ``AWB_WEBUI=0`` —— 最外层保险；
         2. 命令行 ``--ui-engine=qt`` —— 防止设置写坏导致打不开；
-        3. 设置 ``ui_engine == "web"`` —— 才开启。
-        默认（无任何开关）= qt，保持老行为。
+        3. 设置 ``ui_engine != "qt"`` —— 即开启（**缺省 web**）。
+        默认 web；老用户想回 Qt 版可在设置里选 qt 或加 ``--ui-engine=qt``。
         """
         import os
         import sys as _sys
@@ -530,7 +551,7 @@ class MainWindow(QMainWindow):
             return False
         if "--ui-engine=web" in _argv:
             return True
-        return str(self.settings.get("ui_engine", "qt")) == "web"
+        return str(self.settings.get("ui_engine", "web")) != "qt"
 
     # ================= DeepSeek 网页版（v9.14.0 / v9.14.2 免手动） =================
     def _dsw_sync_prefs(self):
@@ -1133,6 +1154,10 @@ class MainWindow(QMainWindow):
         self._update_progress.connect(self._update_on_progress)
         self._update_done.connect(self._update_on_done)
         self._update_fail.connect(self._update_on_fail)
+        # ★ v9.22.0：安装阶段 / 解压进度 / 安装完成（后台线程 -> UI）
+        self._update_stage.connect(self._update_on_stage)
+        self._update_install_progress.connect(self._update_on_install_progress)
+        self._update_install_done.connect(self._update_on_install_done)
 
         self.page_settings = SettingsPage()
         self.stack.addWidget(self.page_settings)
@@ -1162,6 +1187,9 @@ class MainWindow(QMainWindow):
         self.page_browser = BrowserPage()
         self.stack.addWidget(self.page_browser)
         self.page_browser.fetched.connect(self._on_browser_fetched)
+        # ★ v9.21.x（修「点开浏览器后回不到主界面」）：web 模式下 Qt 左栏隐藏，
+        #   浏览器页没有导航，这里接一个返回按钮直接切回对话页。
+        self.page_browser.back_requested.connect(lambda: self._open_page("chat"))
 
         self.statusBar().showMessage("就绪")
 
@@ -1345,7 +1373,8 @@ class MainWindow(QMainWindow):
         self._render_timer.timeout.connect(self._update_live)
         # 流式刷新节拍（毫秒）。★ v9.18.0（需求 6）：不再是写死的 80ms，
         # 由 `_tune_live_interval` 按上一次渲染的真实耗时自适应升降。
-        self._live_interval = 110
+        # ★ v9.21.x：初始值同步提到 140ms（与 _tune_live_interval 的下限一致）。
+        self._live_interval = 140
         return page
 
     # ================= Web UI 一期（v9.21.0）：网页版对话页 =================
@@ -3087,6 +3116,7 @@ class MainWindow(QMainWindow):
         run.pending_tool = []
         run.live_reason = ""
         run.reason_card = None
+        run.aborted = False
         run.running = True
 
         t = team_presets.get_preset(team_id) or {}
@@ -5862,7 +5892,8 @@ class MainWindow(QMainWindow):
         def worker():
             try:
                 updater.download(asset["url"], dest,
-                                 progress=lambda d, t: self._update_progress.emit(d, t))
+                                 progress=lambda d, t: self._update_progress.emit(d, t),
+                                 on_stage=lambda s, det: self._update_stage.emit(s, det))
                 self._update_done.emit(dest)
             except Exception as e:
                 self._update_fail.emit(f"{type(e).__name__}: {e}")
@@ -5876,12 +5907,29 @@ class MainWindow(QMainWindow):
             dlg.setValue(min(99, int(done * 100 / total)))
             dlg.setLabelText(f"正在下载更新… {done / 1048576:.1f} / {total / 1048576:.1f} MB")
 
+    def _update_on_stage(self, stage, detail):
+        """下载 / 安装的阶段提示：让用户知道现在在干嘛，而不是干等一个进度条。"""
+        text = {
+            "probing": "正在选择最快的下载通道…",
+            "downloading": "正在下载更新…",
+            "downloaded": "下载完成，准备安装…",
+            "extracting": "正在解压更新包…",
+            "installing": "正在覆盖程序文件…",
+            "restarting": "安装完成，即将重启…",
+        }.get(str(stage or ""), "")
+        if text:
+            dlg = getattr(self, "_upd_dlg", None)
+            if dlg:
+                dlg.setLabelText(f"{text} {detail}".strip() if detail else text)
+            self.statusBar().showMessage(text, 4000)
+
     def _update_on_fail(self, err):
+        # ★ v9.22.0：下载失败和安装失败共用本槽，文案改成中性的「更新失败」。
         dlg = getattr(self, "_upd_dlg", None)
         if dlg:
             dlg.close()
             self._upd_dlg = None
-        self._info(f"更新下载失败：{err}\n\n可以到发布页手动下载安装：\n"
+        self._info(f"更新失败：{err}\n\n可以到发布页手动下载安装：\n"
                    f"https://github.com/{ver.GITHUB_REPO}/releases", "自动更新")
 
     def _update_on_done(self, zip_path):
@@ -5897,58 +5945,61 @@ class MainWindow(QMainWindow):
                        f"https://github.com/{ver.GITHUB_REPO}/releases", "自动更新")
 
     def _finish_update(self, zip_path):
-        """解压新包，用 PowerShell 在本程序退出后覆盖安装目录并重启。
+        """安装更新包：解压 → 覆盖 → 重启，全程带进度提示（v9.22.0）。
 
-        用 -EncodedCommand（UTF-16LE base64）传脚本，彻底避开中文路径在
-        bat/ps1 文件里的编码坑。"""
-        import sys as _sys
-        import zipfile as _zf
-        import tempfile as _tf
-        import base64 as _b64
-        app_dir = os.path.dirname(_sys.executable) if getattr(_sys, "frozen", False) \
-            else os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        tmp_root = os.path.join(_tf.gettempdir(), f"AIWorkbench_upd_{int(time.time())}")
-        with _zf.ZipFile(zip_path) as z:
-            z.extractall(tmp_root)
-        # 在解压结果里找「直接装着 AIWorkbench.exe 的那一层」
-        src = None
-        for root, _dirs, files in os.walk(tmp_root):
-            if any(f.lower() in ("aiworkbench.exe", "aiworkbench") for f in files):
-                src = root
-                break
-        if not src:
-            raise RuntimeError("压缩包里没找到 AIWorkbench.exe，无法自动安装")
-        src = src.replace("'", "''")
-        dst = app_dir.replace("'", "''")
-        exe = os.path.join(app_dir, "AIWorkbench.exe").replace("'", "''")
-        ps = (
-            "$ErrorActionPreference = 'Stop'\n"
-            "Start-Sleep -Seconds 2\n"
-            "$ok = $false\n"
-            f"for ($i = 0; $i -lt 40; $i++) {{\n"
-            f"  try {{ Copy-Item -Path '{src}\\*' -Destination '{dst}' -Recurse -Force\n"
-            "      $ok = $true; break }\n"
-            "  catch { Start-Sleep -Milliseconds 500 }\n"
-            "}\n"
-            "if ($ok) {\n"
-            "  Start-Sleep -Milliseconds 800\n"
-            f"  Start-Process -FilePath '{exe}'\n"
-            "}\n"
-            f"Remove-Item -LiteralPath '{tmp_root}' -Recurse -Force -ErrorAction SilentlyContinue\n"
-            f"Remove-Item -LiteralPath '{zip_path}' -Force -ErrorAction SilentlyContinue\n"
-        )
-        encoded = _b64.b64encode(ps.encode("utf-16-le")).decode("ascii")
-        from .. import winproc
-        winproc.popen(["powershell", "-NoProfile", "-EncodedCommand", encoded],
-                      creationflags=0x08000000)
+        实际动作交给 updater.install_package（纯逻辑、可 dry_run 测试），
+        这里只负责弹进度框 + 把后台回调转成 Qt 信号（跨线程不碰控件）。
+        """
+        from PyQt6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog("正在安装更新…", "", 0, 100, self)
+        dlg.setWindowTitle("自动更新")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setCancelButton(None)
+        self._upd_dlg = dlg
+        import threading
+
+        def worker():
+            try:
+                res = updater.install_package(
+                    zip_path,
+                    progress=lambda d, t: self._update_install_progress.emit(d, t),
+                    on_stage=lambda s, det: self._update_stage.emit(s, det))
+                self._update_install_done.emit(res)
+            except Exception as e:
+                self._update_fail.emit(f"安装失败：{type(e).__name__}: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_on_install_progress(self, done, total):
+        """解压进度：进度框按字节百分比推进，文案带上 MB 数（用户看得懂）。"""
+        dlg = getattr(self, "_upd_dlg", None)
+        if not dlg or total <= 0:
+            return
+        dlg.setValue(min(99, int(done * 100 / total)))
+        dlg.setLabelText("正在安装更新… "
+                         f"{done / 1048576:.1f} / {total / 1048576:.1f} MB")
+
+    def _update_on_install_done(self, res):
+        """install_package 返回（已安排好覆盖+重启）：关进度框并退出本进程。
+
+        ⚠ 必须 quit()：PowerShell 是等 2 秒后去覆盖安装目录的，本程序不退出
+          exe 就被锁着，覆盖会连续失败（旧实现也在这里 quit，原意不能丢）。
+        """
+        dlg = getattr(self, "_upd_dlg", None)
+        if dlg:
+            dlg.setValue(100)
+            dlg.close()
+            self._upd_dlg = None
         if _NO_MODAL:
-            self.statusBar().showMessage("更新包已就绪，退出后将自动替换并重启", 8000)
+            self.statusBar().showMessage("更新已准备好，程序即将重启", 8000)
             QApplication.quit()
             return
+        from PyQt6.QtWidgets import QMessageBox
         QMessageBox.information(
             self, "自动更新",
-            "更新包已下载并准备好。\n点「确定」后本程序会关闭，"
-            "几秒后自动替换文件并重新启动新版本。")
+            "更新已准备好，程序即将自动重启完成安装。\n\n"
+            "如果没有自动重启，请手动重新打开 AIWorkbench。")
         QApplication.quit()
 
     def _info(self, text, title="提示", ms=5000):
@@ -6340,6 +6391,7 @@ class MainWindow(QMainWindow):
         # ★ v9.18.0（需求 17）：新一轮开始，上一轮残留的思考区清掉
         run.live_reason = ""
         run.reason_card = None
+        run.aborted = False
         # ★★ v9.18.0（需求 13）：这个对话选了团队 -> 本轮**交给团队去做**，
         #   不再走单人链路。放在这里（用户消息已入会话并落盘、运行态已清空之后）
         #   是为了让对话流里的顺序天然正确：先看到自己的消息，再看到团队的过程与汇总。
@@ -6419,11 +6471,17 @@ class MainWindow(QMainWindow):
                 run.team_run.cancel()
             except Exception:
                 pass
+            # ★ v9.21.x：团队取消也要**立刻**撤掉「思考中」占位 —— 成员线程收尾
+            #   需要时间，期间 running 仍为 True，不处理的话界面会一直「正在思考」。
+            #   （team_bar 随后会显示「⊘ 团队已取消」，这就是用户看到的"已取消"提示。）
+            run.aborted = True
             if self._is_current(cid):
+                self._render_sig = None
                 self.state_line.set_phase("stop", "正在收尾")
                 self.send_btn.setEnabled(False)
                 self.send_btn.setText("…")
                 self.statusBar().showMessage("已停止团队，正在收尾…", 4000)
+                self._render()
             return
         w = run.worker
         if w is None or not run.running:
@@ -6432,11 +6490,24 @@ class MainWindow(QMainWindow):
             w.abort()
         except Exception:
             pass
+        # ★ v9.21.x 修「点停止后界面还显示思考中」：
+        #   老逻辑只置 abort 标志 + 把按钮/状态行改成「已停止」，却**没清**流式展示态，
+        #   worker 真正收尾触发 _on_finished 之前，「◈ 思考中」卡片 / 占位一直挂在
+        #   界面上（worker 若还堵在工具/网络里，能挂几十秒）。这里在 UI 线程**立刻**
+        #   清空并强制重渲染一次，用户点下去的瞬间就不再是「思考中」。
+        run.aborted = True
+        run.live_text = ""
+        run.live_card = None
+        run.live_reason = ""
+        run.reason_card = None
+        run.pending_tool = []
         if self._is_current(cid):
+            self._render_sig = None          # 指纹失效，保证这次一定全量重建
             self.state_line.set_phase("stop", "正在收尾")
             self.send_btn.setEnabled(False)
             self.send_btn.setText("…")
             self.statusBar().showMessage("已停止本轮生成，正在收尾…", 4000)
+            self._render()
 
     def _set_stop_mode(self, stop):
         """切换右下角按钮的形态：生成中=红色方形停止键，空闲=蓝色圆形发送键。"""
@@ -6481,6 +6552,9 @@ class MainWindow(QMainWindow):
         """流式增量：写进**它自己**那个对话的运行态；只有它是当前显示时才刷界面。"""
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
+        # ★ v9.21.x：本轮已被打断 —— 丢弃排队中的增量，别把半截正文重新画回界面。
+        if getattr(run, "aborted", False):
+            return
 
         # ★★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
         #   收到后台发来的"作废重来"标记：后台换了端点/模型重试，或者 DeepSeek 网页
@@ -6525,6 +6599,9 @@ class MainWindow(QMainWindow):
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
         if not delta:
+            return
+        # ★ v9.21.x：本轮已被打断 —— 丢弃排队中的思考增量，别再把「◈ 思考中」画回来。
+        if getattr(run, "aborted", False):
             return
         run.live_reason += delta
         if not self._is_current(cid):
@@ -6591,9 +6668,14 @@ class MainWindow(QMainWindow):
         宁可少刷几帧也不让界面失去响应。
         """
         if cost_seconds < 0.03:
-            self._live_interval = 110
+            # ★ v9.21.x（修「模型输出有点卡」）：节拍下限从 110ms 提到 140ms。
+            #   QTextBrowser 每次 setHtml 都是整段 reflow，110ms = 每秒 9 次全量
+            #   重排，长正文/表格/代码时 UI 明显发卡；140ms 仍流畅（~7 帧/秒），
+            #   却省下约两成重排开销，也顺带减少半成品状态下反复 re-layout
+            #   造成的「字体错位」。
+            self._live_interval = 140
         else:
-            self._live_interval = max(110, min(400, int(cost_seconds * 1000 * 3)))
+            self._live_interval = max(140, min(400, int(cost_seconds * 1000 * 3)))
 
     def _on_tool_start(self, desc, cid=None):
         if cid is not None and not self._is_current(cid):
@@ -6611,6 +6693,9 @@ class MainWindow(QMainWindow):
         # ★ v9.18.0：一律写进 **cid 那个对话** 的运行态，界面只在它当前可见时刷新。
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
+        # ★ v9.21.x：本轮已被打断 —— 丢弃排队中的工具回执，别把过程胶囊重新塞回界面。
+        if getattr(run, "aborted", False):
+            return
         _think = strip_tool_markup(run.live_text).strip() if run.live_text else ""
         if _think:
             run.pending_tool.append({"role": "thinking", "content": _think})
@@ -7126,7 +7211,11 @@ class MainWindow(QMainWindow):
             self._cards.append(rc)
             self._reason_card = rc
 
-        if self.running and not self.live_text and not self.pending_tool:
+        # ★ v9.21.x（修「点取消后 UI 还显示思考中」）：已被用户打断的这一轮，
+        #   即使 worker 还在后台收尾（running 仍为 True），也**不再**画「正在思考」
+        #   占位卡片 —— 否则点了停止反而又冒出一个「思考中」。
+        if (self.running and not self.aborted
+                and not self.live_text and not self.pending_tool):
             ind = ThinkingIndicator()
             self.chat_layout.addWidget(ind)
             self._cards.append(ind)

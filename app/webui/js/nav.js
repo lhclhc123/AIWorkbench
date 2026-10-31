@@ -23,7 +23,10 @@ const PAGES = [
   { key: 'browser',     label: '浏览器',     view: null,          qt: true },
 ];
 
-const NAV_SKIP = new Set(['tools', 'team']);   // 不画格子的页面
+// 不画格子的页面：tools/team 收进别处；chat 不再占用侧栏格子——
+// 用户直接点左侧对话列表里的某一项即可回到对话页（见 views/chat.js）。
+// PAGES 里 chat 那条仍保留，供 switchTo('chat') 的页面切换逻辑使用。
+const NAV_SKIP = new Set(['tools', 'team', 'chat']);
 
 let current = 'chat';
 const viewCache = new Map();   // key -> {loaded, init}

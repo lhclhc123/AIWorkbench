@@ -35,6 +35,7 @@ import time
 import urllib.request
 
 from .. import webengine as _webengine
+from .cdp_client import local_urlopen
 
 TARGET_URL = "https://chat.deepseek.com/"
 TARGET_HOST = "chat.deepseek.com"
@@ -67,8 +68,10 @@ def list_targets(port=None, timeout=2.0):
     """读 ``http://127.0.0.1:<port>/json``，返回 target 列表（失败返回 []）。"""
     port = int(port or debug_port())
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json",
-                                    timeout=float(timeout)) as resp:
+        # ★ v9.22：必须走 local_urlopen —— 环境里的 http_proxy 会把本地调试口
+        #   塞进代理隧道，代理一断就是 502 / WinError 10053（见 cdp_client 文件头）。
+        with local_urlopen(f"http://127.0.0.1:{port}/json",
+                           timeout=float(timeout)) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace") or "[]")
         return data if isinstance(data, list) else []
     except Exception:

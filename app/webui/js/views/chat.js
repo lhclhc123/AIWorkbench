@@ -4,6 +4,7 @@
 
 import { getState, patch, subscribe } from '../store.js';
 import { on, call } from '../bridge.js';
+import { switchTo } from '../nav.js';
 import '../components/msg.js';
 import '../components/tool-capsule.js';
 import '../components/think-card.js';
@@ -17,6 +18,9 @@ let threadWrap, thread, welcome, input, composer, sendBtn,
 let streamMsg = null;   // 正在流式输出的 <msg-bubble>
 let streamThink = null; // 正在流式的 <think-card>
 let currentTool = null; // 当前工具胶囊
+// 本轮流式开始前，thread 里已有的消息节点数（不含 welcome）。
+// 收尾时靠它切出「本轮新增」的区间，从而只重建新增消息，不碰历史。
+let streamBaseCount = 0;
 
 
 /* ---------------- 工具函数 ---------------- */
@@ -217,6 +221,9 @@ function renderConvList() {
     btn.querySelector('.conv-title').textContent = c.title || '未命名对话';
     btn.querySelector('.conv-preview').textContent = c.preview || '';
     btn.addEventListener('click', () => {
+      // 一步直达：从任意页面（设置/技能…）点左侧对话项，都先切回对话页。
+      // 不 await —— 切页是同步展示，避免阻塞下面的对话切换。
+      switchTo('chat');
       convList.querySelectorAll('.conv').forEach((x) => x.classList.remove('is-active'));
       btn.classList.add('is-active');
       patch({ currentConvId: c.id });
@@ -270,7 +277,16 @@ function renderAttachments() {
 }
 
 /* ---------------- 流式生命周期 ---------------- */
+
+// thread 里当前的消息节点数（welcome 不算消息）
+function countMessageNodes() {
+  return Array.from(thread.children).filter((el) => el.id !== 'welcome').length;
+}
+
 function beginStream() {
+  // ★ 必须在 streamMsg 入列之前记：这里记的是「本轮开始前」的节点数，
+  //   finalizeStream 靠它切出「本轮新增」的区间。
+  streamBaseCount = countMessageNodes();
   patch({ streaming: true, busy: true, phase: '' });
   setComposerBusy(true);
 
@@ -278,6 +294,9 @@ function beginStream() {
   streamMsg.role = 'assistant';
   streamMsg.time = nowLabel();
   streamMsg.meta = selectedModelLabel() + ' · 生成中…';
+  // 注入渲染器：流式中「已写完的段落」即时变成最终 markdown（粗体/列表/代码块），
+  // 收尾时的排版跳动就只剩最后一段。组件本身不依赖这个函数，不注入即退化为纯文本。
+  streamMsg.setMarkdownFn(renderMarkdown);
   streamMsg.setTyping(true);
   thread.appendChild(streamMsg);
   streamThink = null;
@@ -294,13 +313,42 @@ function ensureThink() {
   return streamThink;
 }
 
-function finalizeStream() {
+/**
+ * 收尾。传入 messages 时做「增量重建」：
+ *   只删掉本轮新增的临时节点、只重建本轮新增的消息，历史消息一律不碰。
+ * 传空参（如 on('error')）时只复位状态，不动 DOM。
+ * @param {Array<object>=} messages 后端 finished 事件带回来的完整消息列表
+ */
+function finalizeStream(messages) {
+  const liveMsg = streamMsg;   // 先留住引用：下面会被置空
   patch({ streaming: false, busy: false });
   setComposerBusy(false);
   streamMsg = null;
   streamThink = null;
   currentTool = null;
 
+  if (!Array.isArray(messages) || messages.length <= streamBaseCount) return;
+
+  // 安全阀：如果流式气泡已经不在 thread 里（例如生成期间切过对话，
+  // 已被 on('messages') 全量重建），就别按旧的 streamBaseCount 去删节点，
+  // 否则会误删新会话的历史消息。
+  if (!liveMsg || liveMsg.parentNode !== thread) {
+    if (welcome) welcome.hidden = messages.length > 0;
+    return;
+  }
+
+  const keep = streamBaseCount;
+  const kids = Array.from(thread.children).filter((el) => el.id !== 'welcome');
+  // 只删「本轮流式期间产生」的节点（第 keep 个之后的）
+  for (let i = keep; i < kids.length; i++) kids[i].remove();
+
+  // 只重建本轮新增的消息；历史消息的 DOM 与其 markdown 渲染结果原样保留
+  const frag = document.createDocumentFragment();
+  for (const m of messages.slice(keep)) frag.appendChild(buildMessage(m));
+  thread.appendChild(frag);
+
+  if (welcome) welcome.hidden = messages.length > 0;
+  scrollBottom(true);
 }
 
 function send() {
@@ -432,11 +480,11 @@ function bindBridge() {
   });
 
   on('finished', (p) => {
-    if (p && p.messages) {
-      patch({ messages: p.messages });
-      renderMessages(p.messages);
-    }
-    finalizeStream();
+    // 增量收尾：不再 renderMessages 全量重建（那会清空整个消息流并重解析
+    // 所有历史消息的 markdown，对话一长就卡）。
+    const msgs = (p && p.messages) || null;
+    if (msgs) patch({ messages: msgs });
+    finalizeStream(msgs);
   });
 
   on('error', (p) => {

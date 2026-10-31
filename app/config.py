@@ -2,7 +2,7 @@
 """
 端点与模型配置。
 - 所有端点均为 OpenAI 兼容 /chat/completions。
-- free=True 表示有免费额度（已在 2026-09-19 实测可用）。
+- free=True 表示标称免费（2026-10-31 已实测复核，结论见各端点注释）。
 - 联网搜索参数按端点类型区分（见 llm_client.py）。
 """
 
@@ -30,9 +30,9 @@ _KEY_BLOBS = {
     "zhipu": "",
     # 超算互联网（免费档只有 SCNet-Max）
     "scnet": "",
-    # 硅基流动（免费档：DeepSeek 蒸馏 8B/7B、Qwen3-8B、GLM-4-9B）
+    # 硅基流动（免费档：DeepSeek-R1-0528-Qwen3-8B、Qwen3-8B）
     "siliconflow": "",
-    # 阿里百炼（免费档含 DeepSeek-V4.1-Flash / DeepSeek-V4-Pro）
+    # 阿里百炼（免费额度：Qwen3.8-Max / Qwen3.7-Flash / Qwen3.8-Flash）
     "dashscope": "",
 }
 
@@ -52,18 +52,34 @@ DEFAULT_API_KEYS = {k: _sec.deobf(v) for k, v in _KEY_BLOBS.items()}
 #   scnet -> enable_search:true
 #   dashscope -> enable_search:true + search_options
 
-# ⚠ 2026-09-30 全量实测后的免费清单（用户要求：所有模型都要免费，
+# ⚠ 2026-10-31 全量实测后的免费清单（用户要求：所有模型都要免费，
 #    且明确要的 DeepSeek 必须是「完全永久免费」——不是会耗尽的"免费额度"）。
-#    删掉的两个端点：
+#    删掉的两个端点（沿用 2026-09-30 结论，本轮复核未变）：
 #      baidu    百度千帆 —— 7 个模型全部按量计费；其"永久免费"的
 #               ernie-speed-8k / ernie-3.5-8k 等实测返回 401 invalid_model
 #               （该 Key 无权限），留下等于全付费，故整端点移除。
 #      deepseek DeepSeek 官方 —— 无永久免费额度，且 deepseek-chat /
 #               deepseek-reasoner 两个 id 已下线。
-#    ★ 永久免费的 DeepSeek 来源 = 硅基流动 SiliconFlow（DeepSeek-R1-0528-Qwen3-8B /
-#      DeepSeek-R1-Distill-Qwen-7B，¥0 永久免费、仅限 RPM 限速、无需绑卡，需用户自己
-#      注册实名后把 Key 填到「设置 → 模型」）。阿里百炼（dashscope）上的 DeepSeek
-#      只是"免费额度"会耗尽，已按用户要求移除，只留其 Qwen 免费额度模型兜底。
+#    ★ 2026-10-31 复核结论：
+#      ① 超算 SCNet：/models 返回 32 个模型，只有 SCNet-Max 免费可调，
+#         其余 31 个（DeepSeek-V4.1-Flash、GLM-5.3-Flash、Qwen3.8-Flash 等）
+#         全部 402 Insufficient Balance，故只保留 SCNet-Max。
+#      ② 硅基流动：★ 2026-10-31 二次复核推翻前一版结论 —— 该平台
+#         **已经没有任何可用的免费对话模型**。用用户真实 key 拉 /v1/models
+#         得到 82 个文本模型，逐个实测（含官方价格页仍标 ¥0 的
+#         Qwen3-8B / DeepSeek-R1-0528-Qwen3-8B / Hunyuan-MT-7B /
+#         Ling-mini-2.0 / GLM-Z1-9B）**全部**返回
+#         402 {"code":30001,"message":"Sorry, your account balance is insufficient"}。
+#         官方 2026 年的口径也变了：free 档只剩翻译(Hunyuan-MT)/OCR/向量(bge)/
+#         生图(Kolors) 这类专用小模型，DeepSeek-V4 / GLM-5 / Kimi 全属计费档；
+#         且余额为 0 时连 ¥0 模型也一律 402（必须先充值激活账户）。
+#         结论：siliconflow **不再进自动降级链**，也不标"（免）"，
+#         只作为"用户自己充了钱想用"的可选项排在列表最末。
+#      ③ 阿里百炼（dashscope）：免费是"免费额度"（一次性/限量、会耗尽），
+#         已按用户要求只留 Qwen 免费额度模型兜底（放末尾）。
+#      ④ 当前真正永久免费且实测可用的只有三处：
+#         DeepSeek 网页版（免 API Key）、超算 SCNet-Max（1.5s 返回）、
+#         智谱 GLM-4-Flash / GLM-4.7-Flash（1.6s 返回）。
 PROVIDERS = [
     {
         "name": "zhipu",
@@ -73,12 +89,12 @@ PROVIDERS = [
         "search_style": "zhipu",
         "models": [
             # 免费主力：glm-4.7-flash 比 glm-4-flash 强不少，放前面让「自动模式」优先用它
-            {"id": "glm-4.7-flash", "name": "GLM-4.7-Flash", "free": True},
-            {"id": "glm-4-flash", "name": "GLM-4-Flash", "free": True},
+            {"id": "glm-4.7-flash", "name": "GLM-4.7-Flash（免）", "free": True},
+            {"id": "glm-4-flash", "name": "GLM-4-Flash（免）", "free": True},
             # 视觉模型（图片识别/OCR 用，两个都官方免费）
-            {"id": "glm-4.6v-flash", "name": "GLM-4.6V-Flash（图像识别·免费）",
+            {"id": "glm-4.6v-flash", "name": "GLM-4.6V-Flash（免）",
              "free": True, "vision": True},
-            {"id": "glm-4v-flash", "name": "GLM-4V-Flash（图像识别·免费）",
+            {"id": "glm-4v-flash", "name": "GLM-4V-Flash（免）",
              "free": True, "vision": True},
             # 已删除：glm-4v（GLM-4V 系列按量计费，无免费额度）
         ],
@@ -90,11 +106,12 @@ PROVIDERS = [
         "free": True,
         "search_style": "scnet",
         "models": [
-            # 2026-09-30 实测：该 Key 的 /models 返回 32 个模型，
-            # 但只有 SCNet-Max 是 $0 可调（2.0s 正常返回）；
-            # DeepSeek-V4.x / Qwen3.8-Max / GLM-5.2 等一律 402 Insufficient Balance
-            # （属订阅套餐，不在免费档），故这里只留 SCNet-Max。
-            {"id": "SCNet-Max", "name": "SCNet-Max", "free": True},
+            # 2026-10-31 实测复核：该 Key 的 /models 返回 32 个模型，
+            # 只有 SCNet-Max 免费可调（正常返回 OK）；
+            # DeepSeek-V4.1-Flash / GLM-5.3-Flash / Qwen3.8-Flash /
+            # MiniMax-M3.1-Flash / Kimi-K3 等其余 31 个一律 402 Insufficient
+            # Balance（属订阅套餐，不在免费档），故这里只留 SCNet-Max。
+            {"id": "SCNet-Max", "name": "SCNet-Max（免）", "free": True},
         ],
     },
     {
@@ -105,13 +122,13 @@ PROVIDERS = [
         "search_style": "dashscope",
         "models": [
             # ⚠ 重要：本端点（阿里百炼）的免费访问是「免费额度」（一次性/限量，会耗尽）。
-            #   2026-09-30 实测 deepseek-v4.1-flash 已 403 额度用尽（AllocationQuota.FreeTierOnly）。
+            #   2026-10-31 复核：deepseek-v4.1-flash 免费额度已耗尽（403 FreeTierOnly）。
             #   用户明确要求 DeepSeek 必须是「完全永久免费」——百炼的 DeepSeek 属于免费额度、
             #   不符合，已整体移除（见下面"已删除"）。下面只留百炼的 Qwen 免费额度模型作兜底。
             #   ★ 永久免费的 DeepSeek 在「硅基流动 SiliconFlow」端点（见下，需用户自己的 Key）。
-            {"id": "qwen3.8-max", "name": "Qwen3.8-Max（免费额度）", "free": True},
-            {"id": "qwen3.7-flash", "name": "Qwen3.7-Flash（免费额度）", "free": True},
-            {"id": "qwen3.8-flash", "name": "Qwen3.8-Flash（免费额度·支持图像）",
+            {"id": "qwen3.8-max", "name": "Qwen3.8-Max（免）", "free": True},
+            {"id": "qwen3.7-flash", "name": "Qwen3.7-Flash（免）", "free": True},
+            {"id": "qwen3.8-flash", "name": "Qwen3.8-Flash（免）",
              "free": True, "vision": True},
             # 已删除（用户要"完全永久免费"，百炼 DeepSeek 只是免费额度、会耗尽）：
             #   deepseek-v4.1-flash / deepseek-v4-pro-0813
@@ -120,29 +137,34 @@ PROVIDERS = [
     },
     {
         "name": "siliconflow",
-        "label": "硅基流动 SiliconFlow",
+        # ★ 2026-10-31 复核：该平台已无可用免费对话模型（82 个模型全 402），
+        #   故整组降级为"付费可选"，label 明确标注，且不参与自动降级链。
+        "label": "硅基流动（需充值）",
         "base_url": "https://api.siliconflow.cn/v1",
-        "free": True,
+        "free": False,
         "search_style": "none",
         "models": [
-            # 只有标 ¥0 的才是永久免费（需实名认证）。下面 4 个都是免费档。
-            {"id": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-             "name": "DeepSeek-R1-0528-Qwen3-8B（免费）", "free": True},
-            {"id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-             "name": "DeepSeek-R1-Distill-Qwen-7B（免费）", "free": True},
-            {"id": "Qwen/Qwen3-8B", "name": "Qwen3-8B（免费）", "free": True},
-            {"id": "THUDM/glm-4-9b-chat", "name": "GLM-4-9B-Chat（免费）", "free": True},
-            # 已删除：deepseek-ai/DeepSeek-V3（2/8 元每百万）
-            #         deepseek-ai/DeepSeek-R1（4/16 元每百万）—— 都无免费额度
+            # 只留两个"便宜且能力对得上"的，标 free=False → 下拉框排最后、
+            # 不加"（免）"字样，不会再误导用户以为能白嫖。
+            {"id": "deepseek-ai/DeepSeek-V4.1-Flash",
+             "name": "DeepSeek-V4.1-Flash", "free": False},
+            {"id": "Qwen/Qwen3-8B", "name": "Qwen3-8B", "free": False},
+            # 已删除（403 已下线）：DeepSeek-R1-Distill-Qwen-7B、glm-4-9b-chat
+            # 已删除（实测 402 余额不足，非免费）：DeepSeek-R1-0528-Qwen3-8B
         ],
     },
 ]
 
-# 优先级顺序（免费端点在前）。agent/自动模式按此尝试。
-# 2026-09-30 调整：dashscope 提到第一位 —— 它的免费额度里有真正的
-# DeepSeek-V4.1-Flash / DeepSeek-V4-Pro，是唯一"正规免费 DeepSeek"渠道；
-# 一旦某模型免费额度用尽（会报 403），chat_auto 会自动往后一个端点继续试。
-PROVIDER_PRIORITY = ["siliconflow", "zhipu", "scnet", "dashscope"]
+# 优先级顺序（只放"实测可用且免费"的端点）。agent/自动模式按此尝试。
+# 2026-10-31 二次调整（按实测结论）：
+#   ① deepseek_web  DeepSeek 网页版，免 API Key（本机 CDP 驱动）
+#   ② scnet         超算 SCNet-Max，永久免费，实测 1.5s
+#   ③ zhipu         智谱 GLM-4.7-Flash / GLM-4-Flash，永久免费，实测 1.6s
+#   ④ dashscope     阿里百炼 Qwen 免费额度（会耗尽，放末尾兜底）
+#   ⚠ siliconflow 已实测"全模型 402 余额不足"，**不进自动链**；
+#     用户自己充了钱可在下拉框里手动选它。
+# 一旦某模型失败（额度用尽/余额不足/已下线），chat_auto 会自动往后一个端点继续试。
+PROVIDER_PRIORITY = ["deepseek_web", "scnet", "zhipu", "dashscope"]
 
 # ---------------------------------------------------------------------------
 # 【v9.14.0 新增】DeepSeek 网页版（本机 OpenAI 兼容中转，免 API Key）
@@ -200,8 +222,6 @@ PROVIDERS.append({
 # 占位 key（双保险）：即使设置页把 Key 存成空串，no_key 白名单也让 llm_client 照常工作。
 # （常量定义见上方 WEB_PLACEHOLDER_KEY，此处只引用，避免出现第二份硬编码串。）
 DEFAULT_API_KEYS.setdefault(WEB_PROVIDER_NAME, WEB_PLACEHOLDER_KEY)
-# 放最后：不抢免费 API 的位，仅作自动模式下的兜底候选（且只在"已连接"时才被选）。
-PROVIDER_PRIORITY.append(WEB_PROVIDER_NAME)
 
 
 # 视觉（图片识别/OCR）端点的尝试顺序，免费优先
@@ -214,11 +234,11 @@ SEARCH_PRIORITY = ["zhipu", "dashscope", "scnet"]
 # ---------------------------------------------------------------------------
 # 语音（全免费）
 # ---------------------------------------------------------------------------
-# 语音识别后端尝试顺序。全部有免费额度：
-#   zhipu       智谱 glm-asr-2512（用现有 Key，实测 0.8 秒出结果）
-#   siliconflow 硅基流动 SenseVoiceSmall（注册即送额度，中文准确率高）
+# 语音识别后端尝试顺序。
+#   zhipu       智谱 glm-asr-2512（用现有 Key，实测 0.8 秒出结果）—— 默认首选
 #   dashscope   阿里百炼 paraformer-v2（需账号已开通 ASR）
-ASR_PRIORITY = ["zhipu", "siliconflow", "dashscope"]
+#   siliconflow 硅基流动 SenseVoiceSmall（2026-10 起该平台余额为 0 会 402，排最后）
+ASR_PRIORITY = ["zhipu", "dashscope", "siliconflow"]
 ASR_MODEL_ZHIPU = "glm-asr-2512"
 ASR_MODEL_SILICONFLOW = "FunAudioLLM/SenseVoiceSmall"
 ASR_MODEL_DASHSCOPE = "paraformer-v2"
