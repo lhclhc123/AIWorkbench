@@ -162,14 +162,17 @@ export function renderMarkdown(text) {
   return html.join('');
 }
 
-/* ---------------- 过程消息语义分组（v9.22.1） ----------------
+/* ---------------- 过程消息语义分组（v9.22.2） ----------------
  * 用户：「过程消息是挨个一条条像现在这样生成完后最后有个动画一样的再合并成过程
  *       消息，只留结论，而且也不一定都要合并成一个过程消息，可以多分几组比如
  *       "查找text.cpp"、"了解程序运行逻辑"等简洁合理，中间也可以有小结论」
+ * 用户（v9.22.2）：「深度思考为什么把好几轮的深度思考都放到一块儿了？不要都混到
+ *       一块儿，一个是一个，每个都是单独的一小块儿」
  *
  * 分组规则（只在**收尾/重建**时执行，流式期间仍逐条显示）：
- *   · 相邻且同类（同一工具类别）归一组，切换类别开新组；
- *   · think 是「中性」步骤：并入当前组，不单独断组（3 工具 + 1 think 仍是 1 组）；
+ *   · 相邻且**同类工具**归一组，切换类别开新组；
+ *   · ★ think 绝不进组、也绝不被组吞：它自己打断当前过程组，独立渲染成一张
+ *     <think-card>（一个是一个，互不污染）；
  *   · 单组最多 PROC_MAX_STEPS 条，超了断新组；
  *   · 组标题取第一件工具的**实际参数对象**，说人话（查找 text.cpp / 修改 main.py）。
  * 折叠态只显示组标题 + 小结论；展开才看全部步骤。
@@ -177,6 +180,7 @@ export function renderMarkdown(text) {
 const PROC_MAX_STEPS = 8;
 
 // 工具类别 → 「人话」前缀 + 对象取参规则
+// 注意：这里**没有** think —— 思考不是过程步骤，是独立的卡片（见 planNodes）。
 const PROC_CATEGORIES = {
   find:  { verb: '查找', tool: ['find_lines', 'search_files'], keys: ['pattern', 'query', 'text', 'q'] },
   read:  { verb: '了解', tool: ['read_file', 'read_document', 'list_dir'], keys: ['path', 'file', 'dir', 'directory', 'name'], base: true },
@@ -184,7 +188,6 @@ const PROC_CATEGORIES = {
   run:   { verb: '运行', tool: ['run_command', 'run_python', 'compile_run', 'build_exe'], keys: ['command', 'cmd', 'code'], clip: 12 },
   web:   { verb: '联网查', tool: ['web_search', 'web_visit', 'web_scrape', 'fetch_url'], keys: ['query', 'q', 'url'], clip: 16 },
   ding:  { verb: '钉钉', tool: null, prefix: 'dingtalk', keys: ['action', 'op', 'to', 'title'], clip: 16 },
-  think: { verb: '思考', tool: null },
 };
 const PROC_TOOL_CAT = {};
 for (const [cat, def] of Object.entries(PROC_CATEGORIES)) {
@@ -193,17 +196,54 @@ for (const [cat, def] of Object.entries(PROC_CATEGORIES)) {
 
 function isProcRole(m) { return !!m && (m.role === 'think' || m.role === 'tool'); }
 
+// JSON 字符串能解析就解析成对象，解析不了原样返回（参数摘要要按 key=value 压一行）
+function normaliseArgs(a) {
+  if (typeof a === 'string') {
+    const s = a.trim();
+    if (s.charAt(0) === '{' || s.charAt(0) === '[') {
+      try { return JSON.parse(s); } catch (e) { return s; }
+    }
+  }
+  return a;
+}
+
+/**
+ * 从工具结果 / 回喂文本里抠工具名（最后一层兜底）。
+ * 认得的真实格式：
+ *   · agent.tool_result_feedback()  → 「（系统已执行工具 find_lines，以下是…」
+ *   · 跳过类消息                     → 「[跳过] find_lines 这个调用已连续失败 2 次…」
+ *   · 流式 tool_start 的描述         → 「find_lines（text.cpp）」
+ * @param {string} text
+ * @returns {string} 工具名；认不出返回 ''
+ */
+function nameFromText(text) {
+  const s = String(text == null ? '' : text);
+  let hit = s.match(/（系统已执行工具\s*([A-Za-z][A-Za-z0-9_]*)/);
+  if (hit) return hit[1];
+  hit = s.match(/\[(?:成功|失败|跳过)\]\s*([A-Za-z][A-Za-z0-9_]*)\s/);
+  if (hit) return hit[1];
+  hit = s.match(/^\s*([A-Za-z][A-Za-z0-9_]*)\s*[（(]/);
+  if (hit) return hit[1];
+  return '';
+}
+
 function toolNameOf(m) {
-  const meta = (m && m.meta) || {};
-  let n = meta.name || meta.tool || meta.toolName || '';
+  if (!m) return '';
+  const meta = m.meta || {};
+  // meta.name 优先；其次是后端 out_messages 里顶层的 name（chat_worker 补的）
+  let n = meta.name || meta.tool || meta.toolName || m.name || '';
   // 兜底：流式 tool_start 的文本是「工具名（参数）」；历史消息可能把它塞进 raw
   if (!n && meta.raw) n = String(meta.raw).split(/[（(]/)[0].trim();
+  // 最后一层：从结果文本里抠（老历史消息没有 name 字段，别退化成「工具」两个字）
+  if (!n) n = nameFromText(m.text);
   return String(n || '');
 }
 
 function toolArgsOf(m) {
-  const meta = (m && m.meta) || {};
+  if (!m) return '';
+  const meta = m.meta || {};
   let a = meta.args != null ? meta.args : (meta.arguments != null ? meta.arguments : meta.arg);
+  if (a == null) a = m.args;
   if (a == null && meta.raw) {
     const mm = String(meta.raw).match(/[（(]([\s\S]*)[）)]\s*$/);
     if (mm) a = mm[1];
@@ -217,6 +257,51 @@ function toolArgsOf(m) {
     return s;
   }
   return (typeof a === 'object') ? a : String(a);
+}
+
+/**
+ * 把一次调用的参数压成**一行**（工具胶囊 / 过程步骤的副标签）。
+ * @param {*} raw 参数：对象 / JSON 字符串 / 普通字符串
+ * @param {number=} max 最大长度（默认 60）
+ * @returns {string} 一行参数摘要，放不下就截断加省略号
+ */
+function compressArgs(raw, max) {
+  const limit = (max == null) ? 60 : Number(max);
+  const a = normaliseArgs(raw);
+  let s = '';
+  if (a && typeof a === 'object') {
+    const parts = [];
+    for (const k of Object.keys(a)) {
+      const v = a[k];
+      if (v == null || v === '') continue;
+      let sv = (typeof v === 'string') ? v : JSON.stringify(v);
+      sv = String(sv == null ? '' : sv).replace(/\s+/g, ' ').trim();
+      if (sv.length > 40) sv = sv.slice(0, 39) + '…';
+      parts.push(k + '=' + sv);
+    }
+    s = parts.join(' ');
+  } else if (a != null) {
+    s = String(a);
+  }
+  s = s.replace(/\s+/g, ' ').trim();
+  if (limit > 1 && s.length > limit) s = s.slice(0, limit - 1) + '…';
+  return s;
+}
+
+/**
+ * 把流式 tool_start 的描述拆成「工具名 + 参数」。
+ * chat_worker 的格式是 `f"{name}  {json}"`（两个空格），历史格式是「name（args）」。
+ * @param {string} desc
+ * @returns {{name: string, arg: string}}
+ */
+function splitToolDesc(desc) {
+  const s = String(desc == null ? '' : desc).trim();
+  if (!s) return { name: '', arg: '' };
+  let hit = s.match(/^([A-Za-z][A-Za-z0-9_]*)\s*[（(]([\s\S]*)[）)]\s*$/);
+  if (hit) return { name: hit[1], arg: hit[2] };
+  hit = s.match(/^([A-Za-z][A-Za-z0-9_]*)\s+([\s\S]*)$/);
+  if (hit) return { name: hit[1], arg: hit[2] };
+  return { name: s.split(/[（(]/)[0].trim(), arg: '' };
 }
 
 function pickArg(args, keys) {
@@ -237,7 +322,7 @@ function basenameOf(p) {
 
 function categoryOf(m) {
   if (!m) return 'other';
-  if (m.role === 'think') return 'think';
+  // think 不是过程步骤：它不参与分组，planNodes 里直接单独成块
   if (m.role !== 'tool') return 'other';
   const name = toolNameOf(m);
   if (PROC_TOOL_CAT[name]) return PROC_TOOL_CAT[name];
@@ -258,7 +343,6 @@ function groupObject(cat, m) {
 }
 
 function groupTitle(cat, firstItem) {
-  if (cat === 'think') return PROC_CATEGORIES.think.verb;   // 「思考」
   const def = PROC_CATEGORIES[cat] || {};
   if (!def.verb) {                                          // 认不出的工具：用工具名，别用 id 唬人
     const nm = toolNameOf(firstItem);
@@ -268,57 +352,58 @@ function groupTitle(cat, firstItem) {
   return def.verb + (obj ? ' ' + obj : '');
 }
 
-function thinkLastLine(m) {
+// 工具结果的第一行：折叠态「小结论」的素材（只在本组内部取，绝不跨轮）
+function resultFirstLine(m) {
   const t = (m && m.text) || '';
   if (!t) return '';
   const lines = String(t).replace(/\r\n/g, '\n').split('\n')
     .map((s) => s.trim()).filter(Boolean);
-  return lines.length ? lines[lines.length - 1] : '';
+  if (!lines.length) return '';
+  let s = lines[0].replace(/^\[(?:成功|失败|跳过)\]\s*/, '').replace(/\s+/g, ' ').trim();
+  if (!s) s = lines[0].replace(/\s+/g, ' ').trim();
+  return s.length > 60 ? s.slice(0, 59) + '…' : s;
 }
 
-// 组的小结论：组内最后一条带 label 的工具、或最后一句 think 文本（取最靠后的那个）
+/**
+ * 组的小结论（折叠态那一行）：只从**本组自己的步骤**里取 ——
+ * 先看有没有显式 label，没有就取最后一条工具结果的第一句。
+ * ★ 绝不再从 think 取（think 已经独立成卡片，跨轮混在一起正是用户骂的那个 bug）。
+ */
 function groupSummary(items) {
   for (let i = items.length - 1; i >= 0; i--) {
-    const m = items[i];
-    const meta = (m && m.meta) || {};
+    const meta = (items[i] && items[i].meta) || {};
     if (meta.label) return String(meta.label);
-    if (m && m.role === 'think') {
-      const line = thinkLastLine(m);
-      if (line) return line;
-    }
+  }
+  for (let i = items.length - 1; i >= 0; i--) {
+    const line = resultFirstLine(items[i]);
+    if (line) return line;
   }
   return '';
 }
 
 /**
  * 把消息列表编排成「渲染节点序列」：
- *   {type:'msg', m}                       单条用户/助手消息
- *   {type:'group', cat, title, items:[]}  一组过程消息
+ *   {type:'msg', m}                       单条用户/助手/思考消息
+ *   {type:'group', cat, title, items:[]}  一组过程消息（**只含工具**）
  * 纯函数、无副作用 —— renderMessages 与 finalizeStream 都走它，两条路径结构必然一致。
+ *
+ * ★ think 的语义（v9.22.2）：一条 think 一张独立的 <think-card>，它**主动打断**
+ *   当前过程组（cur = null），既不会被前面的组吞掉，也不会吞掉后面的工具组。
+ *   这样「3 工具 + 1 思考」= 1 个工具组 + 1 张思考卡，而不是被并成 1 组 4 步。
  */
 function planNodes(messages) {
   const out = [];
   let cur = null;
   for (const m of (messages || [])) {
-    if (!isProcRole(m)) { cur = null; out.push({ type: 'msg', m }); continue; }
-    const cat = categoryOf(m);
-    if (m.role === 'think') {
-      // think 中性：有当前组就并入（作为过程/小结论），没有就开「思考」组
-      if (cur && cur.items.length < PROC_MAX_STEPS) {
-        cur.items.push(m);
-      } else {
-        cur = { type: 'group', cat: 'think', title: groupTitle('think', m), items: [m] };
-        out.push(cur);
-      }
+    if (m && m.role === 'think') {
+      // 思考单独成块：先断组，再原样交给 buildMessage 去造 think-card
+      cur = null;
+      out.push({ type: 'msg', m });
       continue;
     }
-    // 工具：同类并入；当前组若还是「纯思考组」，则被这件工具收编（改成本工具类别）
-    if (cur && cur.cat === 'think' && cur.items.every((x) => x.role === 'think')
-        && cur.items.length < PROC_MAX_STEPS) {
-      cur.cat = cat;
-      cur.title = groupTitle(cat, m);
-      cur.items.push(m);
-    } else if (cur && cur.cat === cat && cur.items.length < PROC_MAX_STEPS) {
+    if (!isProcRole(m)) { cur = null; out.push({ type: 'msg', m }); continue; }
+    const cat = categoryOf(m);
+    if (cur && cur.cat === cat && cur.items.length < PROC_MAX_STEPS) {
       cur.items.push(m);
     } else {
       cur = { type: 'group', cat, title: groupTitle(cat, m), items: [m] };
@@ -328,14 +413,17 @@ function planNodes(messages) {
   return out;
 }
 
-// 把一条组内消息转成 think-card 能吃的步骤描述
+// 把一条**工具**消息转成 think-card(process) 能吃的步骤描述。
+// ★ 组里已经没有 think 了（think 独立成卡），所以这里只需要 tool 一种 kind；
+//   即使真有怪东西掉进来，think-card 也会走它的 else 分支当纯文本渲染，不会报错。
 function toProcStep(m) {
-  if (m && m.role === 'think') return { kind: 'think', text: m.text || '' };
-  const meta = (m && m.meta) || {};
+  const cat = categoryOf(m);
+  // 认得出的类别先用「人话对象」（text.cpp），认不出才退回完整参数摘要
+  const obj = (cat === 'other') ? '' : groupObject(cat, m);
   return {
     kind: 'tool',
-    name: toolNameOf(m) || meta.name || '工具',
-    arg: groupObject(categoryOf(m), m),
+    name: toolNameOf(m) || '工具',
+    arg: obj || compressArgs(toolArgsOf(m), 60),
     result: (m && m.text) || '',
   };
 }
@@ -369,16 +457,21 @@ function buildMessage(m) {
     return el;
   }
   if (role === 'think') {
-    // 兜底：正常路径里 think 都进组（见 planNodes）；单独调用也保证 markdown 生效
+    // ★ 每一轮思考都是**独立的一小块**（用户：不要都混到一块儿，一个是一个）。
+    //   折叠、一行标题、点开只看到自己那一段 —— 不显示「N 步」，也不进任何过程组。
     const el = document.createElement('think-card');
     el.open = false;
+    el.title = '深度思考';
+    el.meta = '';
     el.setMarkdownFn(renderMarkdown);
     el.text = m.text || '';
     return el;
   }
   if (role === 'tool') {
+    // ★ 工具胶囊必须显示**真实工具名 + 参数摘要**，绝不能只剩「工具」两个字
     const el = document.createElement('tool-capsule');
-    el.name = meta.name || '工具';
+    el.name = toolNameOf(m) || '工具';
+    el.arg = compressArgs(toolArgsOf(m), 60);
     el.result = m.text || '';
     el.setRunning(false);
     return el;
@@ -695,6 +788,28 @@ function bindBridge() {
     renderMessages(msgs);
   });
 
+  // ★ v9.22.2：会话列表推送。老版本后端只刷 Qt 侧的列表，网页这边**从没收到过
+  //   任何「新对话已建好」的通知** —— 这就是用户说的「加号点了没反应」。
+  //   后端 _new_conversation / _load_conversations 现在都会 send_convs，
+  //   clearThread=true 表示「刚切到一个空会话」，要把消息区清空回欢迎态。
+  on('convs', (p) => {
+    if (!p) return;
+    const next = { convs: p.convs || [] };
+    if (p.currentConvId !== undefined) next.currentConvId = p.currentConvId || null;
+    if (p.clearThread) {
+      next.messages = [];
+      next.streaming = false;
+      streamMsg = null;
+      streamThink = null;
+      currentTool = null;
+      streamBaseCount = 0;
+      streamBaseMsgCount = 0;
+    }
+    patch(next);
+    renderConvList();
+    if (p.clearThread) renderMessages([]);
+  });
+
   on('token', (p) => {
     if (!p || !streamMsg) return;
     streamMsg.appendText(p.delta || '');
@@ -710,12 +825,19 @@ function bindBridge() {
 
   on('tool_start', (p) => {
     if (!p) return;
+    // 描述形如「find_lines  {"pattern": "text.cpp"}」或「find_lines（text.cpp）」，
+    // 拆成真实工具名 + 参数摘要 —— 用户要看的是「用的什么工具、执行的啥」。
+    const info = splitToolDesc(p.text || '');
     const cap = document.createElement('tool-capsule');
-    cap.name = (p.text || '执行工具').split(/[（(]/)[0];
-    cap.arg = p.text || '';
+    cap.name = info.name || '工具';
+    cap.arg = compressArgs(info.arg, 60);
     cap.setRunning(true);
     if (streamMsg) streamMsg.insertBeforeBody(cap);
     currentTool = cap;
+    // ★ v9.22.2：工具是「本轮思考结束」的分界线 —— 丢掉当前的流式思考卡，
+    //   下一次 send_reason 会开一张新卡。否则好几轮的深度思考在流式期间
+    //   也会被写进同一个块里（收尾重建后不混，但生成过程中混，同样是那个 bug）。
+    streamThink = null;
     scrollBottom(false);
   });
 

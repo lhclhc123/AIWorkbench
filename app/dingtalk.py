@@ -199,6 +199,25 @@ def find_dws():
         node = _find_node()
         if node:
             return node, base
+    # 2.5 ★ v9.22.2：**本程序自己一键安装的目录**。
+    #   老实现把 dws 装到 ~/.awb/dws-cli，却只认 ~/.workbuddy/... 和 PATH ——
+    #   于是"装成功了，但重启后又找不到"，用户再点一次一键配置又装一遍，
+    #   网络慢就表现为「配置 CLI 一直超时」。这里补上自建目录，装完重启也能认。
+    for cand in (
+        os.path.join(home, ".awb", "dws-cli", "node_modules",
+                     "dingtalk-workspace-cli", "bin", "dws.js"),
+        os.path.join(home, ".awb", "dws-cli", "node_modules",
+                     "dingtalk-workspace-cli", "bin", "dws"),
+    ):
+        if os.path.exists(cand):
+            node = _find_node()
+            if node:
+                return node, cand
+    # 2.6 自建目录里 npm 生成的 .bin 包装脚本（Windows 下是 .cmd）
+    for cand in ("dws.cmd", "dws"):
+        p = os.path.join(home, ".awb", "dws-cli", "node_modules", ".bin", cand)
+        if os.path.exists(p):
+            return None, p
     # 3. PATH 里的 dws / dws.cmd（全局 npm i -g dingtalk-workspace-cli）
     for cand in ("dws.cmd", "dws"):
         p = shutil.which(cand)

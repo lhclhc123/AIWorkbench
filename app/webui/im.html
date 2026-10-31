@@ -194,6 +194,33 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- ============ 钉钉 CLI 配置进度窗口（v9.22.2） ============
+     用户原话：「配置的过程我也看不见，你不行再多弹出来一个窗口嘛，
+               它在安装什么干什么东西进度条都显示出来啊」
+     所以在安装/登录期间弹一个模态窗口：进度条 + 逐步状态 + 实时日志。 -->
+<div class="cli-modal" id="cliModal" hidden>
+  <div class="cli-box" role="dialog" aria-modal="true" aria-labelledby="cliTitle">
+    <div class="cli-head">
+      <span class="cli-dot" id="cliDot"></span>
+      <span class="cli-title" id="cliTitle">正在配置钉钉 CLI</span>
+      <span class="spacer"></span>
+      <button class="cli-x" id="cliClose" title="关掉这个窗口（后台会继续）">✕</button>
+    </div>
+    <div class="cli-bar"><i id="cliBar" style="width:2%"></i></div>
+    <div class="cli-hint" id="cliHint">准备中…</div>
+    <ul class="cli-steps" id="cliSteps"></ul>
+    <details class="cli-log-wrap" id="cliLogWrap">
+      <summary>查看安装日志</summary>
+      <pre class="cli-log" id="cliLog"></pre>
+    </details>
+    <div class="cli-foot">
+      <span class="cli-elapsed" id="cliElapsed"></span>
+      <button class="btn btn-ghost" id="cliLoginGo" hidden>去登录钉钉</button>
+      <button class="btn" id="cliDone" hidden>完成</button>
+    </div>
+  </div>
+</div>
+
 <script src="./js/vendor/qwebchannel.js"></script>
 <script type="module" src="./js/im.js"></script>
 </body>

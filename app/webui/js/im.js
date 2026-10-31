@@ -108,6 +108,151 @@ function startCliWatch(onDone) {
   cliWatchTimer = setTimeout(() => tick(0), 800);
 }
 
+/* ---------------- 配置进度窗口（v9.22.2） ----------------
+ * 用户原话：「配置的过程我也看不见，你不行再多弹出来一个窗口嘛，它在安装
+ *           什么干什么东西进度条都显示出来啊」
+ * 后端 _im_cli_state_data 现在推 steps / percent / log 三个字段，这里把它们
+ * 画成一个模态小窗：进度条 + 四步状态 + 可展开的实时日志 + 用时计时器。
+ * 关掉窗口不打断后台任务（busy 仍在跑），下次新的一次运行才会再自动弹。
+ */
+const CLI_STEP_ICON = { pending: '○', running: '◐', done: '✓', fail: '✕' };
+let cliShownRun = 0;        // 已经为哪一次运行弹过窗（后端 started_at）
+let cliElapsedTimer = null;
+
+function fmtSec(s) {
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m} 分 ${r} 秒` : `${r} 秒`;
+}
+
+function tickCliElapsed() {
+  const el = $('#cliElapsed');
+  if (!el) return;
+  const cli = state.cli || {};
+  const st = Number(cli.started_at || 0);
+  if (!st) { el.textContent = ''; return; }
+  const end = cli.busy ? Date.now() / 1000 : (Number(cli.done_at || 0) || Date.now() / 1000);
+  el.textContent = (cli.busy ? '已用 ' : '用时 ') + fmtSec(Math.max(0, Math.round(end - st)));
+}
+
+function openCliModal() {
+  const m = $('#cliModal');
+  if (!m || !m.hidden) return;
+  m.hidden = false;
+  clearInterval(cliElapsedTimer);
+  tickCliElapsed();
+  cliElapsedTimer = setInterval(tickCliElapsed, 1000);
+}
+
+function closeCliModal() {
+  const m = $('#cliModal');
+  if (m) m.hidden = true;
+  clearInterval(cliElapsedTimer);
+  cliElapsedTimer = null;
+}
+
+/* 把后端状态画到窗口上（refreshState / im_refresh 都会调） */
+function renderCli(cli) {
+  const modal = $('#cliModal');
+  if (!modal) return;
+  cli = cli || {};
+  const busy = !!cli.busy;
+  const runId = Number(cli.started_at || 0);
+  const steps = cli.steps || [];
+  // 从没跑过就别动（页面平时 10s 轮询一次，不能让它自己冒出来）
+  if (!runId || steps.length === 0) return;
+
+  // 新的一次运行（started_at 变了）且正在跑 → 自动弹窗；用户关掉后不再骚扰
+  if (busy && runId !== cliShownRun) {
+    cliShownRun = runId;
+    openCliModal();
+  }
+
+  const pct = Math.max(0, Math.min(100, Number(cli.percent || 0)));
+  const bar = $('#cliBar');
+  if (bar) {
+    bar.classList.toggle('is-indet', busy && pct <= 0);
+    bar.style.width = (busy && pct <= 0 ? 100 : Math.max(2, pct)) + '%';
+    bar.classList.toggle('is-done', !busy && !!cli.ok);
+    bar.classList.toggle('is-fail', !busy && cli.ok === false);
+  }
+
+  const dot = $('#cliDot');
+  if (dot) dot.className = 'cli-dot ' + (busy ? 'on' : (cli.ok ? 'ok' : 'bad'));
+  const title = $('#cliTitle');
+  if (title) {
+    title.textContent = busy ? '正在配置钉钉 CLI'
+      : (cli.ok ? '配置完成' : '配置未完成');
+  }
+  const hint = $('#cliHint');
+  if (hint) hint.textContent = cli.message || (busy ? '正在处理…' : '');
+
+  // 四步状态
+  const ul = $('#cliSteps');
+  if (ul) {
+    ul.innerHTML = '';
+    steps.forEach((s) => {
+      const st = s.status || 'pending';
+      const li = document.createElement('li');
+      li.className = 'cli-step is-' + st;
+      const ic = document.createElement('span');
+      ic.className = 'cli-step-ic';
+      ic.textContent = CLI_STEP_ICON[st] || '○';
+      const tx = document.createElement('span');
+      tx.className = 'cli-step-tx';
+      const lb = document.createElement('b');
+      lb.textContent = s.label || s.key || '';
+      tx.appendChild(lb);
+      if (s.detail) {
+        const dt = document.createElement('i');
+        dt.textContent = String(s.detail).slice(0, 300);
+        tx.appendChild(dt);
+      }
+      li.appendChild(ic);
+      li.appendChild(tx);
+      ul.appendChild(li);
+    });
+  }
+
+  // 实时日志（用户看得到「到底在装什么」）
+  const log = Array.isArray(cli.log) ? cli.log : [];
+  const wrap = $('#cliLogWrap');
+  const pre = $('#cliLog');
+  if (wrap && pre) {
+    if (log.length === 0) {
+      wrap.hidden = true;
+    } else {
+      wrap.hidden = false;
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 28;
+      pre.textContent = log.join('\n');
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+    }
+  }
+
+  // 底部按钮：还没登录 → 给「去登录钉钉」；跑完 → 给「完成」
+  const needLogin = !busy && steps.some((s) => s.key === 'auth' && s.status !== 'done');
+  const go = $('#cliLoginGo');
+  if (go) go.hidden = !needLogin;
+  const done = $('#cliDone');
+  if (done) done.hidden = busy;
+
+  tickCliElapsed();
+}
+
+function wireCliModal() {
+  const m = $('#cliModal');
+  if (!m) return;
+  $('#cliClose').addEventListener('click', closeCliModal);
+  $('#cliDone').addEventListener('click', closeCliModal);
+  // 点遮罩空白处也能关（别让用户觉得窗口关不掉）
+  m.addEventListener('click', (e) => { if (e.target === m) closeCliModal(); });
+  $('#cliLoginGo').addEventListener('click', () => {
+    closeCliModal();
+    const b = $('#cliLoginBtn');
+    if (b && !b.disabled) b.click();
+  });
+}
+
 /* ---------------- tab 切换 ---------------- */
 function wireTabs() {
   document.querySelectorAll('.tab').forEach((t) => {
@@ -318,6 +463,7 @@ async function refreshState() {
     renderSettings();
     renderTags();
     renderStatus();
+    renderCli(state.cli);      // ★ v9.22.2：配置进度窗口跟着状态一起刷
   } catch (e) {
     console.error('[im] refreshState 失败', e);
   } finally {
@@ -465,7 +611,9 @@ function wire() {
       restore();
       return;
     }
-    // 后端已受理：按钮保持「配置中…」，等真正跑完再由 startCliWatch 恢复
+    // 后端已受理：立刻把进度窗口弹出来（用户点完就能看见「在装什么」），
+    // 后续 steps/percent/log 由 renderCli 一点点填进去。
+    openCliModal();
     startCliWatch(restore);
     await refreshState();
   });
@@ -489,6 +637,7 @@ function wire() {
       restore();
       return;
     }
+    openCliModal();
     startCliWatch(restore);
     await refreshState();
   });
@@ -497,6 +646,7 @@ function wire() {
 /* ---------------- 启动 ---------------- */
 async function boot() {
   wire();
+  wireCliModal();
   // 订阅后端主动推送的 IM 刷新事件（消息到达/状态变化时后端会推 im_refresh）
   on('im_refresh', () => refreshState());
   await refreshState();

@@ -146,6 +146,15 @@ class WebUIBridge(QObject):
     def send_messages(self, payload):
         self.emit_event("messages", payload)
 
+    def send_convs(self, payload):
+        """会话列表变了（新建 / 删除 / 改名 / 切换）→ 让网页左栏重画。
+
+        ★ v9.22.2：老版本只在 init 里推一次会话列表，于是网页里点「+ 新建对话」
+          后端确实建了、Qt 侧也切了，但**网页左栏一个字都不动、对话区也不清空**，
+          用户看到的就是「加号点了没有任何反应」。
+        """
+        self.emit_event("convs", payload)
+
     def send_token(self, delta):
         """流式 token：只往 buffer 追加，50ms 由定时器 flush。"""
         if delta:

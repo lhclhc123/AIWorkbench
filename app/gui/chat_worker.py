@@ -171,6 +171,52 @@ def _write_preview(call):
     return "```%s\n%s%s\n```" % (lang, "\n".join(lines), more)
 
 
+def _compact_args(args, limit=200):
+    """把参数压成**一行紧凑字符串**（args 不是 dict 时的兜底）。"""
+    if isinstance(args, str):
+        s = args
+    else:
+        try:
+            s = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            s = str(args)
+    s = " ".join(str(s).split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _tool_msg(name, content, args=None):
+    """造一条给界面看的工具消息（role=tool）。
+
+    修的真实 bug（用户 2026-10-01 反馈"工具现在怎么就显示工具俩字儿，我都看不着
+    它用的什么工具执行的啥了"）：
+    老代码只 append ``{"role": "tool", "content": shown}`` —— 工具名和参数全都丢了，
+    网页重建历史消息时只能退化成一个孤零零的「工具」标题。
+    现在一律带上：
+
+      · ``name``：真实工具名（find_lines / write_file / auto_verify …）；
+      · ``args``：该次调用的参数（dict 优先，拿不到就用紧凑字符串）。
+
+    这两个字段会被 main_window._web_conv_messages() 透传成 meta.name / meta.args，
+    再被 chat.js 的 toolNameOf() / toolArgsOf() 读成胶囊标题和参数摘要。
+    """
+    if args is None:
+        payload = {}
+    elif isinstance(args, dict):
+        # 浅拷贝一层：界面只读，但别让后续改动污染调用方的 dict
+        try:
+            payload = dict(args)
+        except Exception:
+            payload = _compact_args(args)
+    else:
+        payload = _compact_args(args)
+    return {
+        "role": "tool",
+        "content": content,
+        "name": str(name or ""),
+        "args": payload,
+    }
+
+
 class ChatWorker(QThread):
     token = pyqtSignal(str)            # 增量文本
     reason = pyqtSignal(str)           # ★ v9.18.0（需求 17）思维链增量，边来边显示
@@ -946,7 +992,9 @@ class ChatWorker(QThread):
                         auto = self._auto_verify(written_paths)
                         if auto:
                             verified_after_write = True
-                            self.out_messages.append({"role": "tool", "content": auto})
+                            self.out_messages.append(_tool_msg(
+                                "auto_verify", auto,
+                                {"written": list(written_paths or [])}))
                             self.tool_result.emit(auto)
                             if agent_mod.verify_failed(auto) and fix_rounds < 2:
                                 fix_rounds += 1
@@ -1018,9 +1066,10 @@ class ChatWorker(QThread):
                         feedback_parts.append(
                             f"（工具 {name} 未执行）这个调用之前已经连续失败 2 次，"
                             f"不要再原样重试。请换一种写法或换一个路径。")
-                        self.out_messages.append(
-                            {"role": "tool",
-                             "content": f"[跳过] {name} 这个调用已连续失败 2 次，已停止重试。"})
+                        self.out_messages.append(_tool_msg(
+                            name,
+                            f"[跳过] {name} 这个调用已连续失败 2 次，已停止重试。",
+                            call.get("arguments", {})))
                         continue
                     self.phase.emit("tool", name)
                     self.tool_start.emit(
@@ -1133,7 +1182,8 @@ class ChatWorker(QThread):
                         prev = _write_preview(call)
                         if prev:
                             shown = result + "\n\n" + prev
-                    self.out_messages.append({"role": "tool", "content": shown})
+                    self.out_messages.append(
+                        _tool_msg(name, shown, call.get("arguments", {})))
                     feedback_parts.append(f"（工具 {name} 的真实输出）\n{result}")
 
                 if blocked_repeat:
@@ -1177,10 +1227,10 @@ class ChatWorker(QThread):
                 except Exception:
                     items = []
                 chk.append("▰ 工作区当前文件：" + (", ".join(items) if items else "（空）"))
-                self.out_messages.append({
-                    "role": "tool",
-                    "content": "【系统完成自检】\n" + "\n".join(chk),
-                })
+                self.out_messages.append(_tool_msg(
+                    "self_check",
+                    "【系统完成自检】\n" + "\n".join(chk),
+                    {"written": list(written_paths or [])}))
 
             # ---------- 收尾：保证一定有一条最终答复 ----------
             # ★ v9.18.0（需求 15）：用户点了停止 —— **绝不再调模型**。
@@ -1250,7 +1300,9 @@ class ChatWorker(QThread):
                 auto = self._auto_verify(written_paths)
                 if auto:
                     verified_after_write = True
-                    self.out_messages.append({"role": "tool", "content": auto})
+                    self.out_messages.append(_tool_msg(
+                        "auto_verify", auto,
+                        {"written": list(written_paths or [])}))
                     self.tool_result.emit(auto)
                     _tail = ("\n\n---\n**程序自动运行的验证结果**"
                              "（系统代跑，以下是真实输出）：\n\n" + auto)

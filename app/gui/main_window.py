@@ -12,6 +12,7 @@
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 
@@ -642,6 +643,45 @@ class MainWindow(QMainWindow):
         try:
             for note in self.dsw.take_notices():
                 self.statusBar().showMessage(str(note)[:160], 12000)
+        except Exception:
+            pass
+        # ★ v9.22.2：选了 DeepSeek 网页版 → 周期性自检连通性，不通就推事件让前端弹窗
+        try:
+            self._ds_health_tick(state, st)
+        except Exception:
+            pass
+
+    _DS_OK_STATES = ("ready", "generating")
+
+    def _ds_health_tick(self, state, st):
+        """选了 DeepSeek 网页版时主动自检连通性。
+
+        用户要求：「只要用户选择了 DeepSeek 大模型，就要经常性地自检一下有没有连通，
+        如果没有连通，就弹出一个对话框，提醒用户还没联通，然后引导用户联通。」
+
+        节流规则：状态**变化**时立刻推；状态没变时每 90 秒最多提醒一次 ——
+        否则底层每 1.5s 轮询一次会让弹窗疯狂刷屏。
+        """
+        if not (self._web_engine and self._web_bridge is not None):
+            return
+        if not self._dsw_is_web_model():
+            return
+        ok = str(state) in self._DS_OK_STATES
+        now = time.time()
+        last = getattr(self, "_ds_health_last", None)
+        if last and bool(last.get("ok")) == ok and (now - float(last.get("at") or 0)) < 90:
+            return
+        self._ds_health_last = {"ok": ok, "at": now, "state": state}
+        try:
+            self._web_bridge.emit_event("ds_health", {
+                "ok": ok,
+                "state": str(state),
+                "kind": str(st.get("kind") or state),
+                "detail": str(st.get("detail") or ""),
+                "model": str(self.settings.get("selected_model") or ""),
+                "chrome": bool(st.get("chrome")),
+                "at": now,
+            })
         except Exception:
             pass
 
@@ -1478,13 +1518,10 @@ class MainWindow(QMainWindow):
             # ★ v9.21.1：不再在这里 push init —— 前端连接成功后会上行 ready，
             #   由 cmd_ready 触发 _web_push_init。否则前端还没 onEvent 就丢了 init。
 
-    def _web_push_init(self):
-        """把初始状态推给网页：主题 / 会话列表 / 模型列表。"""
-        if self._web_bridge is None:
-            return
+    def _web_conv_list(self):
+        """左栏会话列表的统一构造（init 与 convs 推送共用同一份口径）。"""
+        convs = []
         try:
-            theme = str(self.settings.get("theme", "light") or "light")
-            convs = []
             for c in (self.workspace.list_conversations() or []):
                 convs.append({
                     "id": c.get("id", ""),
@@ -1492,6 +1529,72 @@ class MainWindow(QMainWindow):
                     "preview": c.get("preview", ""),
                     "time": c.get("time", ""),
                 })
+        except Exception:
+            pass
+        return convs
+
+    def _web_ds_health_check(self):
+        """网页「立即重试」：后台重新拉一次 DeepSeek 网页版，立刻返回状态快照。"""
+        self._dsw_ensure()
+        try:
+            self._dsw_sync_prefs()
+        except Exception:
+            pass
+
+        def work():
+            try:
+                self.dsw.connect_if_online()
+            except Exception:
+                pass
+            try:
+                if self._dsw_auto_on():
+                    self.dsw.ensure_started()
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True, name="awb-ds-health").start()
+        try:
+            st = self.dsw.status()
+        except Exception:
+            st = {}
+        return {"ok": True, "async": True,
+                "state": str(st.get("state") or "not_started"),
+                "detail": str(st.get("detail") or "")}
+
+    def _web_ds_show_window(self):
+        """网页「打开登录窗口」：把 DeepSeek 网页亮出来（后台线程，不卡界面）。"""
+        try:
+            threading.Thread(target=self._dsw_do_show, daemon=True,
+                             name="awb-ds-showwin-web").start()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "async": True,
+                "message": "正在打开 DeepSeek 网页窗口，登录一次后长期免登。"}
+
+    def _web_push_convs(self, clear_thread=False):
+        """把会话列表推给网页（新建/删除/改名/切换后调用）。
+
+        ★ v9.22.2：老版本只在 init 推一次，所以网页点「+ 新建对话」时后端建了、
+          Qt 侧切了，网页左栏与对话区**毫无变化** —— 用户反馈「加号点了没反应」。
+        """
+        if not (self._web_engine and self._web_bridge is not None):
+            return
+        try:
+            self._web_bridge.send_convs({
+                "convs": self._web_conv_list(),
+                "currentConvId": self._conv_cid(),
+                "clearThread": bool(clear_thread),
+            })
+        except Exception:
+            pass
+
+    def _web_push_init(self):
+        """把初始状态推给网页：主题 / 会话列表 / 模型列表。"""
+        if self._web_bridge is None:
+            return
+        try:
+            theme = str(self.settings.get("theme", "light") or "light")
+            convs = self._web_conv_list()
             # ★ v9.21.0 修复：模型列表必须推给网页，否则「换模型」菜单是空的。
             #   前端 renderModelMenu 读 {label, choice}；这里对齐 _fill_model_combo 的
             #   顺序：先 [自动] 免费优先，再按 all_models_sorted 逐个（含 免费/付费 徽标）。
@@ -1595,13 +1698,26 @@ class MainWindow(QMainWindow):
                 r = "think"
             else:
                 r = "assistant"
+            # ★ v9.22.2：工具消息必须把**工具名与参数**透传给前端。
+            #   chat_worker._tool_msg() 已经把它们写进对话 JSON（name / args），
+            #   老版本这里只透传 model，前端 toolNameOf() 拿不到 name，
+            #   历史消息重建时就退化成孤零零的「工具」两个字（用户明确投诉）。
+            #   think 消息同理带上 label，方便前端区分多轮思考。
+            meta = {"model": m.get("_model", "")}
+            if r == "tool":
+                nm = str(m.get("name") or m.get("tool") or "")
+                if nm:
+                    meta["name"] = nm
+                a = m.get("args")
+                if a is None:
+                    a = m.get("arguments")
+                if a not in (None, "", {}, []):
+                    meta["args"] = a
             out.append({
                 "id": str(m.get("id", "") or ""),
                 "role": r,
                 "text": str(content),
-                "meta": {
-                    "model": m.get("_model", ""),
-                },
+                "meta": meta,
             })
         return out
 
@@ -1673,6 +1789,10 @@ class MainWindow(QMainWindow):
         if method == "im_cli_login":
             return self._web_im_cli_login()
         # ---- 通用：模型列表 / 主题（供各页面共用）----
+        if method == "ds_health_check":
+            return self._web_ds_health_check()
+        if method == "ds_show_window":
+            return self._web_ds_show_window()
         if method == "get_models":
             models = [{"label": "[自动] 免费优先", "choice": "auto"}]
             for m in config.all_models_sorted():
@@ -2225,10 +2345,18 @@ class MainWindow(QMainWindow):
             pass
 
     def _im_cli_state_get(self):
-        """CLI 一键配置/登录的异步状态（前端轮询 im_get_state 拿）。"""
+        """CLI 一键配置/登录的异步状态（前端轮询 im_get_state 拿）。
+
+        ★ v9.22.2：新增 `steps` / `percent` / `log` 三个字段，供前端「配置进度窗口」
+          逐步展示。老版本只有一个 `message` 字符串，用户点了按钮只看到一句提示，
+          完全不知道到底在装什么、卡在哪一步（用户原话：「配置的过程我也看不见，
+          你不行再多弹出来一个窗口嘛，它在安装什么干什么东西进度条都显示出来啊」）。
+        """
         if not hasattr(self, "_im_cli_state_data"):
             self._im_cli_state_data = {
-                "busy": False, "ok": None, "message": "", "done_at": 0.0}
+                "busy": False, "ok": None, "message": "", "done_at": 0.0,
+                "started_at": 0.0, "steps": [], "percent": 0, "log": [],
+            }
         return self._im_cli_state_data
 
     def _im_cli_state_set(self, **kw):
@@ -2237,6 +2365,105 @@ class MainWindow(QMainWindow):
         if not st.get("busy"):
             st["done_at"] = time.time()
         return st
+
+    # ---- v9.22.2：分步进度（前端进度窗口吃这三个方法推出来的状态）----
+    _IM_CLI_STEPS = (
+        ("node", "检查 Node.js 运行环境"),
+        ("dws", "检查 / 安装钉钉命令行工具 dws"),
+        ("verify", "校验 dws 能否正常运行"),
+        ("auth", "检查钉钉登录状态"),
+    )
+
+    def _im_cli_steps_init(self):
+        st = self._im_cli_state_get()
+        st.update(
+            busy=True, ok=None, message="正在配置钉钉 CLI…", done_at=0,
+            percent=2, log=[], started_at=time.time(),
+            steps=[{"key": k, "label": lbl, "status": "pending", "detail": ""}
+                   for k, lbl in self._IM_CLI_STEPS],
+        )
+        self._notify_im_refresh()
+
+    def _im_cli_step(self, key, status, detail="", percent=None, message=None):
+        """把某一步置为 running / done / fail，并可选更新总进度。"""
+        st = self._im_cli_state_get()
+        for s in (st.get("steps") or []):
+            if s.get("key") == key:
+                s["status"] = status
+                if detail:
+                    s["detail"] = str(detail)[:400]
+        if percent is not None:
+            st["percent"] = max(0, min(100, int(percent)))
+        if message:
+            st["message"] = message
+        self._notify_im_refresh()
+
+    def _im_cli_log(self, line, creep=None):
+        """追加一行实时日志（前端滚动展示）。creep=(from,to) 时按日志条数缓慢推进。"""
+        st = self._im_cli_state_get()
+        lg = st.setdefault("log", [])
+        for ln in str(line or "").replace("\r", "\n").split("\n"):
+            ln = ln.strip()
+            if ln:
+                lg.append(ln[:300])
+        if len(lg) > 80:
+            del lg[:-80]
+        if creep:
+            lo, hi = creep
+            st["percent"] = min(hi, lo + len(lg))
+        self._notify_im_refresh()
+
+    def _im_cli_run_npm(self, args, registry=None, deadline=420):
+        """流式跑 npm：边跑边把输出推进进度窗口，返回 (rc, 最后几行文本)。
+
+        ★ v9.22.2：老实现是 `_wp.run(..., timeout=300)` 一次性阻塞 —— 用户既看不到
+          进度，网慢就直接「超时」。现在改成逐行读 stdout/stderr，日志实时上屏。
+        """
+        import app.winproc as _wp
+        cmd = list(args)
+        if registry:
+            cmd += ["--registry", registry]
+        cmd += ["--no-fund", "--no-audit", "--loglevel", "info"]
+        self._im_cli_log("$ " + " ".join(cmd))
+        try:
+            p = _wp.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding="utf-8", errors="ignore", bufsize=1)
+        except Exception as exc:
+            return -1, f"启动 npm 失败：{type(exc).__name__}: {exc}"
+        t0 = time.time()
+        try:
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                self._im_cli_log(line, creep=(25, 70))
+                if time.time() - t0 > deadline:
+                    try:
+                        _wp.kill_tree(p)
+                    except Exception:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    return -9, "安装超时（超过 %d 秒），请检查网络后重试" % deadline
+            try:
+                p.wait(timeout=60)
+            except Exception:
+                try:
+                    _wp.kill_tree(p)
+                except Exception:
+                    pass
+                return -9, "安装进程无响应，已终止"
+        except Exception as exc:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return -1, f"安装中断：{type(exc).__name__}: {exc}"
+        tail = "\n".join((self._im_cli_state_get().get("log") or [])[-8:])
+        return p.returncode, tail
 
     def _web_im_state(self):
         """钉钉助手页全量状态：消息双栏 + 设置 + 标签 + 钉钉登录态。"""
@@ -2345,7 +2572,13 @@ class MainWindow(QMainWindow):
             ok = bool(result.get("ok"))
             msg = (result.get("message") or result.get("error")
                    or ("钉钉 CLI 已就绪" if ok else "配置失败"))
-            self._im_cli_state_set(busy=False, ok=ok, message=msg)
+            # ★ v9.22.2：收尾时把「还在转圈」的那一步落定，别让进度窗口永远卡在 90%
+            st = self._im_cli_state_get()
+            for s in (st.get("steps") or []):
+                if s.get("status") == "running":
+                    s["status"] = "done" if ok else "fail"
+            self._im_cli_state_set(busy=False, ok=ok, message=msg,
+                                   percent=100 if ok else st.get("percent", 0))
             self._notify_im_refresh()
 
         threading.Thread(target=_worker, daemon=True,
@@ -2354,67 +2587,125 @@ class MainWindow(QMainWindow):
                 "message": "正在配置钉钉 CLI…（可离开本页，完成后会提示）"}
 
     def _im_cli_setup_worker(self):
-        """真正干活：检测 → 缺 node/dws 就自动装 → 返回结果 dict。"""
+        """真正干活：检测 → 缺 node/dws 就自动装 → 校验 → 看登录态。
+
+        ★ v9.22.2：全程**分步上报**（steps / percent / log），前端有一个进度窗口
+          逐步显示「在做什么、装到哪、日志长什么样」。老实现一次性阻塞，
+          用户只看到一句「超时」，完全不知道发生了什么。
+        """
+        import shutil
         from ..dingtalk import find_dws, _find_node
+
+        self._im_cli_steps_init()
+
+        # ---------- 步骤 1/4：Node.js ----------
+        self._im_cli_step("node", "running", "正在查找 Node.js…", percent=5,
+                          message="步骤 1/4：检查 Node.js")
+        node_exe = _find_node()
+        if not node_exe:
+            self._im_cli_step("node", "fail", "没找到 Node.js")
+            return {"ok": False,
+                    "error": "没找到 Node.js。请先安装 Node.js（建议 18 以上），"
+                             "装完后重新点一次「一键配置」。"}
+        self._im_cli_step("node", "done", node_exe, percent=15)
+
+        # ---------- 步骤 2/4：dws ----------
+        self._im_cli_step("dws", "running", "正在查找已安装的 dws…", percent=20,
+                          message="步骤 2/4：检查钉钉命令行工具")
         node, dws = find_dws()
-        if dws:
-            # 已有 dws，看登录态
-            authed = False
-            try:
-                st = self.ding.dws_auth_status() or {}
-                authed = bool(st.get("authenticated"))
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "message": "钉钉 CLI 已就绪" + ("，且已登录" if authed else "，还需登录"),
-                "available": True,
-                "authenticated": authed,
-            }
-        # 没找到 dws：尝试自动安装
-        try:
-            node_exe = _find_node()
-            if not node_exe:
-                return {"ok": False, "error": "没找到 Node.js，请先安装 Node.js 后再试"}
-            import subprocess
-            import shutil
-            # 装到用户目录下独立 prefix，避免 -g 全局污染
+        if not dws:
             target = os.path.join(os.path.expanduser("~"), ".awb", "dws-cli")
             os.makedirs(target, exist_ok=True)
             npm = shutil.which("npm")
-            npm_cmd = []
             if npm:
                 npm_cmd = [npm]
             else:
-                # 没有 npm 命令，用 node 直接跑 npm-cli.js（若存在）
-                npm_cli = os.path.join(os.path.dirname(node_exe), "..", "node_modules", "npm", "bin", "npm-cli.js")
-                if os.path.exists(npm_cli):
-                    npm_cmd = [node_exe, npm_cli]
-                else:
-                    return {"ok": False, "error": "没找到 npm，无法自动安装 dws"}
-            self._im_cli_state_set(
-                busy=True, message="正在安装 dingtalk-workspace-cli…（首次可能较慢）")
-            self._notify_im_refresh()
-            cmd = npm_cmd + ["install", "--prefix", target, "dingtalk-workspace-cli"]
-            import app.winproc as _wp
-            p = _wp.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                        errors="ignore", timeout=300)
-            if p.returncode != 0:
-                return {"ok": False, "error": "安装失败：" + (p.stderr or p.stdout or "")[:300]}
-            # 装完后设环境变量，让 find_dws 能找到
-            dws_js = os.path.join(target, "node_modules", "dingtalk-workspace-cli", "bin", "dws.js")
+                npm_cli = os.path.join(os.path.dirname(node_exe), "..",
+                                       "node_modules", "npm", "bin", "npm-cli.js")
+                if not os.path.exists(npm_cli):
+                    self._im_cli_step("dws", "fail", "没找到 npm")
+                    return {"ok": False,
+                            "error": "这台机器上没找到 npm，无法自动安装 dws。"
+                                     "请装 Node.js 完整版（自带 npm）后再试。"}
+                npm_cmd = [node_exe, npm_cli]
+
+            self._im_cli_step("dws", "running",
+                              "正在安装 dingtalk-workspace-cli（首次较慢）…",
+                              percent=25, message="正在下载并安装 dingtalk-workspace-cli…")
+            self._im_cli_log("开始安装到 " + target)
+
+            base_args = npm_cmd + ["install", "--prefix", target,
+                                   "dingtalk-workspace-cli@latest"]
+            rc, tail = self._im_cli_run_npm(base_args)
+            if rc != 0:
+                # 国内网络下默认源经常拉不动 —— 自动换 npmmirror 再来一次
+                self._im_cli_log("默认源失败（rc=%s），改用国内镜像 registry.npmmirror.com 重试…"
+                                 % rc)
+                self._im_cli_step("dws", "running", "默认源失败，正在用国内镜像重试…",
+                                  percent=30, message="正在用国内镜像重试安装…")
+                rc, tail = self._im_cli_run_npm(
+                    base_args, registry="https://registry.npmmirror.com")
+            if rc != 0:
+                self._im_cli_step("dws", "fail", (tail or "")[-300:])
+                return {"ok": False,
+                        "error": "安装 dws 失败。最后几行日志：" + (tail or "")[-300:]}
+
+            dws_js = os.path.join(target, "node_modules",
+                                  "dingtalk-workspace-cli", "bin", "dws.js")
             if not os.path.exists(dws_js):
-                return {"ok": False, "error": "安装完成但没找到 dws.js，请重启后重试"}
+                self._im_cli_step("dws", "fail", "装完但没找到 dws.js")
+                return {"ok": False,
+                        "error": "安装完成但没找到 dws.js（安装目录可能被清理），请重试。"}
             os.environ["AIWORKBENCH_NODE_PATH"] = node_exe
             os.environ["AIWORKBENCH_DWS_JS"] = dws_js
-            return {
-                "ok": True,
-                "message": "钉钉 CLI 已自动安装完成，请点「登录」授权",
-                "available": True,
-                "authenticated": False,
-            }
+            dws = dws_js
+            node = node_exe
+            self._im_cli_log("安装完成：" + dws_js)
+        self._im_cli_step("dws", "done", dws, percent=72)
+
+        # ---------- 步骤 3/4：真的能跑起来吗 ----------
+        self._im_cli_step("verify", "running", "正在试跑 dws --version…", percent=78,
+                          message="步骤 3/4：校验 dws")
+        ver = ""
+        try:
+            import app.winproc as _wp
+            cmd = ([node, dws] if node else [dws]) + ["--version"]
+            r = _wp.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                        errors="ignore", timeout=30)
+            ver = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+            ver = ver[0][:120] if ver else ""
+            if r.returncode != 0:
+                self._im_cli_step("verify", "fail", ver or ("rc=%s" % r.returncode))
+                return {"ok": False,
+                        "error": "dws 装好了但跑不起来：" + (ver or "rc=%s" % r.returncode)}
         except Exception as exc:
-            return {"ok": False, "error": f"自动安装失败：{type(exc).__name__}: {exc}"}
+            self._im_cli_step("verify", "fail", f"{type(exc).__name__}: {exc}")
+            return {"ok": False,
+                    "error": "试跑 dws 失败：%s: %s" % (type(exc).__name__, exc)}
+        self._im_cli_step("verify", "done", ver or "可运行", percent=88)
+
+        # ---------- 步骤 4/4：登录态 ----------
+        self._im_cli_step("auth", "running", "正在查询登录状态…", percent=93,
+                          message="步骤 4/4：检查钉钉登录状态")
+        authed = False
+        detail = ""
+        try:
+            st = self.ding.dws_auth_status() or {}
+            authed = bool(st.get("authenticated"))
+            detail = ("已登录：" + str(st.get("user_name") or st.get("user_id") or "")) \
+                if authed else "还没登录"
+        except Exception as exc:
+            detail = "查询失败：%s" % type(exc).__name__
+        self._im_cli_step("auth", "done" if authed else "pending",
+                          detail, percent=100)
+        return {
+            "ok": True,
+            "message": ("钉钉 CLI 已就绪，且已登录（%s）"
+                        % (detail.replace("已登录：", "") or "已授权")) if authed
+                       else "钉钉 CLI 已就绪，还需点「登录钉钉」完成授权",
+            "available": True,
+            "authenticated": authed,
+        }
 
     def _web_im_cli_login(self):
         """发起钉钉 CLI 登录（异步）：立即返回，后台等授权结果。
@@ -2430,8 +2721,14 @@ class MainWindow(QMainWindow):
         if st.get("busy"):
             return {"ok": True, "async": True, "busy": True,
                     "message": st.get("message") or "正在处理中…"}
-        self._im_cli_state_set(busy=True, ok=None,
-                               message="请在弹出的窗口/浏览器完成授权…", done_at=0)
+        self._im_cli_state_set(
+            busy=True, ok=None,
+            message="请在弹出的窗口/浏览器完成授权…", done_at=0,
+            # ★ v9.22.2：登录也走同一个进度窗口——单独给一步「等待授权」，
+            #   否则前端会沿用上一次「一键配置」残留的四步状态，看着像卡住了。
+            started_at=time.time(), percent=0, log=[],
+            steps=[{"key": "auth", "label": "等待钉钉授权完成",
+                    "status": "running", "detail": "扫码或输入设备码…"}])
 
         def _worker():
             try:
@@ -2452,11 +2749,13 @@ class MainWindow(QMainWindow):
                     s2 = {}
                 if s2.get("authenticated"):
                     who = s2.get("user_name") or ""
+                    self._im_cli_step("auth", "done", who or "已授权", percent=100)
                     self._im_cli_state_set(
                         busy=False, ok=True,
                         message="✓ 登录成功" + (("：" + who) if who else ""))
                     self._notify_im_refresh()
                     return
+            self._im_cli_step("auth", "fail", "等不到授权结果", percent=100)
             self._im_cli_state_set(busy=False, ok=False,
                                    message="登录未完成 / 已超时，可重试")
             self._notify_im_refresh()
@@ -3682,6 +3981,8 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, cid)
             if cid == cur:
                 item.setSelected(True)
+        # ★ v9.22.2：网页左栏也要跟着变（删除/改名/新建后 Qt 列表刷新了，网页却没有）
+        self._web_push_convs()
 
     def _new_conversation(self, silent=False):
         self.conv = self.workspace.new_conversation()
@@ -3703,6 +4004,14 @@ class MainWindow(QMainWindow):
         self._update_page_title()
         if not silent:
             self._load_conversations()
+        # ★ v9.22.2：网页模式下必须把新会话推过去，否则「加号点了没反应」
+        if self._web_engine and self._web_bridge is not None:
+            try:
+                self._web_bridge.send_messages({
+                    "convId": self._conv_cid(), "messages": []})
+            except Exception:
+                pass
+            self._web_push_convs(clear_thread=True)
         self.input.setFocus()
         self._open_page("chat")
 
@@ -6029,7 +6338,9 @@ class MainWindow(QMainWindow):
                                  on_stage=lambda s, det: self._update_stage.emit(s, det))
                 self._update_done.emit(dest)
             except Exception as e:
-                self._update_fail.emit(f"{type(e).__name__}: {e}")
+                # ★ v9.22.2：交给 updater.human_error 翻译成人话，
+                #   不要在界面上出现「RuntimeError: ...」这种技术栈信息。
+                self._update_fail.emit(updater.human_error(e))
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_on_progress(self, done, total):
@@ -6040,21 +6351,22 @@ class MainWindow(QMainWindow):
             dlg.setValue(min(99, int(done * 100 / total)))
             dlg.setLabelText(f"正在下载更新… {done / 1048576:.1f} / {total / 1048576:.1f} MB")
 
-    def _update_on_stage(self, stage, detail):
-        """下载 / 安装的阶段提示：让用户知道现在在干嘛，而不是干等一个进度条。"""
-        text = {
-            "probing": "正在选择最快的下载通道…",
-            "downloading": "正在下载更新…",
-            "downloaded": "下载完成，准备安装…",
-            "extracting": "正在解压更新包…",
-            "installing": "正在覆盖程序文件…",
-            "restarting": "安装完成，即将重启…",
-        }.get(str(stage or ""), "")
-        if text:
-            dlg = getattr(self, "_upd_dlg", None)
-            if dlg:
-                dlg.setLabelText(f"{text} {detail}".strip() if detail else text)
-            self.statusBar().showMessage(text, 4000)
+    def _update_on_stage(self, stage, text):
+        """下载 / 安装的阶段提示：让用户知道现在在干嘛，而不是干等一个进度条。
+
+        ★ v9.22.2：文案**只由** :mod:`app.updater` 的 ``_stage_label`` 产出
+        （第二参 ``text`` 已经是洗干净的「一句人话」）。这里绝不能再自己维护
+        一份 stage→中文 的对照表，也不许把内部细节拼到后面 —— 之前
+        ``f"{text} {detail}"`` 会把「正在选择最快的下载通道…」这类实现细节
+        贴回用户眼前，正是用户投诉的那句。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return
+        dlg = getattr(self, "_upd_dlg", None)
+        if dlg:
+            dlg.setLabelText(text)
+        self.statusBar().showMessage(text, 4000)
 
     def _update_on_fail(self, err):
         # ★ v9.22.0：下载失败和安装失败共用本槽，文案改成中性的「更新失败」。
@@ -6101,7 +6413,8 @@ class MainWindow(QMainWindow):
                     on_stage=lambda s, det: self._update_stage.emit(s, det))
                 self._update_install_done.emit(res)
             except Exception as e:
-                self._update_fail.emit(f"安装失败：{type(e).__name__}: {e}")
+                # ★ v9.22.2：同上，只暴露人话原因。
+                self._update_fail.emit(updater.human_error(e))
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_on_install_progress(self, done, total):
