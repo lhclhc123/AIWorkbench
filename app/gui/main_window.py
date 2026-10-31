@@ -880,6 +880,11 @@ class MainWindow(QMainWindow):
     def _tray_dingtalk(self):
         """托盘里快速往钉钉发一句（不打断当前对话）。"""
         from PyQt6.QtWidgets import QInputDialog
+        # ★ v9.22.1：web 模式禁止弹 Qt 对话框（QInputDialog 会盖在网页上）
+        if getattr(self, "_web_engine", False):
+            self.statusBar().showMessage(
+                "Web 版请到「钉钉助手」页发消息（托盘快捷发送仅 Qt 界面可用）", 6000)
+            return
         if not self.ding.configured():
             QMessageBox.information(self, "钉钉未配置",
                                     "先到「集成」页把钉钉配置好。")
@@ -2202,6 +2207,37 @@ class MainWindow(QMainWindow):
 
         raise KeyError(f"未知 RPC 方法：{method}")
 
+    # ---------- 钉钉助手：跨线程状态推送 / CLI 异步任务状态 ----------
+    def _notify_im_refresh(self):
+        """从任意线程通知 web 钉钉页刷新（失败静默，绝不影响业务）。
+
+        ★ v9.22.1：这是「自动检测一直检查中」的修复点之一 —— 后台 probe 完成后
+        必须主动推 im_refresh，前端才知道结果出来了。
+        """
+        if not getattr(self, "_web_engine", False):
+            return
+        bridge = getattr(self, "_im_bridge", None)
+        if bridge is None:
+            return
+        try:
+            bridge.emit_event("im_refresh", {})
+        except Exception:
+            pass
+
+    def _im_cli_state_get(self):
+        """CLI 一键配置/登录的异步状态（前端轮询 im_get_state 拿）。"""
+        if not hasattr(self, "_im_cli_state_data"):
+            self._im_cli_state_data = {
+                "busy": False, "ok": None, "message": "", "done_at": 0.0}
+        return self._im_cli_state_data
+
+    def _im_cli_state_set(self, **kw):
+        st = self._im_cli_state_get()
+        st.update(kw)
+        if not st.get("busy"):
+            st["done_at"] = time.time()
+        return st
+
     def _web_im_state(self):
         """钉钉助手页全量状态：消息双栏 + 设置 + 标签 + 钉钉登录态。"""
         if getattr(self, "im_store", None) is None:
@@ -2226,6 +2262,7 @@ class MainWindow(QMainWindow):
             "running": bool(getattr(self, "assistant", None)
                             and self.assistant.running),
             "ding_status": self._asst_ding_status_text(),
+            "cli": dict(self._im_cli_state_get()),
             "rows": rows,
             "settings": st,
             "tags": tag_list,
@@ -2285,11 +2322,39 @@ class MainWindow(QMainWindow):
         return {"ok": True}
 
     def _web_im_cli_setup(self):
-        """一键配置钉钉 CLI：检测 → 缺 node/dws 就自动装 → 报告结果。
+        """一键配置钉钉 CLI（异步）：立即返回，检测/安装放后台线程。
 
-        返回 {ok, message, available, authenticated}。装在用户目录下的独立目录，
-        不污染系统全局环境（沙箱/普通权限都能跑）。
+        ★ v9.22.1：原来同步执行 —— find_dws + dws_auth_status 最坏 40s、npm 最长
+        300s，web RPC 会一直堵着 UI 线程，前端干等 120s 只看到一句 toast。现在
+        立即返回 async=True；进度写进 _im_cli_state_data，前端靠轮询/im_refresh 取。
         """
+        st = self._im_cli_state_get()
+        if st.get("busy"):
+            return {"ok": True, "async": True, "busy": True,
+                    "message": st.get("message") or "正在配置中…"}
+        self._im_cli_state_set(busy=True, ok=None,
+                               message="正在检查 Node/dws…", done_at=0)
+
+        def _worker():
+            try:
+                result = self._im_cli_setup_worker()
+            except Exception as exc:
+                result = {"ok": False,
+                          "error": "自动安装失败：%s: %s"
+                                   % (type(exc).__name__, exc)}
+            ok = bool(result.get("ok"))
+            msg = (result.get("message") or result.get("error")
+                   or ("钉钉 CLI 已就绪" if ok else "配置失败"))
+            self._im_cli_state_set(busy=False, ok=ok, message=msg)
+            self._notify_im_refresh()
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="awb-im-cli-setup").start()
+        return {"ok": True, "async": True,
+                "message": "正在配置钉钉 CLI…（可离开本页，完成后会提示）"}
+
+    def _im_cli_setup_worker(self):
+        """真正干活：检测 → 缺 node/dws 就自动装 → 返回结果 dict。"""
         from ..dingtalk import find_dws, _find_node
         node, dws = find_dws()
         if dws:
@@ -2327,6 +2392,9 @@ class MainWindow(QMainWindow):
                     npm_cmd = [node_exe, npm_cli]
                 else:
                     return {"ok": False, "error": "没找到 npm，无法自动安装 dws"}
+            self._im_cli_state_set(
+                busy=True, message="正在安装 dingtalk-workspace-cli…（首次可能较慢）")
+            self._notify_im_refresh()
             cmd = npm_cmd + ["install", "--prefix", target, "dingtalk-workspace-cli"]
             import app.winproc as _wp
             p = _wp.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -2349,17 +2417,54 @@ class MainWindow(QMainWindow):
             return {"ok": False, "error": f"自动安装失败：{type(exc).__name__}: {exc}"}
 
     def _web_im_cli_login(self):
-        """发起钉钉 CLI 登录（设备码方式，沙箱里浏览器扫码可能被拦，用设备码最稳）。"""
+        """发起钉钉 CLI 登录（异步）：立即返回，后台等授权结果。
+
+        ★ v9.22.1：登录本身要等用户扫码/输设备码（可能几十秒到几分钟），不能
+        让 RPC 同步干等，否则 UI 线程被占、前端 120s 后只看到超时。
+        """
         from ..dingtalk import find_dws
         node, dws = find_dws()
         if not dws:
             return {"ok": False, "error": "还没装 dws，请先点「一键配置钉钉 CLI」"}
-        try:
-            # 设备码登录最稳（本地回环扫码在沙箱可能被拦）
-            self.ding.dws_login_start(device=True)
-            return {"ok": True, "message": "已发起设备码登录，请在弹窗/终端按提示完成授权"}
-        except Exception as exc:
-            return {"ok": False, "error": f"登录失败：{type(exc).__name__}: {exc}"}
+        st = self._im_cli_state_get()
+        if st.get("busy"):
+            return {"ok": True, "async": True, "busy": True,
+                    "message": st.get("message") or "正在处理中…"}
+        self._im_cli_state_set(busy=True, ok=None,
+                               message="请在弹出的窗口/浏览器完成授权…", done_at=0)
+
+        def _worker():
+            try:
+                self.ding.dws_login_start(device=True)
+            except Exception as exc:
+                self._im_cli_state_set(
+                    busy=False, ok=False,
+                    message="发起登录失败：%s: %s" % (type(exc).__name__, exc))
+                self._notify_im_refresh()
+                return
+            # 后台轮询登录态（最多 ~180s），成功后写状态并通知前端
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                time.sleep(5)
+                try:
+                    s2 = self.ding.dws_auth_status(force=True, timeout=10) or {}
+                except Exception:
+                    s2 = {}
+                if s2.get("authenticated"):
+                    who = s2.get("user_name") or ""
+                    self._im_cli_state_set(
+                        busy=False, ok=True,
+                        message="✓ 登录成功" + (("：" + who) if who else ""))
+                    self._notify_im_refresh()
+                    return
+            self._im_cli_state_set(busy=False, ok=False,
+                                   message="登录未完成 / 已超时，可重试")
+            self._notify_im_refresh()
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="awb-im-cli-login").start()
+        return {"ok": True, "async": True,
+                "message": "已发起设备码登录，请在弹窗/浏览器完成授权…"}
 
     def _style_input_area(self):
         """按当前主题给输入卡片与图标按钮上色（跟随浅色 / 深色切换）。"""
@@ -4637,11 +4742,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._safe_asst_log(f"刷新助手页失败：{type(exc).__name__}: {exc}")
         # ★ v9.21.1：web 版钉钉页激活时，推 im_refresh 让前端重新拉数据
-        if self._web_engine and getattr(self, "_im_bridge", None) is not None:
-            try:
-                self._im_bridge.emit_event("im_refresh", {})
-            except Exception:
-                pass
+        # v9.22.1：统一走 _notify_im_refresh（任意线程安全 + 失败静默）
+        self._notify_im_refresh()
 
     # ---------- 钉钉连接（在助理「设置」页里配）----------
     def _asst_ding_status_text(self):
@@ -4678,6 +4780,10 @@ class MainWindow(QMainWindow):
                 finally:
                     self._ding_status_loading = False
                 self._ding_status_cache = (time.time(), text)
+                # ★ v9.22.1：后台查完必须主动推前端。否则 web 钉钉页 boot 那次
+                #   拿到的是占位串、3 秒后缓存还没填好、之后再无刷新 —— 页面会
+                #   永远停在「检查中…」。推送失败不能影响状态写入，整体 try 掉。
+                self._notify_im_refresh()
             threading.Thread(target=_probe, daemon=True,
                              name="awb-ding-status").start()
         return "检查钉钉登录状态中…"
@@ -5840,10 +5946,25 @@ class MainWindow(QMainWindow):
             self.page_integrations.show_update_result(info)
         except Exception:
             pass
+        # ★ v9.22.1：web 模式把结果推给前端「就地显示」，绝不 _open_page 抢栈。
+        #   _open_page 会把 stack 切到 Qt 集成页，而 web 导航栏不在那个页面里，
+        #   用户会「自动跳到钉钉集成界面且退不出」。
+        if getattr(self, "_web_engine", False):
+            try:
+                if self._web_bridge is not None:
+                    self._web_bridge.emit_event("update_checked", {
+                        "ok": bool(info.get("ok")),
+                        "has_update": bool(info.get("has_update")),
+                        "tag": str(info.get("tag") or ""),
+                        "current": ver.VERSION,
+                        "error": str(info.get("error") or ""),
+                    })
+            except Exception:
+                pass
         if silent:
             self.statusBar().clearMessage()
             if info.get("ok") and info.get("has_update"):
-                if _NO_MODAL:
+                if _NO_MODAL or getattr(self, "_web_engine", False):
                     self.statusBar().showMessage(
                         f"发现新版本 {info.get('tag')}（当前 {ver.VERSION}）", 15000)
                     return
@@ -5856,8 +5977,9 @@ class MainWindow(QMainWindow):
                 if r == QMessageBox.StandardButton.Yes:
                     self._update_apply()
             return
-        self._open_page("integrations")
-        self.nav.select("integrations")
+        if not getattr(self, "_web_engine", False):
+            self._open_page("integrations")
+            self.nav.select("integrations")
         self.statusBar().showMessage(
             ("有更新：" + str(info.get("tag"))) if info.get("has_update")
             else ("已是最新" if info.get("ok") else "检查更新失败（见集成页说明）"), 6000)
@@ -5868,6 +5990,17 @@ class MainWindow(QMainWindow):
         info = getattr(self, "_pending_update", None)
         if not (info and info.get("ok") and info.get("has_update")):
             self._info("当前没有待安装的更新。先点「立即检查更新」看看。", "自动更新")
+            return
+        # ★ v9.22.1：web 模式禁止 Qt 对话框（QProgressDialog 会盖住网页且退不出）
+        if getattr(self, "_web_engine", False):
+            msg = ("Web 版请到发布页手动下载更新包："
+                   + str(info.get("html_url") or ""))
+            try:
+                if self._web_bridge is not None:
+                    self._web_bridge.emit_event("update_error", {"error": msg})
+            except Exception:
+                pass
+            self.statusBar().showMessage(msg, 10000)
             return
         asset = updater.pick_asset(info, prefer=(".zip", ".exe"))
         if not asset:
@@ -5991,7 +6124,7 @@ class MainWindow(QMainWindow):
             dlg.setValue(100)
             dlg.close()
             self._upd_dlg = None
-        if _NO_MODAL:
+        if _NO_MODAL or getattr(self, "_web_engine", False):
             self.statusBar().showMessage("更新已准备好，程序即将重启", 8000)
             QApplication.quit()
             return
@@ -6003,8 +6136,12 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def _info(self, text, title="提示", ms=5000):
-        """统一的信息提示：正常运行时是弹窗，自动化测试时只写状态栏（不阻塞）。"""
-        if _NO_MODAL:
+        """统一的信息提示：正常运行时是弹窗，自动化测试/web 模式只写状态栏。
+
+        ★ v9.22.1：web 模式下**禁止任何 Qt 对话框**（会盖在网页上且无法关闭），
+        统一降级为状态栏提示。
+        """
+        if _NO_MODAL or getattr(self, "_web_engine", False):
             self.statusBar().showMessage(f"{title}：{text}", ms)
             return
         QMessageBox.information(self, title, text)
@@ -7221,8 +7358,16 @@ class MainWindow(QMainWindow):
             self._cards.append(ind)
         elif live_shown:
             prose, blocks = markdown_render.render_with_blocks(live_shown)
+            # ★★ v9.22.1：流式中的「活卡片」也要走顺序模式。
+            #   老写法只传 prose+blocks 不传 flow → `_flow_enabled=False`，
+            #   而 `update_live()` 只有在 `_flow_enabled` 为真时才会重算 _flow，
+            #   于是**生成过程中**代码块仍然全堆在正文下面（用户报的就是这个场景：
+            #   "不管什么时候生成的，生成了几个，都会被统一放到最底下"）。
+            #   这里无条件把 flow 传进去（哪怕此刻还没有代码块），
+            #   后续一旦出现 ``` 围栏，`update_live()` 就能当场切成顺序模式。
             card = MessageCard("assistant", prose, blocks, raw_text=live_shown,
-                               actions=False)
+                               actions=False,
+                               flow=markdown_render.render_flow(live_shown))
             self.chat_layout.addWidget(card)
             self._cards.append(card)
             self._live_card = card

@@ -257,6 +257,68 @@ html[data-theme="dark"] .win-btn .ico-sun{display:block;}
 }
 .steps b{display:block;color:var(--text);font-weight:600;font-size:12px;}
 
+/* —— 过程消息语义分组（v9.22.1） —— */
+/* 组容器：无边框 / 无背景 / 无圆角，只保留可折叠的标题与步骤 */
+.think-card.mode-process{overflow:visible;}
+/* 过程组的展开/收起用 display 切换：grid-template-rows 的 0fr→1fr 在这版
+   WebEngine 里对「auto 高度 + overflow:hidden 子项」会解析成 0，步骤打不开。
+   组的展开不做高度动画（收束动画只发生在收尾合并那一刻），所以这里直接切换。 */
+.think-card.mode-process .think-body{display:none;}
+.think-card.mode-process.open .think-body{display:block;}
+/* 折叠态小结论：单行、可点开、超长省略号。展开时由 .open 隐藏 */
+.proc-summary{
+  display:block;
+  width:100%;
+  margin:0;
+  padding:0 6px 0 0;
+  border:none;background:none;
+  font-family:inherit;
+  font-size:12px;line-height:1.55;color:var(--text-2);
+  text-align:left;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  cursor:pointer;
+}
+.proc-summary:hover{color:var(--text);}
+.proc-summary[hidden]{display:none;}
+.think-card.open .proc-summary{display:none;}
+/* 展开后的步骤列表：左侧一条 2px 细竖线，条目间距 4px，全部直接可见（不再单独折叠） */
+.proc-steps{
+  margin:0;padding:2px 0 2px 8px;
+  border-left:2px solid var(--border);
+  display:flex;flex-direction:column;gap:4px;
+}
+.proc-step{min-height:16px;}
+/* think 段落：沿用 .live-p 的段距口径（margin:0 0 10px），最后一段不留底距 */
+.proc-think{font-size:12px;color:var(--text-2);line-height:1.65;}
+.proc-think p{margin:0 0 10px;}
+.proc-think p:last-child{margin-bottom:0;}
+.proc-think ul,.proc-think ol{margin:0 0 10px;padding-left:18px;}
+.proc-think pre{margin:0 0 10px;}
+/* 工具步骤行：16px、无背景胶囊、不单独折叠（结果挂 title 悬停） */
+.proc-tool{
+  display:inline-flex;align-items:center;gap:4px;
+  max-width:100%;height:16px;
+  font-size:11px;color:var(--text-2);
+}
+.proc-tool .pt-name{font-weight:600;color:var(--text);flex:0 0 auto;}
+.proc-tool .pt-arg{
+  color:var(--text-3);
+  max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+
+/* 收束动画：收尾时过程消息淡出 + 高度收拢（尊重「减少动态效果」） */
+.proc-collapse{
+  transition:opacity .24s ease, transform .24s ease, max-height .24s ease, margin .24s ease;
+  overflow:hidden;max-height:640px;
+}
+.proc-collapse-run{
+  opacity:0;transform:translateY(-4px);
+  max-height:0 !important;margin:0 !important;padding:0 !important;
+}
+@media (prefers-reduced-motion: reduce){
+  .proc-collapse{transition:none;}
+}
+
 /* —— 工具：无框无底色，细一行 —— */
 .tool{display:flex;flex-direction:column;gap:0;align-items:flex-start;}
 .tool-pill{

@@ -97,23 +97,49 @@ def append(ws, *, source="对话", request="", tools=None, files=None,
 
 
 def _index_add(ws, title, source, ok):
-    """维护一个轻量索引，方便界面列表展示（没有也能跑）。"""
+    """维护一个轻量索引，方便界面列表展示（没有也能跑）。
+
+    ★ v9.22.1 修两个真实隐患（v9.22.0 之前的写法只有一个大 try）：
+      ① **非原子写**：原来 `open(p,"w")` 直写，写到一半被读（界面刷新 / 另一个
+         线程同时 append）会读到半个 JSON；写的时候进程被杀更是把整份索引写坏。
+      ② **读失败连累写**：原来 read+append+write 在同一个 try 里，`json.load`
+         一旦抛异常，**整条记录都加不进去**，界面就显示「今天 0 件事」，
+         而且异常被静默吞掉，用户完全不知道索引已经坏了。
+         真实症状：`tests/smoke_gui_v91.py` 偶发「总结提示含统计 → 今天 0 件事」。
+    现在的做法：读失败就把坏文件改名留档（.bad）后重建；写一律 tmp + os.replace（原子）。
+    """
+    p = os.path.join(_dir(ws), _INDEX)
+    data = []
     try:
-        p = os.path.join(_dir(ws), _INDEX)
-        data = []
         if os.path.isfile(p):
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 data = []
-        data.append({
-            "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "title": title, "source": source, "ok": bool(ok),
-        })
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data[-500:], f, ensure_ascii=False, indent=1)
     except Exception:
-        pass
+        # 读坏了不能连累写：留档一份，然后从空表重建，至少新记录进得去。
+        try:
+            os.replace(p, p + ".bad")
+        except Exception:
+            pass
+        data = []
+    data.append({
+        "t": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": title, "source": source, "ok": bool(ok),
+    })
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data[-500:], f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)          # 同盘原子替换：读者要么看到旧的、要么看到新的
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def list_days(ws):
@@ -144,14 +170,30 @@ def read_day(ws, day=None):
 
 
 def recent(ws, n=20):
-    """返回最近 n 条总结（解析 index.json）。"""
-    try:
-        p = os.path.join(_dir(ws), _INDEX)
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return list(reversed(data[-int(n):]))
-    except Exception:
+    """返回最近 n 条总结（解析 index.json）。
+
+    ★ v9.22.1：Windows 上 `os.replace` 撞上「另一个句柄正开着同名文件」会
+      抛 `PermissionError`（共享删除没开），读侧就会**偶发**拿到空列表 ——
+      界面上表现为「今天 0 件事」，而异常又被吞掉，极难查。
+      所以这里做**短暂重试**：写是原子的，重试 30ms 后一定能读到完整的旧版或新版。
+    """
+    import time as _t
+    p = os.path.join(_dir(ws), _INDEX)
+    last = None
+    for attempt in range(4):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return list(reversed(data[-int(n):]))
+        except FileNotFoundError:
+            return []
+        except Exception as e:      # PermissionError / 半个 JSON / 正在替换
+            last = e
+            if attempt < 3:
+                _t.sleep(0.03 * (attempt + 1))
+    if last is not None:
         return []
+    return []
 
 
 def today_stats(ws):

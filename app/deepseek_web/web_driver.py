@@ -312,6 +312,43 @@ JS_AGENT_TEMPLATE = r"""
   };
   const UI_NOISE = { test: isUiNoise };     // 兼容旧引用
 
+  // ★ v9.22.1 修「深度思考与结论混为一谈」（用户实测反馈）：
+  //   DeepSeek 现版把思维链渲染成 `ds-think-content`，而且它**嵌在**
+  //   `.ds-assistant-message-main-content` 里面（docs/04-qa §5.1 记的
+  //   "独立块"是旧结构，已经变了）。直接取 innerText 会把思维链 + 正式答复
+  //   一起捞出来，前端只能当正文显示。
+  //   统一走「克隆 → 摘除噪声 → 取文本」：**绝不改动页面真实 DOM**。
+  const THINK_SEL = '.ds-think-content, [class*="think-content"], [class*="thinking"]';
+  const cleanText = (el, dropThink) => {
+    if (!el) { return ''; }
+    let root = el;
+    try { root = el.cloneNode(true); } catch (e) { root = el; }
+    try {
+      const sel = (dropThink ? THINK_SEL + ', ' : '')
+                + '.ds-toggle-button, button, [role="button"]';
+      root.querySelectorAll(sel).forEach((n) => { try { n.remove(); } catch (e) {} });
+    } catch (e) {}
+    return stripDisclaimer(root.innerText || '');
+  };
+  // 「已深度思考（用时 12 秒）」这类标题行：只按**整行精确**匹配，
+  // 正文里正常出现"深度思考"三个字不会被误删。
+  const THINK_TITLE_LINE = /^已?深度思考\s*(（用时[^）]*）)?\s*$/;
+
+  // 单独取思维链（喂给前端渲染成独立的「深度思考」折叠块）
+  AWB.reasoningText = () => {
+    let el = null;
+    for (const s of ['.ds-think-content', '[class*="think-content"]',
+                     '[class*="thinking"]', '[class*="ds-think"]']) {
+      const list = queryAll(s).filter(visible);
+      if (list.length) { el = list[list.length - 1]; break; }
+    }
+    if (!el) { return ''; }
+    const raw = cleanText(el, false);
+    const lines = raw.split('\n')
+      .filter((ln) => !THINK_TITLE_LINE.test(String(ln).trim()));
+    return lines.join('\n').trim();
+  };
+
   AWB.answerText = () => {
     const sels = [
       '.ds-assistant-message-main-content',
@@ -320,7 +357,9 @@ JS_AGENT_TEMPLATE = r"""
       '[class*="message-content"]',
     ];
     const good = (el) => {
-      const t = stripDisclaimer(el.innerText || '');
+      // ★ 判"有没有答复"也要先摘掉思维链：思考阶段正文本来就是空的，
+      //   若拿含 think 的 innerText 判断，会误以为"已经有答复了"而提前收尾。
+      const t = cleanText(el, true);
       return t.length > 0 && !isUiNoise(t);
     };
     for (const s of sels) {
@@ -328,7 +367,7 @@ JS_AGENT_TEMPLATE = r"""
         .filter((el) => String(el.className || '').indexOf('-paragraph') < 0)
         .filter(good);
       if (list.length) {
-        return stripDisclaimer(list[list.length - 1].innerText || '');
+        return cleanText(list[list.length - 1], true);
       }
     }
     // 结构兜底：找主对话滚动容器（排除左侧会话栏），取它最后一块"像答复"的文本块；
@@ -343,12 +382,12 @@ JS_AGENT_TEMPLATE = r"""
         const blocks = [...main.querySelectorAll('div,p,article,li')]
           .filter((el) => !el.closest('button, a, [role="button"], [class*="toggle"]'))
           .filter((el) => {
-            const t = stripDisclaimer(el.innerText || '');
+            const t = cleanText(el, true);
             return t.length > 0 && !isUiNoise(t);
           });
         if (blocks.length) {
           const last = blocks[blocks.length - 1];
-          return stripDisclaimer(last.innerText || '');
+          return cleanText(last, true);
         }
       }
     } catch (e) {}
@@ -360,7 +399,7 @@ JS_AGENT_TEMPLATE = r"""
   AWB.answerCount = () => {
     const good = (el) => {
       if (String(el.className || '').indexOf('-paragraph') >= 0) { return false; }
-      const t = stripDisclaimer(el.innerText || '');
+      const t = cleanText(el, true);
       return t.length > 0 && !isUiNoise(t);
     };
     let list = queryAll('.ds-assistant-message-main-content').filter(visible).filter(good);
@@ -536,6 +575,31 @@ def _looks_complete(text):
 #   "已发的所有增量拼起来 == 最终文本"这个不变式仍然成立
 #   （否则收尾时会把全文又补发一遍，又是一次重复）。
 # ---------------------------------------------------------------------------
+def bounds_usable(bounds):
+    """窗口位置是否"可用"（够大、且在可视区内）。
+
+    ★ v9.22.1：用户明确要求「显示窗口时不要每次都把窗口顶到屏幕最顶端」。
+      所以"恢复可见性"这条路径改成：**位置可用就一个字都不动**，
+      只有真的离屏（历史上出过 -32000,-32000 的坑）或尺寸异常时才重新摆位。
+    """
+    if not isinstance(bounds, dict):
+        return False
+    try:
+        left = int(bounds.get("left"))
+        top = int(bounds.get("top"))
+        width = int(bounds.get("width") or 0)
+        height = int(bounds.get("height") or 0)
+    except Exception:
+        return False
+    if width < 300 or height < 200:
+        return False
+    if left <= -1000 or top <= -1000:      # 典型离屏：-32000,-32000
+        return False
+    if left > 20000 or top > 20000:
+        return False
+    return True
+
+
 def compute_delta(text, last_text, emitted, on_progress=None):
     """算这一拍的增量。
 
@@ -873,17 +937,30 @@ class WebDriver:
         #   （Browser.getWindowForTarget 在内嵌内核里还是 -32601，也一并跳过。）
         if self.embedded:
             return True
-        # ② 把窗口从"最小化/离屏"恢复成普通窗口并摆到屏幕内
+        # ② 把窗口从"最小化/离屏"恢复成普通窗口。
+        #   ★ v9.22.1 用户反馈：「显示窗口时不要每次都把 deepseek 窗口置顶到最顶端」。
+        #     旧写法**每次都** setWindowBounds(left=60, top=50)，等于每发一条消息
+        #     都把用户自己拖好的窗口顶回屏幕左上角。现在改成：
+        #       先取消最小化 → 读当前 bounds → **只有位置真的不可用（离屏/极小）才挪**，
+        #       否则原样保留用户的位置和大小。
         try:
             res = self.cdp.call("Browser.getWindowForTarget", {}, timeout=6)
             wid = (res.get("result") or {}).get("windowId")
             if wid:
                 self.cdp.call("Browser.setWindowBounds", {
                     "windowId": wid, "bounds": {"windowState": "normal"}}, timeout=6)
-                self.cdp.call("Browser.setWindowBounds", {
-                    "windowId": wid,
-                    "bounds": {"left": 60, "top": 50, "width": 1180, "height": 840}},
-                    timeout=6)
+                cur = {}
+                try:
+                    got = self.cdp.call("Browser.getWindowBounds", {"windowId": wid},
+                                        timeout=5) or {}
+                    cur = (got.get("result") or got).get("bounds") or {}
+                except Exception:
+                    cur = {}
+                if not bounds_usable(cur):
+                    self.cdp.call("Browser.setWindowBounds", {
+                        "windowId": wid,
+                        "bounds": {"left": 60, "top": 50, "width": 1180, "height": 840}},
+                        timeout=6)
         except Exception:
             pass
         # ③ 轮询可见性
@@ -1444,6 +1521,9 @@ class WebDriver:
         last_text_change = time.time()   # 最后一次"答复文本变化"（用于 quiet 判结束）
         last_activity = time.time()      # 最后一次"页面任何活动"（用于零增量兜底）
         emitted = []              # 已下发的增量；用于收尾对账，确保绝不丢正文
+        # ★ v9.22.1：思维链（深度思考）单独一路下发，不再混进正文。
+        last_reasoning = ""       # 上一次看到的思维链全文（做增量差分用）
+        emitted_reasoning = []    # 已下发的思维链增量（收尾对账用）
         err_since = 0.0           # 网页错误文案在"空闲态"连续出现的起点（0 = 当前没看到）
         try:
             last_page_len = int(self._js("window.__AWB__.pageTextLen()") or 0)
@@ -1463,6 +1543,25 @@ class WebDriver:
                 page_len = last_page_len
 
             # ---- 活动检测：答复文本 / 答复块数 / 页面正文长度 任一变化 = 有增量 ----
+            # ★ v9.22.1：思维链单独读、单独差分发（只动 think 块，不污染正文）
+            try:
+                rsn = self._js("window.__AWB__.reasoningText()") or ""
+            except Exception:
+                rsn = ""
+            if not isinstance(rsn, str):
+                rsn = ""
+            if rsn != last_reasoning:
+                if rsn.startswith(last_reasoning):
+                    rdelta = rsn[len(last_reasoning):]
+                else:
+                    rdelta = rsn          # 思考块被折叠/重排 -> 整段重发
+                last_reasoning = rsn
+                if rdelta:
+                    emitted_reasoning.append(rdelta)
+                    if on_progress:
+                        on_progress("", rdelta)     # 空正文 + 思维链增量
+                    last_activity = time.time()
+
             if text != last_text:
                 compute_delta(text, last_text, emitted, on_progress)
                 last_text = text if isinstance(text, str) else ""

@@ -24,7 +24,7 @@ from .. import winproc
 from . import errors
 from .cdp_client import CDPClient, local_urlopen
 from .local_server import LocalServer
-from .web_driver import WebDriver
+from .web_driver import WebDriver, bounds_usable
 
 # 浏览器候选路径（Chrome 优先，Edge 兜底）
 BROWSER_CANDIDATES = [
@@ -830,16 +830,29 @@ class DeepSeekWebService:
             self._driver.cdp.call("Browser.setWindowBounds", {
                 "windowId": wid, "bounds": {"windowState": "normal"},
             }, timeout=6)
-            time.sleep(0.25)
-            self._driver.cdp.call("Browser.setWindowBounds", {
-                "windowId": wid,
-                "bounds": {"left": 90, "top": 70, "width": 1200, "height": 860},
-            }, timeout=6)
+            # ★ v9.22.1：用户要求「不要每次都把窗口顶到屏幕最顶端」。
+            #   旧写法无条件 setWindowBounds(left=90, top=70)，用户自己拖好的位置
+            #   每点一次"显示网页窗口"就被顶回去。现在：位置可用就**原地不动**，
+            #   只有真离屏/尺寸异常才摆回来。
+            cur = {}
+            try:
+                got = self._driver.cdp.call("Browser.getWindowBounds",
+                                            {"windowId": wid}, timeout=5) or {}
+                cur = (got.get("result") or got).get("bounds") or {}
+            except Exception:
+                cur = {}
+            if not bounds_usable(cur):
+                time.sleep(0.15)
+                self._driver.cdp.call("Browser.setWindowBounds", {
+                    "windowId": wid,
+                    "bounds": {"left": 90, "top": 70, "width": 1200, "height": 860},
+                }, timeout=6)
             try:
                 self._driver.cdp.call("Page.bringToFront", {}, timeout=5)
             except Exception:
                 pass
-            self.log("info", "已把网页窗口挪回屏幕内")
+            self.log("info", "已把网页窗口挪回屏幕内" if not bounds_usable(cur)
+                     else "网页窗口已在屏幕上，保留原位置")
             return True
         except Exception as exc:
             self.log("warn", f"显示网页窗口失败：{exc}")

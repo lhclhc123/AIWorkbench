@@ -13,6 +13,8 @@ let state = {
   whitelist: [],
   running: false,
   dingStatus: '',
+  cli: {},         // {busy, ok, message, done_at} — 后端 CLI 异步任务状态（v9.22.1）
+  checkTries: 0,   // 「检查中…」连续重试次数（v9.22.1）
   selected: new Set(),   // 选中的 msgid
   selectedTagId: null,
 };
@@ -23,6 +25,87 @@ function toast(msg) {
   el.classList.add('show');
   clearTimeout(toast._t);
   toast._t = setTimeout(() => el.classList.remove('show'), 1900);
+}
+
+/* ---------------- 状态轮询（v9.22.1 修复「永远检查中」） ----------------
+ * 背景：后端查 dws 登录态是异步的（最坏 40s）。旧代码只有 boot 后一次性
+ * setTimeout(refreshState, 3000)：3 秒时缓存还是占位串，之后再也没有刷新，
+ * 页面就永远停在「检查中…」。现在改成：
+ *   - 状态含「检查」：每 1.5s 重试，最多 20 次（约 30s），超限显示「状态未知」
+ *   - 拿到真实状态：每 10s 刷新一次
+ *   - 页面隐藏时暂停，回到前台立即刷一次
+ *   - 点状态文字 = 立即重新检测
+ */
+let statusTimer = null;
+const STATUS_RETRY_MS = 1500;
+const STATUS_IDLE_MS = 10000;
+const STATUS_MAX_TRIES = 20;
+
+function statusIsChecking() {
+  return /检查/.test(String(state.dingStatus || ''));
+}
+
+function scheduleStatusPoll() {
+  clearTimeout(statusTimer);
+  statusTimer = null;
+  if (document.visibilityState === 'hidden') return;   // 后台不白跑
+  if (statusIsChecking()) {
+    state.checkTries = (state.checkTries || 0) + 1;
+    if (state.checkTries > STATUS_MAX_TRIES) {
+      state.dingStatus = '状态未知，点「重新检测」';
+      renderStatus();
+      return;                                          // 超限停止，别无限转圈
+    }
+    statusTimer = setTimeout(refreshState, STATUS_RETRY_MS);
+  } else {
+    state.checkTries = 0;
+    statusTimer = setTimeout(refreshState, STATUS_IDLE_MS);
+  }
+}
+
+function refreshStatusNow() {
+  clearTimeout(statusTimer);
+  statusTimer = null;
+  state.checkTries = 0;
+  refreshState();
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshStatusNow();
+    else clearTimeout(statusTimer);
+  });
+}
+
+/* ---------------- CLI 异步任务观察（v9.22.1） ----------------
+ * 后端 im_cli_setup / im_cli_login 已改成立即返回 async=True，真正干活在
+ * 后台线程。这里在 busy 期间每 1.5s 拉一次状态，完成时 toast 结果并回调
+ * onDone（用来恢复按钮）—— 一趟装 npm 包可能要好几分钟，所以上限放到
+ * 200 次（≈5min），不能像旧版那样 60s 就撒手不管。
+ */
+let cliWatchTimer = null;
+
+function startCliWatch(onDone) {
+  clearTimeout(cliWatchTimer);
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (typeof onDone === 'function') {
+      try { onDone(); } catch (e) { /* 恢复按钮失败不影响主流程 */ }
+    }
+  };
+  const tick = async (n) => {
+    await refreshState();
+    const cli = state.cli || {};
+    if (cli.busy && n < 200) {                 // 最多观察 ~5min
+      cliWatchTimer = setTimeout(() => tick(n + 1), 1500);
+      return;
+    }
+    if (!cli.busy && cli.message) toast(cli.message);
+    finish();
+  };
+  cliWatchTimer = setTimeout(() => tick(0), 800);
 }
 
 /* ---------------- tab 切换 ---------------- */
@@ -202,8 +285,18 @@ function renderStatus() {
     txt.textContent = '未运行';
     $('#toggleBtn').textContent = '启动助理';
   }
-  $('#dingStatus').textContent = state.dingStatus || '';
-  $('#cliStatus').textContent = state.dingStatus || '';
+  const ding = $('#dingStatus');
+  ding.textContent = state.dingStatus || '状态未知，点「重新检测」';
+  ding.title = '点击重新检测钉钉登录状态';
+  ding.style.cursor = 'pointer';
+
+  // ★ v9.22.1：CLI 状态单独展示。旧代码把它赋值成 state.dingStatus（复读），
+  //   所以 CLI 那格永远跟着显示「检查中…」。
+  const cli = state.cli || {};
+  let cliText = cli.message || '';
+  if (cli.busy && !cliText) cliText = '正在执行…';
+  if (!cliText) cliText = '尚未检测';
+  $('#cliStatus').textContent = cliText;
 }
 
 /* ---------------- 数据刷新 ---------------- */
@@ -220,12 +313,30 @@ async function refreshState() {
     state.whitelist = d.whitelist || [];
     state.running = !!d.running;
     state.dingStatus = d.ding_status || '';
+    state.cli = d.cli || {};
     renderMessages();
     renderSettings();
     renderTags();
     renderStatus();
   } catch (e) {
     console.error('[im] refreshState 失败', e);
+  } finally {
+    // 每次拉完都重新排下一次（检查中 1.5s / 已就绪 10s / 隐藏时暂停）
+    scheduleStatusPoll();
+  }
+}
+
+/* ---------------- 按钮「进行中」态 ---------------- */
+async function withBusy(btn, label, fn) {
+  if (!btn) return await fn();
+  const oldHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = label;
+  try {
+    return await fn();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = oldHtml;
   }
 }
 
@@ -235,26 +346,43 @@ function wire() {
   const backBtn = $('#backBtn');
   if (backBtn) backBtn.addEventListener('click', () => rpc('nav_to', { key: 'chat' }));
 
+  // 状态文字可点 → 立即重新检测（v9.22.1）
+  const dingEl = $('#dingStatus');
+  if (dingEl) dingEl.addEventListener('click', () => refreshStatusNow());
+
   // tab
   wireTabs();
 
   // 消息页操作
   $('#delBtn').addEventListener('click', async () => {
     if (state.selected.size === 0) return;
-    await rpc('im_delete_msgs', { msgids: [...state.selected] });
-    state.selected.clear();
-    await refreshState();
+    await withBusy($('#delBtn'), '删除中…', async () => {
+      await rpc('im_delete_msgs', { msgids: [...state.selected] });
+      state.selected.clear();
+      await refreshState();
+    });
     toast('已删除');
   });
   $('#allBtn').addEventListener('click', () => {
+    const btn = $('#allBtn');
+    const oldHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = '已提交…';
     call('rpc', { method: 'im_process_all', args: {}, reqId: 'all' + Date.now() });
     toast('已提交全部消息给 AI');
+    setTimeout(async () => {
+      await refreshState();
+      btn.disabled = false;
+      btn.innerHTML = oldHtml;
+    }, 1500);
   });
 
   // 启动/停止
   $('#toggleBtn').addEventListener('click', async () => {
-    await rpc('im_toggle', { start: !state.running });
-    await refreshState();
+    await withBusy($('#toggleBtn'), '处理中…', async () => {
+      await rpc('im_toggle', { start: !state.running });
+      await refreshState();
+    });
   });
 
   // 白名单
@@ -262,9 +390,11 @@ function wire() {
     const name = $('#wlInput').value.trim();
     if (!name) return;
     const kind = $('#wlKind').value === '单聊' ? 'p2p' : 'group';
-    await rpc('im_whitelist_add', { cid: name, name: name, kind });
-    $('#wlInput').value = '';
-    await refreshState();
+    await withBusy($('#wlAdd'), '添加中…', async () => {
+      await rpc('im_whitelist_add', { cid: name, name: name, kind });
+      $('#wlInput').value = '';
+      await refreshState();
+    });
   });
 
   // 保存设置
@@ -280,16 +410,26 @@ function wire() {
       interval: parseInt($('#interval').value || '25', 10),
       auto_reply: $('#autoReply').checked,
     };
-    await rpc('im_set_settings', patch);
+    await withBusy($('#saveBtn'), '保存中…', async () => {
+      await rpc('im_set_settings', patch);
+      await refreshState();
+    });
     toast('设置已保存');
-    await refreshState();
   });
 
   // 标签
   $('#scanBtn').addEventListener('click', () => {
+    const btn = $('#scanBtn');
+    const oldHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = '扫描中…';
     call('rpc', { method: 'im_scan_tags', args: {}, reqId: 'scan' + Date.now() });
     toast('已开始扫描打标签');
-    setTimeout(refreshState, 3000);
+    setTimeout(async () => {
+      await refreshState();
+      btn.disabled = false;
+      btn.innerHTML = oldHtml;
+    }, 2000);
   });
   $('#tagSave').addEventListener('click', async () => {
     if (!state.selectedTagId) {
@@ -297,32 +437,59 @@ function wire() {
       return;
     }
     const tag = $('#tagInput').value.trim();
-    await rpc('im_set_tag', { thread_id: state.selectedTagId, tag });
-    await refreshState();
+    await withBusy($('#tagSave'), '保存中…', async () => {
+      await rpc('im_set_tag', { thread_id: state.selectedTagId, tag });
+      await refreshState();
+    });
     toast('标签已保存');
   });
 
-  // CLI 一键配置
+  // CLI 一键配置（后端 v9.22.1 改异步：立即返回 async=True，不再干等 120s）
   $('#cliSetupBtn').addEventListener('click', async () => {
-    toast('开始检测/安装钉钉 CLI…');
+    const btn = $('#cliSetupBtn');
+    const restore = () => { btn.disabled = false; btn.textContent = '一键配置钉钉 CLI'; };
+    state.cli = { busy: true, message: '正在配置…（可离开本页，完成后会提示）' };
+    renderStatus();
+    btn.disabled = true;
+    btn.textContent = '配置中…';
     try {
-      const d = await rpc('im_cli_setup', {}, 120000);
-      if (d && d.ok) toast(d.message || '钉钉 CLI 配置完成');
-      else toast((d && d.error) || '配置失败');
+      const d = await rpc('im_cli_setup', {});
+      if (d && d.message) toast(d.message);
+      if (d && d.ok === false && !d.async) {
+        toast(d.error || '配置失败');
+        restore();
+        return;
+      }
     } catch (e) {
       toast('CLI 配置失败：' + e.message);
+      restore();
+      return;
     }
+    // 后端已受理：按钮保持「配置中…」，等真正跑完再由 startCliWatch 恢复
+    startCliWatch(restore);
     await refreshState();
   });
   $('#cliLoginBtn').addEventListener('click', async () => {
-    toast('开始登录…');
+    const btn = $('#cliLoginBtn');
+    const restore = () => { btn.disabled = false; btn.textContent = '登录'; };
+    state.cli = { busy: true, message: '请在弹出的窗口/浏览器完成授权…' };
+    renderStatus();
+    btn.disabled = true;
+    btn.textContent = '等待授权…';
     try {
-      const d = await rpc('im_cli_login', {}, 120000);
-      if (d && d.ok) toast(d.message || '登录完成');
-      else toast((d && d.error) || '登录失败');
+      const d = await rpc('im_cli_login', {});
+      if (d && d.message) toast(d.message);
+      if (d && d.ok === false && !d.async) {
+        toast(d.error || '登录失败');
+        restore();
+        return;
+      }
     } catch (e) {
       toast('登录失败：' + e.message);
+      restore();
+      return;
     }
+    startCliWatch(restore);
     await refreshState();
   });
 }

@@ -683,7 +683,7 @@ class MessageCard(QWidget):
 
     def __init__(self, role, prose_html="", blocks=None, raw_text="", parent=None,
                  footer_text="", label=None, timestamp="", index=-1, actions=True,
-                 stats=None, collapsed=None, emphasis=False):
+                 stats=None, collapsed=None, emphasis=False, flow=None):
         super().__init__(parent)
         t = themes.tokens()
         self.role = role
@@ -691,6 +691,13 @@ class MessageCard(QWidget):
         self._raw = raw_text or ""
         self._prose = prose_html or ""
         self._blocks = blocks or []
+        # ★★ v9.22.0 修「代码块全被堆到消息最底下」（见 markdown_render.render_flow）：
+        #    `flow` 是按**原文顺序**排好的分段列表（正文段 / 代码块交替）。
+        #    非空 -> 走「顺序模式」：正文与代码块按原位置逐段铺开；
+        #    None / []（默认，所有非 assistant 角色以及直接构造的调用点）-> 老路径，
+        #    保证「正文在上、代码块在下」的旧行为对它们零回归。
+        self._flow = list(flow or [])
+        self._flow_enabled = flow is not None
         self._stats = stats                    # (新增行数, 删除行数) 或 None
         self._emphasis = bool(emphasis)        # 关键中间结论（保留可见 + 左侧竖线）
         self._label = label if label else _ROLE_LABEL.get(role, role)
@@ -800,6 +807,14 @@ class MessageCard(QWidget):
         self.body = body
         vbox.addWidget(body)
 
+        # ★★ v9.22.0：顺序模式的容器 —— 正文段与代码块按原文顺序交替铺进这里。
+        #   位置紧贴 body 之后、code_host 之前：顺序模式下 body 隐藏，这个容器顶上来，
+        #   视觉上仍与 body 左对齐（同一层 vbox、相同的 margins/宽度）。
+        self.flow_host = QVBoxLayout()
+        self.flow_host.setContentsMargins(0, 0, 0, 0)
+        self.flow_host.setSpacing(8)
+        vbox.addLayout(self.flow_host)
+
         self.code_host = QVBoxLayout()
         self.code_host.setContentsMargins(0, 0, 0, 0)
         self.code_host.setSpacing(8)
@@ -873,6 +888,10 @@ class MessageCard(QWidget):
             outer.addWidget(bubble, 0, Qt.AlignmentFlag.AlignTop)
             outer.addStretch(1)
 
+        # ★ v9.22.0：顺序模式里的正文段浏览器要长得**和 body 一模一样**，
+        #   所以把上面按角色定好的样式表存一份复用，避免两处字面量各自漂移。
+        self._body_qss = body.styleSheet()
+
         self._rebuild()
 
     # ---------- 构造入口 ----------
@@ -882,10 +901,23 @@ class MessageCard(QWidget):
                   emphasis=False):
         from .. import markdown_render
         prose, blocks = markdown_render.render_with_blocks(text)
+        # ★ v9.22.0：只有 assistant 正文才走「顺序模式」—— 代码块留在原文位置。
+        #   user / tool / thinking 保持老行为（工具结果里全是 ``` 命令输出，
+        #   走顺序模式会把胶囊撑成一大坨，得不偿失）。
+        #   ★ 没有代码块的消息**不启用**顺序模式（flow=None）：它只有一段正文，
+        #     老路径的渲染结果一模一样，没必要多造一个 QTextBrowser —— 零回归。
+        flow = None
+        if role == "assistant":
+            try:
+                segs = markdown_render.render_flow(text)
+                if any(s.get("type") == "code" for s in segs):
+                    flow = segs
+            except Exception:
+                flow = None          # 渲染出任何意外都退回老路径，宁可位置不对也别崩
         return cls(role, prose, blocks, raw_text=text or "", parent=parent,
                    footer_text=footer_text, label=label, timestamp=timestamp,
                    index=index, actions=actions, stats=stats, collapsed=collapsed,
-                   emphasis=emphasis)
+                   emphasis=emphasis, flow=flow)
 
     def update_live(self, text):
         """流式期间**原地**更新这张卡片的正文（v9.17.0）。
@@ -900,11 +932,16 @@ class MessageCard(QWidget):
         try:
             from .. import markdown_render
             prose, blocks = markdown_render.render_with_blocks(text or "")
+            flow = None
+            if self._flow_enabled:
+                flow = markdown_render.render_flow(text or "")
         except Exception:
             return False
         self._raw = text or ""
         self._prose = prose
         self._blocks = blocks
+        if self._flow_enabled:
+            self._flow = list(flow or [])
         try:
             self._rebuild()
         except Exception:
@@ -926,7 +963,41 @@ class MessageCard(QWidget):
         self._collapsed = bool(collapsed)
         self._apply_height_policy()
 
+    def _flow_has_code(self):
+        """flow 里是否**真的**存在代码段。
+
+        ★ v9.22.1：只有存在代码段才值得走顺序模式。
+          纯正文消息（含流式刚开头、还没吐到 ``` 的那段）走老路径：
+          一个 QTextBrowser + `setHtml()`，每帧只改一个文档。
+          否则流式时每 110ms 都要为"唯一的正文段"新建/销毁一个 QTextBrowser，
+          正是用户以前抱怨过的「模型输出有点卡」。
+          反过来，流式里一旦出现 ``` 围栏，下一次 `update_live()` 就会自动切进
+          顺序模式 —— 代码块再也不会被挪到正文下面。
+        """
+        try:
+            return any((s or {}).get("type") == "code" for s in (self._flow or []))
+        except Exception:
+            return False
+
     def _rebuild(self):
+        # ★★ v9.22.0：有顺序分段就按原文顺序铺（正文段与代码块交替）。
+        #   老路径（正文一坨 + 代码块全堆下面）**原样保留**给没有代码段的卡片，
+        #   保证工具胶囊 / 用户消息 / 纯文字消息 / 流式刚开头零回归。
+        if self._flow_has_code():
+            self.body.setVisible(False)
+            self._rebuild_flow()
+            self._apply_height_policy()
+            return
+
+        # 从顺序模式退回老路径（例如流式中代码块被删、或内容重算成纯正文）：
+        # 先把 flow_host 拆干净，否则两套控件会同时挂在卡片里。
+        while self.flow_host.count():
+            it = self.flow_host.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
         self.body.setHtml(self._prose)
         # ★ v9.18.0：代码块控件**能复用就复用**。
         #   流式输出时这里每 110ms 被调一次，老实现是"全部销毁再重建" ——
@@ -959,7 +1030,84 @@ class MessageCard(QWidget):
             self.code_host.addWidget(w)
         self._apply_height_policy()
 
+    # ---------- 顺序模式（代码块回到原文位置） ----------
+    def _make_prose_browser(self, html):
+        """造一个「和 body 长得完全一样」的正文浏览器（顺序模式用）。"""
+        b = QTextBrowser()
+        b.setReadOnly(True)
+        b.setOpenExternalLinks(False)
+        b.setFrameShape(QFrame.Shape.NoFrame)
+        b.setFixedWidth(BODY_WIDTH)
+        b.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        b.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        b.setStyleSheet(getattr(self, "_body_qss", "") or "")
+        b.setHtml(html or "")
+        return b
+
+    def _rebuild_flow(self):
+        """按 `self._flow` 的顺序把「正文段 / 代码块」逐个铺进 `flow_host`。
+
+        复用策略照抄 `_rebuild()`：先按签名建 pool，签名命中就原地复用，
+        没被复用的 `setParent(None) + deleteLater()`。
+        签名单独用 `_flow_sig` 存（不占 `_sig`）——`_sig` 是 `CodeBlockWidget`
+        给 `code_host` 那套 pool 用的 2 元组，两套 pool 各管各的，互不污染。
+        """
+        old = []
+        while self.flow_host.count():
+            it = self.flow_host.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                old.append(w)
+        pool = {}
+        for w in old:
+            sig = getattr(w, "_flow_sig", None)
+            if sig is not None:
+                pool.setdefault(sig, w)
+
+        fresh = []
+        for seg in self._flow:
+            if seg.get("type") == "code":
+                sig = ("code", seg.get("lang", ""), seg.get("code", ""))
+                w = pool.pop(sig, None)
+                if w is None:
+                    w = CodeBlockWidget(seg.get("lang", ""), seg.get("html", ""),
+                                        seg.get("code", ""))
+                    w._flow_sig = sig
+                fresh.append(w)
+            else:
+                sig = ("prose", seg.get("html", ""))
+                w = pool.pop(sig, None)
+                if w is None:
+                    w = self._make_prose_browser(seg.get("html", ""))
+                    w._flow_sig = sig
+                fresh.append(w)
+
+        for w in pool.values():          # 这次没被复用的：销毁
+            w.setParent(None)
+            w.deleteLater()
+        for w in fresh:
+            self.flow_host.addWidget(w)
+
+    def _fit_flow_prose(self):
+        """把顺序模式里的每个正文段撑到内容高度（不出现内部滚动条）。"""
+        for i in range(self.flow_host.count()):
+            it = self.flow_host.itemAt(i)
+            w = it.widget() if it is not None else None
+            sig = getattr(w, "_flow_sig", None) if w is not None else None
+            if not sig or sig[0] != "prose":
+                continue
+            w.setMaximumHeight(16777215)
+            fit_prose(w, BODY_WIDTH)
+
+    def _set_flow_visible(self, visible):
+        """顺序模式：整批子控件一起显/隐（照抄 `_apply_height_policy` 对 code_host 的做法）。"""
+        for i in range(self.flow_host.count()):
+            it = self.flow_host.itemAt(i)
+            if it and it.widget():
+                it.widget().setVisible(bool(visible))
+
     def _apply_height_policy(self):
+        flow_on = self._flow_has_code()
         # 收起态：正文 / 代码块 / 脚注全部隐藏，只留一行标题栏
         if self._collapsible and self._collapsed:
             self.body.setVisible(False)
@@ -967,17 +1115,24 @@ class MessageCard(QWidget):
                 it = self.code_host.itemAt(i)
                 if it and it.widget():
                     it.widget().setVisible(False)
+            self._set_flow_visible(False)
             self.footer.setVisible(False)
             if self.toggle_btn is not None:
                 self.toggle_btn.setText("▸")
         else:
-            self.body.setVisible(True)
-            self.body.setMaximumHeight(16777215)
-            fit_prose(self.body, BODY_WIDTH)
+            if flow_on:
+                # 顺序模式：body 已被 flow_host 取代，绝不能重新显示
+                self.body.setVisible(False)
+                self._fit_flow_prose()
+            else:
+                self.body.setVisible(True)
+                self.body.setMaximumHeight(16777215)
+                fit_prose(self.body, BODY_WIDTH)
             for i in range(self.code_host.count()):
                 it = self.code_host.itemAt(i)
                 if it and it.widget():
                     it.widget().setVisible(True)
+            self._set_flow_visible(True)
             self.footer.setVisible(bool(self.footer.text()))
             if self.toggle_btn is not None:
                 self.toggle_btn.setText("▾")
@@ -986,14 +1141,32 @@ class MessageCard(QWidget):
         self._add_lb.setVisible(show_stats)
         self._del_lb.setVisible(show_stats)
 
-    def set_content(self, prose_html="", blocks=None):
+    def set_content(self, prose_html="", blocks=None, raw_text=None):
+        """外部替换正文内容。
+
+        ★ v9.22.0：顺序模式下光有 (prose, blocks) 拼不回原文的交替顺序，
+          所以多给一个可选的 `raw_text` —— 传了且本卡是顺序模式时，顺便重算 flow。
+          不传就沿用原来的 flow（没有 flow 的卡片依旧是老行为，等于没变）。
+        """
         self._prose = prose_html or ""
         if blocks is not None:
             self._blocks = blocks
+        if raw_text is not None:
+            self._raw = raw_text or ""
+            if self._flow_enabled:
+                try:
+                    from .. import markdown_render
+                    self._flow = markdown_render.render_flow(self._raw)
+                except Exception:
+                    pass
         self._rebuild()
 
     def refit(self):
         if self._collapsible and self._collapsed:
+            return
+        if self._flow:
+            # 顺序模式：body 是隐藏的，量它的 viewport 宽没意义 —— 每个正文段都撑一遍
+            self._fit_flow_prose()
             return
         w = self.body.viewport().width()
         fit_prose(self.body, w if w > 80 else BODY_WIDTH)

@@ -244,6 +244,107 @@ def render_with_blocks(text: str):
     return html, [dict(b) for b in out]
 
 
+def render_flow(text: str):
+    r"""按**原文顺序**把 Markdown 拆成「正文段 / 代码块」交替的分段列表。
+
+    ★★ v9.22.0 修「模型生成的代码块全部被堆到消息最底下」：
+      历史实现是 `render_with_blocks()` —— 它把所有 ``` 代码块从原文里**摘出来**
+      单独返回一个 list，正文里只留占位符再删掉。界面于是只能「正文一坨在上、
+      所有代码块按顺序堆在下面」，代码块**离开了它原本的位置**：
+      前言 → 代码1 → 中间说明 → 代码2 → 结尾 会被压成
+      正文（前言 + 中间说明 + 结尾） → 代码1 → 代码2。
+      用户看不到「说明紧跟在自己的代码后面」这种最关键的阅读顺序。
+
+      本函数是**顺序扫描**版本：一遍扫过原文，围栏之间的文本累积成 prose 段，
+      围栏内的行累积成 code 段，按出现顺序交替产出。界面按这个顺序 addWidget
+      就能把代码块放回原位。
+
+    Returns:
+        list[dict]: 分段列表，元素是以下两种之一：
+          {"type": "prose", "html": str}                          —— 一段正文
+          {"type": "code", "lang": str, "html": str, "code": str} —— 一个代码块
+        没有代码块时返回 `[{"type": "prose", "html": 整段HTML}]`；
+        `text` 为空（或去掉工具调用后为空白）时返回 `[]`。
+
+    Note:
+        高亮、缓存、围栏解析规则与 `render_with_blocks()` **完全一致**
+        （复用 `_strip_tool_call` / `_inline_pygments` / `_norm_lang` /
+        `_FENCE_OPEN_RE` / `_FENCE_CLOSE_RE` / `_EMPTY_P_RE`），
+        只是产出的**组织方式**不同。缓存独立在 `("flow", hash)` 这个 key 上，
+        不会干扰 `("wb", ...)` / `("md", ...)`。
+    """
+    if not text:
+        return []
+
+    text = _strip_tool_call(text)
+    key = ("flow", _h(text))
+    hit = _cache_get(_render_cache, key)
+    if hit is not None:
+        # 复制一层新的 dict，避免调用方改动污染缓存
+        return [dict(seg) for seg in hit]
+
+    # 统一换行符，规则同 `_split_code_blocks`（CRLF 会让围栏行匹配失败）
+    src = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = src.split("\n")
+
+    segs = []
+    buf = []            # 正在累积的正文行
+    code_buf = []       # 正在累积的代码行
+    fence = None        # 已开围栏：(反引号个数, 语言名)
+
+    def flush_prose():
+        """把累积的正文行收成一段（空白段落直接丢掉，免得撑出空行）。"""
+        if not buf:
+            return
+        raw = "\n".join(buf)
+        del buf[:]
+        if not raw.strip():
+            return
+        html = markdown.markdown(raw, extensions=["tables", "nl2br"])
+        html = _EMPTY_P_RE.sub("", html)
+        if not html.strip():
+            return
+        segs.append({"type": "prose", "html": html})
+
+    def flush_code():
+        """把累积的代码行收成一个代码块（含流式未闭合围栏的最后一段）。"""
+        if fence is None:
+            return
+        code = "\n".join(code_buf)
+        del code_buf[:]
+        if code:
+            code += "\n"
+        lang = fence[1]
+        segs.append({"type": "code", "lang": lang,
+                     "html": _inline_pygments(code, lang), "code": code})
+
+    for line in lines:
+        if fence is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m and len(m.group(1)) >= 3:
+                # 开围栏：先收掉前面的正文，再切进代码态
+                flush_prose()
+                fence = (len(m.group(1)), _norm_lang(m.group(2)))
+                continue
+            buf.append(line)
+        else:
+            mc = _FENCE_CLOSE_RE.match(line)
+            if mc and len(mc.group(1)) >= fence[0]:
+                flush_code()
+                fence = None
+                continue
+            code_buf.append(line)
+
+    if fence is not None:
+        # ★ 流式中间态：围栏开了还没闭合 -> 剩下的全算代码（和 _split_code_blocks 一致）
+        flush_code()
+    else:
+        flush_prose()
+
+    _cache_put(_render_cache, key, segs, _RENDER_CACHE_MAX)
+    return [dict(seg) for seg in segs]
+
+
 def render_markdown(text: str) -> str:
     if not text:
         return ""

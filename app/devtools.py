@@ -15,7 +15,10 @@
 
 2. `find_lines(pattern, path=".", glob=None, regex=False, case_sensitive=True,
               context=1, max_results=60)`
-   按内容找**行号**，是 `edit_lines` 的前置步骤。
+   按内容找**行号**，是 `edit_lines` 的前置步骤。`context` 是命中处前后各带几行
+   （v9.22.1 起上限 10，默认 1）；命中数超过 `max_results` 时结果里会写明
+   「共命中 N 处、只显示了前 M 处、用 path/glob 收窄」。`read_file` 一次
+   读超过 400 行时也会在末尾追加「下次用 start/limit」的提示。
 
 3. `edit_lines(path, start, end, new_text, expect=None)`
    只替换第 start~end 行。四道硬闸：
@@ -55,6 +58,14 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 2 * 1024 * 1024          # 单文件 > 2MB 直接跳过
 DEFAULT_MAX_RESULTS = 60
 MAX_MAX_RESULTS = 200
+# 命中处的上下文行数（前后各几行）。v9.22.1：上限 5 -> 10 ——
+# 实测 5 行不够看清一个函数的开头和收尾，模型还得再补一次 read_file。
+DEFAULT_CONTEXT = 1
+MAX_CONTEXT = 10
+
+# 一次 read_file 返回超过这么多行，就在结果末尾追加一句「下次别这么读」。
+# 400 行大约是 2 万字符，已经占掉相当一部分上下文，再读下去只会看漏中间。
+BIG_READ_LINES = 400
 
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules", "venv", ".venv",
@@ -340,6 +351,11 @@ def read_file(args, ctx=None, confirm_cb=None):
         out.append(f"# 还有 {rest} 行没显示；继续读请用 start={last + 1}, limit={limit}")
     else:
         out.append(f"# 已读到文件末尾（共 {total} 行）")
+    # v9.22.1 护栏：一次读太多等于没读（中间会漏、上下文也会被塞爆）
+    nread = last - start + 1
+    if nread > BIG_READ_LINES:
+        out.append(f"[提示] 本次读了 {nread} 行，共 {total} 行。"
+                   f"下次用 start/limit 只读你要的那段，或先 find_lines 定位。")
     return "\n".join(out)
 
 
@@ -388,10 +404,10 @@ def find_lines(args, ctx=None, confirm_cb=None):
     pat = _s(a, "glob", "include", "文件名")
     is_re = _as_bool(a.get("regex"), False)
     cs = _as_bool(a.get("case_sensitive"), True)
-    ctxn = _as_int(a.get("context"), 1)
+    ctxn = _as_int(a.get("context"), DEFAULT_CONTEXT)
     if ctxn is None or ctxn < 0:
         ctxn = 0
-    ctxn = min(ctxn, 5)
+    ctxn = min(ctxn, MAX_CONTEXT)
     maxr = _as_int(a.get("max_results"), DEFAULT_MAX_RESULTS)
     if maxr is None or maxr <= 0:
         maxr = DEFAULT_MAX_RESULTS
@@ -495,11 +511,15 @@ def find_lines(args, ctx=None, confirm_cb=None):
                 + ("（按正则匹配）" if is_re else "") + f"。{tail}\n"
                 "换个关键词，或把 case_sensitive 设为 false、regex 设为 true 再试。")
 
-    head = f"# 在 {nfiles} 个文件里找到 {hits} 处"
+    # 统计句必须把「共命中多少 / 只给了多少 / 怎么收窄」说全：
+    # 否则模型看到满屏结果会以为已经搜全了，后面就按错误的结论干活。
+    head = f"# 共命中 {hits} 处（分布在 {nfiles} 个文件）"
     if hits > shown:
-        head += f"（只显示了前 {shown} 处，还有 {hits - shown} 处没显示）"
+        head += (f"；已显示前 {shown} 处，还有 {hits - shown} 处没显示"
+                 f" —— 用 path 指定文件/目录，或加 glob（如 glob=\"*.py\"）收窄范围再搜，"
+                 f"别以为这就是全部")
     else:
-        head += f"（已全部显示，共 {shown} 处）"
+        head += f"；已全部显示（{shown} 处）"
     out = [head] + blocks
     if skipped_big:
         out.append(f"# 跳过了 {skipped_big} 个大文件（单个超过 2MB，按文本搜不动）")
@@ -758,11 +778,13 @@ def apply_patch(args, ctx=None, confirm_cb=None):
 TOOLS_DEV = {
     "read_file": {
         "fn": read_file, "readonly": True, "danger": False,
-        "desc": "分批读文本文件，每行带行号（start/limit）。",
+        "desc": ("读文件片段（必须给 start/limit 才高效；整读只适合不到 80 行的文件），"
+                 "每行带行号。"),
     },
     "find_lines": {
         "fn": find_lines, "readonly": True, "danger": False,
-        "desc": "按文本/正则搜行号，是 edit_lines 的前置步骤。",
+        "desc": ("搜函数名/变量名/报错原文/中文关键词；返回 `文件:行号: 内容`"
+                 "（context 可带前后各 10 行），是 read_file / edit_lines 的前置步骤。"),
     },
     "edit_lines": {
         "fn": edit_lines, "readonly": False, "danger": False,
