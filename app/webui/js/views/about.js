@@ -82,6 +82,7 @@ let _lastProgress = null; // 最近一次 update_progress 载荷；切页回来�
 
 function updateBtn() { return document.getElementById('aboutUpdate'); }
 function updateMsgEl() { return document.getElementById('aboutUpdateMsg'); }
+function updateNowBtn() { return document.getElementById('aboutUpdateNow'); }
 
 /** 渲染按钮右侧的状态文案（就地显示，不弹窗、不跳页）。 */
 function setUpdateMsg(text, kind) {
@@ -120,6 +121,8 @@ function setChecking(on) {
 function setUpdating(on) {
   _updating = !!on;
   syncUpdateBtn();
+  const nb = updateNowBtn();
+  if (nb && on) nb.hidden = true;
 }
 
 /** 抹掉一切实现细节与网址，只留一句人话。 */
@@ -199,6 +202,10 @@ function renderProgress(d) {
 
   wrap.hidden = false;
   setUpdating(ACTIVE_STAGES.indexOf(stage) >= 0);   // done/failed 之外都算进行中
+  if (stage === 'failed') {
+    const nb = updateNowBtn();
+    if (nb) nb.hidden = false;   // 失败后可重试
+  }
 
   const textEl = updTextEl();
   if (textEl) textEl.textContent = text;   // 一行文案
@@ -247,6 +254,8 @@ function applyUpdateResult(d) {
     setUpdateMsg('已是最新' + cur, 'ok');
     toast('已是最新' + cur);
   }
+  const nb = updateNowBtn();
+  if (nb) nb.hidden = !data.has_update;   // 有更新才显示「下载并安装」
 }
 
 function build(root) {
@@ -257,6 +266,7 @@ function build(root) {
       <span class="spacer"></span>
       <span class="hint" id="aboutUpdateMsg"></span>
       <button class="btn" id="aboutUpdate">检查更新</button>
+      <button class="btn btn-primary" id="aboutUpdateNow" hidden>下载并安装</button>
       <button class="btn" id="aboutDiag">复制诊断信息</button>
     </div>
     <div class="up-wrap" id="aboutUpdWrap" hidden>
@@ -353,6 +363,24 @@ function wire(root) {
       setChecking(false);
       setUpdateMsg('检查失败：' + e.message, 'err');
       toast('检查更新失败：' + e.message);
+    }
+  });
+  $('#aboutUpdateNow', root).addEventListener('click', async () => {
+    if (_updating || _checking) return;
+    if (!window.confirm('要下载并安装新版本吗？下载完成后程序会自动重启。')) return;
+    const nb = updateNowBtn();
+    if (nb) nb.hidden = true;
+    setUpdating(true);
+    hideProgress();
+    try {
+      await rpc('update.apply', {});
+      // 真正进度走 update_progress 事件；此处无需额外处理
+    } catch (e) {
+      setUpdating(false);
+      const msg = '更新启动失败：' + e.message;
+      setUpdateMsg(msg, 'err');
+      toast(msg);
+      if (nb) nb.hidden = false;
     }
   });
   $('#aboutDiag', root).addEventListener('click', async () => {

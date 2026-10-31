@@ -3,7 +3,7 @@
 'use strict';
 
 import { getState, patch, subscribe } from '../store.js';
-import { on, call } from '../bridge.js';
+import { on, call, rpc } from '../bridge.js';
 import { switchTo } from '../nav.js';
 import '../components/msg.js';
 import '../components/tool-capsule.js';
@@ -27,6 +27,14 @@ let streamBaseCount = 0;
 let streamBaseMsgCount = 0;
 // 收束动画时长覆盖（探针用 0 让它同步完成；正常运行留空走默认/减弱动画）。
 let collapseMsOverride = null;
+
+/* ---------------- 语音 / 朗读 运行态 ---------------- */
+// 当前正在朗读的 SpeechSynthesisUtterance；非空表示朗读进行中（再点按钮即停止）。
+let currentUtterance = null;
+// 正在朗读的那条消息上的「朗读」按钮，便于停止时还原文案 / 高亮。
+let currentReadBtn = null;
+// 语音状态占位符：记录 input 默认占位符，语音状态变化时临时覆盖，状态结束后还原。
+let voicePlaceholderDefault = '';
 
 
 /* ---------------- 工具函数 ---------------- */
@@ -66,6 +74,13 @@ function setComposerBusy(on) {
 function syncSend() {
   const st = getState();
   sendBtn.disabled = !st.streaming && input.value.trim() === '';
+}
+
+// 语音状态占位符：有状态文本就临时覆盖输入框占位符，空或停止类词则还原默认文案。
+function setVoicePlaceholder(msg) {
+  const m = String(msg || '');
+  const stopped = !m || /(停止|stop|关闭|off|idle|就绪|完成|停止录音|已停止)/i.test(m);
+  input.placeholder = stopped ? voicePlaceholderDefault : m;
 }
 
 function autosize() {
@@ -530,9 +545,31 @@ function renderConvList() {
     const btn = document.createElement('button');
     btn.className = 'conv' + (c.id === st.currentConvId ? ' is-active' : '');
     btn.innerHTML =
-      `<span class="conv-title"></span><span class="conv-preview"></span>`;
+      `<span class="conv-main"><span class="conv-title"></span><span class="conv-preview"></span></span>` +
+      `<button class="conv-export" type="button" title="导出对话" aria-label="导出对话">` +
+      `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">` +
+      `<path d="M8 2.2v7M5 6.4 8 9.4l3-3M3.2 12.6h9.6"/></svg>` +
+      `</button>` +
+      `<button class="conv-del" type="button" title="删除对话" aria-label="删除对话">` +
+      `<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">` +
+      `<path d="M2.5 4h11M6 4V2.8c0-.4.3-.8.8-.8h2.4c.4 0 .8.4.8.8V4M12.5 4l-.6 9.2c0 .5-.4 1-1 1H5.1c-.6 0-1-.5-1-1L3.5 4M6.5 7v4M9.5 7v4"/></svg>` +
+      `</button>`;
     btn.querySelector('.conv-title').textContent = c.title || '未命名对话';
     btn.querySelector('.conv-preview').textContent = c.preview || '';
+    const del = btn.querySelector('.conv-del');
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const title = c.title || '未命名对话';
+      if (window.confirm(`确定删除对话「${title}」吗？此操作不可恢复。`)) {
+        call('delete_conv', { convId: c.id });
+      }
+    });
+    const exp = btn.querySelector('.conv-export');
+    exp.addEventListener('click', (e) => {
+      e.stopPropagation();
+      call('export_conv', { convId: c.id });
+      toast('已导出，正在打开文件夹…');
+    });
     btn.addEventListener('click', () => {
       // 一步直达：从任意页面（设置/技能…）点左侧对话项，都先切回对话页。
       // 不 await —— 切页是同步展示，避免阻塞下面的对话切换。
@@ -740,7 +777,15 @@ function wireEvents() {
   });
 
   fileBtn.addEventListener('click', () => call('pick_file'));
-  micBtn.addEventListener('click', () => toast('语音输入暂未接入'));
+  // 语音输入：切换录音。状态/转写由后端 push 事件驱动（见 bindBridge 的 on(...)）。
+  micBtn.addEventListener('click', async () => {
+    try {
+      const d = await rpc('voice.toggle');
+      if (d && d.status) setVoicePlaceholder(d.status);
+    } catch (e) {
+      toast('语音切换失败：' + e.message);
+    }
+  });
 
   modelBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -763,6 +808,39 @@ function wireEvents() {
       } else {
         toast('复制不可用');
       }
+    }
+    // 朗读：浏览器内置 Web Speech API 朗读助手消息；再点一次停止。
+    if (act.dataset.act === 'read') {
+      const msg = act.closest('msg-bubble');
+      const btn = act;
+      if (currentUtterance) {                       // 正在朗读 → 停止（含切到别的消息朗读时）
+        const prevBtn = currentReadBtn;
+        window.speechSynthesis.cancel();
+        currentUtterance = null;
+        if (prevBtn) {
+          prevBtn.textContent = '朗读';
+          prevBtn.classList.remove('is-active');
+        }
+        currentReadBtn = null;
+        if (btn === prevBtn) return;                 // 点的就是正在朗读的那条 → 仅停止
+        // 点是另一条：下面继续为它朗读
+      }
+      const text = msg ? (msg._body ? msg._body.innerText : '') : '';
+      if (!text) { toast('没有可朗读的内容'); return; }
+      const u = new SpeechSynthesisUtterance(text);
+      const reset = () => {
+        currentUtterance = null;
+        currentReadBtn = null;
+        btn.textContent = '朗读';
+        btn.classList.remove('is-active');
+      };
+      u.onend = reset;
+      u.onerror = reset;
+      currentUtterance = u;
+      currentReadBtn = btn;
+      btn.textContent = '停止';
+      btn.classList.add('is-active');
+      window.speechSynthesis.speak(u);
     }
   });
 }
@@ -881,6 +959,20 @@ function bindBridge() {
   on('theme', (p) => {
     if (p && p.theme) patch({ theme: p.theme });
   });
+
+  // 语音状态：后端 push 的录音状态，临时显示在输入框占位符上（见 setVoicePlaceholder）。
+  on('voice_status', (p) => {
+    if (!p) return;
+    setVoicePlaceholder(p.msg || p.status || '');
+  });
+
+  // 语音转写结果：把识别出的文本追加进输入框。
+  on('voice_transcript', (p) => {
+    if (!p || !p.text) return;
+    input.value += p.text;
+    autosize();
+    syncSend();
+  });
 }
 
 /* ---------------- 启动 ---------------- */
@@ -900,6 +992,8 @@ export function initChat() {
   attachmentsEl = $('#attachments');
   fileBtn = $('#fileBtn');
   micBtn = $('#micBtn');
+
+  voicePlaceholderDefault = input.placeholder || '输入消息，回车发送';
 
   bindBridge();
   wireEvents();

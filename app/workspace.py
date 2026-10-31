@@ -618,9 +618,24 @@ class Workspace:
             pass
 
     def delete_conversation(self, cid):
+        cid = str(cid or "").strip()
+        if not cid:
+            return
         p = self._conv_path(cid)
         if os.path.exists(p):
             os.remove(p)
+        # ★ v9.22.3：对话的专属文件夹（chats/<NN_标题>/，含 files 产物与 MEMORY.md）
+        #   也要一起删掉，否则只删了 json、文件夹和产物会残留在磁盘上。
+        try:
+            import shutil
+            folder = self.conv_folder(cid, create=False)
+            if folder and os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+            idx = self._load_index()
+            if idx.pop(cid, None) is not None:
+                self._save_index(idx)
+        except Exception:
+            pass
 
     def new_conversation(self):
         cid = "c" + str(int(time.time() * 1000))

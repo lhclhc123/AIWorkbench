@@ -1313,6 +1313,9 @@ class MainWindow(QMainWindow):
         self.voice.transcribed.connect(self._on_transcribed)
         self.voice.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.voice.failed.connect(self._on_voice_error)
+        # ★ Web UI：把语音信号额外接一份，只在 web 激活时回推事件（不干扰 Qt 模式）。
+        self.voice.transcribed.connect(self._web_on_voice_transcribed)
+        self.voice.status.connect(self._web_on_voice_status)
         right.addWidget(self.voice)
         self.voice.setVisible(False)
 
@@ -1450,6 +1453,8 @@ class MainWindow(QMainWindow):
         bridge.cmd_set_theme.connect(self._web_set_theme)
         bridge.cmd_new_conv.connect(self._new_conversation)
         bridge.cmd_select_conv.connect(self._web_select_conv)
+        bridge.cmd_delete_conv.connect(self._web_delete_conv)
+        bridge.cmd_export_conv.connect(self._web_export_conv)
         bridge.cmd_ready.connect(self._web_push_init)   # 前端连接成功后才推 init
         bridge.rpc_request.connect(
             lambda method, args_json, req_id: self._web_handle_rpc(method, args_json, req_id, bridge))
@@ -1674,6 +1679,54 @@ class MainWindow(QMainWindow):
                 "convId": conv_id,
                 "messages": self._web_conv_messages(conv_id),
             })
+
+    def _web_delete_conv(self, conv_id):
+        """网页左栏每个对话项的「删除」图标 → 真删（含文件夹）→ 刷新列表。
+
+        ★ v9.22.3：此前网页侧根本没入口删对话，只能删当前对话（Qt 侧按钮）。
+          现在 web 列表每项都有垃圾桶图标，点确认后走这里。删掉的是当前对话时，
+          自动切到剩余最新一条（没有就新建），保证界面不空。
+        """
+        conv_id = (conv_id or "").strip()
+        if not conv_id:
+            return
+        was_current = (str(self._conv_cid()) == conv_id)
+        try:
+            self.workspace.delete_conversation(conv_id)
+        except Exception:
+            pass
+        if was_current:
+            try:
+                remaining = self.workspace.list_conversations()
+                if remaining:
+                    self._web_select_conv(remaining[0]["id"])
+                else:
+                    self._new_conversation(silent=True)
+            except Exception:
+                pass
+        self._web_push_convs()
+
+    def _web_export_conv(self, conv_id):
+        """网页左栏每个对话项的「导出」图标 → 生成 md 并打开所在文件夹。
+
+        ★ v9.22.3：补齐 Qt 有而 Web 缺的「导出对话」。复用 workspace.export_conversation，
+          导出成功后用 os.startfile 打开所在文件夹，让用户马上看到文件。
+        """
+        conv_id = (conv_id or "").strip()
+        if not conv_id:
+            return
+        try:
+            conv = self.workspace.load_conversation(conv_id)
+        except Exception:
+            conv = None
+        if not conv:
+            return
+        try:
+            fpath = self.workspace.export_conversation(conv, fmt="md")
+            if fpath and os.path.isfile(fpath):
+                os.startfile(os.path.dirname(fpath))
+        except Exception:
+            pass
 
     def _web_conv_messages(self, cid=None):
         """把 cid 对话的消息列表转成网页渲染用的格式。
@@ -2018,6 +2071,127 @@ class MainWindow(QMainWindow):
             try:
                 self.trace.clear()
                 return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 语音输入 voice ----
+        if method == "voice.toggle":
+            return self._web_voice_toggle(args)
+
+        # ---- 后台并行任务池 bg ----
+        if method == "bg.list":
+            try:
+                tasks = []
+                for t in self.taskman.list(limit=100):
+                    try:
+                        snap = t.snapshot()
+                    except Exception:
+                        snap = {}
+                    tasks.append({
+                        "id": snap.get("id", getattr(t, "id", "")),
+                        "name": snap.get("title", ""),
+                        "status": snap.get("status", ""),
+                        "progress": snap.get("progress", ""),
+                        "kind": snap.get("kind", ""),
+                    })
+                return {"tasks": tasks}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "tasks": []}
+        if method == "bg.cancel":
+            try:
+                self.taskman.cancel(str(args.get("id", "")))
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "bg.cancel_all":
+            try:
+                self.taskman.cancel_all()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "bg.clear":
+            try:
+                self.taskman.clear_finished()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 团队 team ----
+        if method == "team.list":
+            try:
+                runs = []
+                for r in self.teamman.list(limit=50):
+                    try:
+                        snap = r.snapshot()
+                    except Exception:
+                        snap = {}
+                    runs.append({
+                        "id": snap.get("id", getattr(r, "id", "")),
+                        "status": snap.get("status", ""),
+                        "team_id": snap.get("team_id", ""),
+                        "team_name": snap.get("team_name", ""),
+                        "goal": snap.get("goal", ""),
+                    })
+                return {"teams": runs}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "teams": []}
+        if method == "team.select":
+            try:
+                team_id = str(args.get("team_id") or "")
+                cid = str(args.get("conv_id") or "")
+                if cid and cid != self._conv_cid():
+                    conv = self.workspace.load_conversation(cid)
+                    if conv is None:
+                        return {"ok": False, "error": f"未找到对话 {cid}"}
+                    conv["team_id"] = team_id
+                    self.workspace.save_conversation(conv)
+                else:
+                    if self.conv is None:
+                        return {"ok": False, "error": "当前没有对话可设置团队"}
+                    self.conv["team_id"] = team_id
+                    self.workspace.save_conversation(self.conv)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "team.start":
+            try:
+                goal = str(args.get("goal") or "")
+                team_id = str(args.get("team_id") or "") or None
+                run = self._team_start(goal, team_id=team_id)
+                return {"ok": True, "run_id": run.id}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "team.cancel":
+            try:
+                rid = str(args.get("id") or "")
+                run = self.teamman.get(rid)
+                if run is None:
+                    return {"ok": False, "error": f"未找到团队运行 {rid}"}
+                run.cancel()
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        if method == "team.status":
+            try:
+                rid = str(args.get("id") or "")
+                run = self.teamman.get(rid)
+                if run is None:
+                    return {"ok": False, "error": f"未找到团队运行 {rid}"}
+                return {"ok": True, "status": run.status, "run": run.snapshot()}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        # ---- 工作区切换 workspace ----
+        if method == "workspace.switch":
+            try:
+                old = self.workspace.path
+                self._switch_workspace()
+                new = self.workspace.path
+                if (new != old and getattr(self, "_web_engine", False)
+                        and self._web_bridge is not None):
+                    self._web_bridge.emit_event(
+                        "workspace_changed", {"path": new})
+                return {"ok": True, "path": new}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
@@ -4271,6 +4445,40 @@ class MainWindow(QMainWindow):
     def _toggle_recording(self):
         self.voice.toggle()
 
+    # ---------- Web UI 语音回推 ----------
+    def _web_voice_state(self):
+        """VoiceInput 没有 is_recording()，用 recorder/busy 推断状态。"""
+        try:
+            if getattr(self.voice, "recorder", None) is not None:
+                return "recording"
+            if getattr(self.voice, "busy", False):
+                return "recognizing"
+        except Exception:
+            pass
+        return "idle"
+
+    def _web_voice_toggle(self, args):
+        """Web 版「点麦克风」：复用 VoiceInput.toggle()，回当前状态。"""
+        try:
+            self.voice.toggle()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "status": self._web_voice_state()}
+
+    def _web_on_voice_transcribed(self, text):
+        if getattr(self, "_web_engine", False) and self._web_bridge is not None:
+            try:
+                self._web_bridge.emit_event("voice_transcript", {"text": text})
+            except Exception:
+                pass
+
+    def _web_on_voice_status(self, msg):
+        if getattr(self, "_web_engine", False) and self._web_bridge is not None:
+            try:
+                self._web_bridge.emit_event("voice_status", {"msg": msg})
+            except Exception:
+                pass
+
     def _speak(self, text, engine=None):
         if self.speaker.speak(text, engine=engine or self.speaker.engine):
             return f"[成功] 已朗读（{len(text)} 字，{engine or self.speaker.engine} 引擎）"
@@ -6298,26 +6506,29 @@ class MainWindow(QMainWindow):
         """下载新版本压缩包并自动应用。UI 线程只管弹进度，下载在后台线程。"""
         info = getattr(self, "_pending_update", None)
         if not (info and info.get("ok") and info.get("has_update")):
-            self._info("当前没有待安装的更新。先点「立即检查更新」看看。", "自动更新")
-            return
-        # ★ v9.22.1：web 模式禁止 Qt 对话框（QProgressDialog 会盖住网页且退不出）
-        if getattr(self, "_web_engine", False):
-            msg = ("Web 版请到发布页手动下载更新包："
-                   + str(info.get("html_url") or ""))
-            try:
-                if self._web_bridge is not None:
-                    self._web_bridge.emit_event("update_error", {"error": msg})
-            except Exception:
-                pass
-            self.statusBar().showMessage(msg, 10000)
+            msg = "当前没有待安装的更新。先点「检查更新」看看。"
+            if getattr(self, "_web_engine", False):
+                self._web_push_update_progress("failed", None, None, msg)
+            else:
+                self._info(msg, "自动更新")
             return
         asset = updater.pick_asset(info, prefer=(".zip", ".exe"))
         if not asset:
-            self._info(f"这个 Release 没有附件，请到发布页手动下载：\n{info.get('html_url')}",
-                       "自动更新")
+            msg = f"这个 Release 没有附件，请到发布页手动下载：\n{info.get('html_url')}"
+            if getattr(self, "_web_engine", False):
+                self._web_push_update_progress("failed", None, None, msg)
+            else:
+                self._info(msg, "自动更新")
             return
         import tempfile as _tf
         dest = os.path.join(_tf.gettempdir(), "AIWorkbench_update_" + asset["name"])
+        if getattr(self, "_web_engine", False):
+            # ★ v9.22.3：Web 版真正跑下载+安装，进度通过 update_progress 事件推前端
+            #   （about.js 已支持「一行人话 + 进度条」渲染，无需 Qt 对话框）。
+            threading.Thread(target=self._web_update_worker, args=(asset, dest),
+                            daemon=True, name="awb-web-update").start()
+            return
+        # ---- Qt 模式：原有 QProgressDialog 流程 ----
         from PyQt6.QtWidgets import QProgressDialog
         dlg = QProgressDialog(f"正在下载 {asset['name']} …", "", 0, 100, self)
         dlg.setWindowTitle("自动更新")
@@ -6342,6 +6553,58 @@ class MainWindow(QMainWindow):
                 #   不要在界面上出现「RuntimeError: ...」这种技术栈信息。
                 self._update_fail.emit(updater.human_error(e))
         threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Web 版自动更新：后台真下载+安装，进度推给前端 ----
+    def _web_push_update_progress(self, stage, done=None, total=None, text=None):
+        """把更新阶段/进度翻译成 update_progress 事件推给网页（about.js 渲染）。"""
+        if not (self._web_engine and self._web_bridge is not None):
+            return
+        try:
+            pct = None
+            if done is not None and total:
+                try:
+                    pct = int(done * 100 / total)
+                except Exception:
+                    pct = None
+            self._web_bridge.emit_event("update_progress", {
+                "stage": str(stage),
+                "text": text if text is not None else "",
+                "done": int(done) if done is not None else 0,
+                "total": int(total) if total is not None else 0,
+                "percent": pct,
+            })
+        except Exception:
+            pass
+
+    def _web_update_worker(self, asset, dest):
+        """Web 模式下在后台线程跑 下载→安装，进度逐段推前端；结束退出本进程交 PowerShell 重启。"""
+        import threading  # noqa: F401（保持与 Qt 分支一致）
+        cur = {"stage": "downloading"}
+
+        def _on_stage(s, det):
+            cur["stage"] = str(s)
+            self._web_push_update_progress(s, None, None, det)
+
+        def _on_progress(d, t):
+            self._web_push_update_progress(cur["stage"], d, t)
+
+        try:
+            updater.download(asset["url"], dest,
+                             progress=_on_progress, on_stage=_on_stage)
+            self._web_push_update_progress("extracting", None, None, "正在解压更新包…")
+            cur["stage"] = "installing"
+            updater.install_package(dest,
+                                   progress=_on_progress, on_stage=_on_stage)
+            # install_package 已安排好 PowerShell 覆盖+重启；推重启提示后退出本进程
+            self._web_push_update_progress("restarting", None, None, "正在重启到新版本…")
+        except Exception as e:
+            self._web_push_update_progress("failed", None, None, updater.human_error(e))
+            return
+        try:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.quit()
+        except Exception:
+            pass
 
     def _update_on_progress(self, done, total):
         dlg = getattr(self, "_upd_dlg", None)

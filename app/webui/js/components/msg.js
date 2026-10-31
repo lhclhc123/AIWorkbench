@@ -66,6 +66,7 @@ class MsgBubble extends HTMLElement {
     actions.className = 'msg-actions';
     actions.hidden = true;
     actions.innerHTML =
+      `<button class="act" data-act="read">朗读</button>` +
       `<button class="act" data-act="copy">复制</button>` +
       `<button class="act" data-act="regenerate">重答</button>` +
       `<span class="spacer"></span>` +

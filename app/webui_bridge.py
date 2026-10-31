@@ -58,6 +58,8 @@ class WebUIBridge(QObject):
     cmd_set_theme = pyqtSignal(str)     # set_theme("light"/"dark")
     cmd_new_conv = pyqtSignal()         # new_conv()
     cmd_select_conv = pyqtSignal(str)   # select_conv(convId)
+    cmd_delete_conv = pyqtSignal(str)   # delete_conv(convId)
+    cmd_export_conv = pyqtSignal(str)   # export_conv(convId)
     cmd_ready = pyqtSignal()            # ready() —— 前端连接成功后主动上报
     # ★ v9.21.1 通用 RPC：前端 call('rpc', {method, args, reqId}) → 后端
     #   dispatch(method) → 结果通过 webui_event('rpc_result', {reqId, ok, data})
@@ -110,6 +112,10 @@ class WebUIBridge(QObject):
             self.cmd_new_conv.emit()
         elif name == "select_conv":
             self.cmd_select_conv.emit(str(args.get("convId", "")))
+        elif name == "delete_conv":
+            self.cmd_delete_conv.emit(str(args.get("convId", "")))
+        elif name == "export_conv":
+            self.cmd_export_conv.emit(str(args.get("convId", "")))
         elif name == "ready":
             self.cmd_ready.emit()
         elif name == "rpc":

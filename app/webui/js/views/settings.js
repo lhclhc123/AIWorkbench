@@ -1,7 +1,7 @@
 // views/settings.js —— 设置页：5 个分组（通用/模型/语音/密钥/提示词），tab 切换 + 统一保存
 'use strict';
 
-import { rpc } from '../bridge.js';
+import { rpc, on } from '../bridge.js';
 
 const $ = (s, root) => (root || document).querySelector(s);
 
@@ -63,6 +63,11 @@ function build(root) {
             <option value="light">浅色</option>
             <option value="dark">深色</option>
           </select>
+        </div>
+        <div class="f-row">
+          <span class="f-label">工作区</span>
+          <span class="hint" id="set_workspace">当前工作区未知</span>
+          <button class="btn" id="set_workspace_switch">切换工作区</button>
         </div>
         <div class="f-row">
           <span class="f-label">字号缩放</span>
@@ -461,6 +466,24 @@ function wire(root) {
   $('#promptReset', root).addEventListener('click', () => {
     $('#set_system_prompt', root).value = '';
     toast('已清空，将回落到内置默认提示词');
+  });
+
+  // 切换工作区：调用后端打开原生对话框，路径由 workspace_changed 事件回推刷新
+  $('#set_workspace_switch', root).addEventListener('click', async () => {
+    try {
+      await rpc('workspace.switch', {});
+      toast('已打开切换工作区对话框');
+    } catch (e) {
+      toast('切换工作区失败：' + e.message);
+    }
+  });
+
+  // 后端推送工作区路径变化（RPC 打开对话框选择后回推），更新设置页展示
+  on('workspace_changed', (p) => {
+    const el = $('#set_workspace', root);
+    if (!el) return;
+    const path = (p && (p.path || p.workspace)) || '';
+    el.textContent = path ? ('当前工作区：' + path) : '当前工作区未知';
   });
 }
 
