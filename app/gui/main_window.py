@@ -5196,7 +5196,10 @@ class MainWindow(QMainWindow):
         except Exception:
             self._dt_last_log = ""
         try:
-            self.statusBar().showMessage("钉钉：" + str(msg)[:110], 6000)
+            # ★ v9.22.4：本回调是 dws/Stream **后台线程**直接调的，
+            #   直接 statusBar() 会跨线程碰控件（启动时刷 "Cannot create children
+            #   for a parent that is in a different thread"）。改发信号回主线程。
+            self.status_flash.emit("钉钉：" + str(msg)[:110], 6000)
         except Exception:
             pass
 
@@ -5874,7 +5877,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._safe_asst_log(f"消息落盘失败（不影响处理）：{type(exc).__name__}: {exc}")
         who = msg.get("conv") or msg.get("sender") or "钉钉"
-        self.statusBar().showMessage(
+        # 本方法在 IM/Stream 工作线程里跑：状态栏必须走信号（v9.22.4）
+        self.status_flash.emit(
             f"⚑ 助理收到消息（{who}）：{str(msg.get('text'))[:40]}", 8000)
         if self.assistant.cfg.get("auto_reply"):
             # ★ v9.20.0：用户要的流程 ——「收到消息 → 立刻让 AI 把回复准备好
@@ -6538,7 +6542,8 @@ class MainWindow(QMainWindow):
     def _asst_log_ui(self, line):
         try:
             self.page_assistant.log(line)
-            self.statusBar().showMessage(line, 8000)
+            # 本方法常由后台线程调用（发文件、代回等），状态栏走信号（v9.22.4）
+            self.status_flash.emit(str(line), 8000)
         except Exception:
             pass
 
