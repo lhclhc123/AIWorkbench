@@ -653,7 +653,7 @@ function wire() {
     });
     toast('已删除');
   });
-  $('#allBtn').addEventListener('click', () => {
+  $('#allBtn').addEventListener('click', async () => {
     const btn = $('#allBtn');
     const oldHtml = btn.innerHTML;
     btn.disabled = true;
@@ -714,7 +714,7 @@ function wire() {
   });
 
   // 标签
-  $('#scanBtn').addEventListener('click', () => {
+  $('#scanBtn').addEventListener('click', async () => {
     const btn = $('#scanBtn');
     const oldHtml = btn.innerHTML;
     btn.disabled = true;

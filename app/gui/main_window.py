@@ -194,6 +194,14 @@ class MainWindow(QMainWindow):
     sched_notice = pyqtSignal(str)
     subagent_notice = pyqtSignal(str)
     hotkey_triggered = pyqtSignal(str)
+    # ★ v9.22.4：状态栏闪现（text, ms）。
+    #   以前是 `signal.connect(lambda m: self.statusBar().showMessage(...))` ——
+    #   lambda 不是 QObject 的方法，PyQt 会按**发射线程**直连执行，于是后台线程
+    #   里去碰 statusBar() 会在启动时刷出
+    #     "QObject: Cannot create children for a parent that is in a different thread"
+    #     "QObject::startTimer: Timers can only be used with threads started with QThread"
+    #   统一发本信号（发信号跨线程是安全的），由绑定方法在主线程收。
+    status_flash = pyqtSignal(str, int)
     # 「工作总结 + 自动记忆」的回执（后台线程 -> 界面）
     wrapup_notice = pyqtSignal(str)
     # 钉钉接口调试台：后台线程 -> 界面
@@ -501,6 +509,9 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(make_icon())
         self.resize(1320, 860)
         self.setAcceptDrops(True)
+        # ★ status_flash 必须**最早接上**：_build_shell / _open_workspace 期间
+        #   就可能有 _info(...) 调用，接晚了那条提示会静默丢掉。
+        self.status_flash.connect(self._on_status_flash)
         self._apply_theme()
         self._build_shell()
         self._open_workspace(self.workspace.path, first=True)
@@ -508,9 +519,10 @@ class MainWindow(QMainWindow):
 
         # 后台任务回报（跨线程 -> 界面）
         self.sched_done.connect(self._on_sched_done)
-        self.sched_notice.connect(lambda m: self.statusBar().showMessage(str(m), 6000))
+        self.sched_notice.connect(
+            lambda m: self.status_flash.emit(str(m), 6000))
         self.subagent_notice.connect(
-            lambda m: self.statusBar().showMessage(str(m), 9000))
+            lambda m: self.status_flash.emit(str(m), 9000))
         self.hotkey_triggered.connect(self._on_hotkey)
         self.wrapup_notice.connect(self._on_wrapup_notice)
 
@@ -1311,7 +1323,8 @@ class MainWindow(QMainWindow):
             keys_provider=lambda: self.settings.get("api_keys", {}),
             settings_provider=lambda: self.settings)
         self.voice.transcribed.connect(self._on_transcribed)
-        self.voice.status.connect(lambda m: self.statusBar().showMessage(m, 6000))
+        self.voice.status.connect(
+            lambda m: self.status_flash.emit(str(m), 6000))
         self.voice.failed.connect(self._on_voice_error)
         # ★ Web UI：把语音信号额外接一份，只在 web 激活时回推事件（不干扰 Qt 模式）。
         self.voice.transcribed.connect(self._web_on_voice_transcribed)
@@ -6930,11 +6943,20 @@ class MainWindow(QMainWindow):
 
         ★ v9.22.1：web 模式下**禁止任何 Qt 对话框**（会盖在网页上且无法关闭），
         统一降级为状态栏提示。
+        ★ v9.22.4：状态栏也走信号 —— 本方法可能被后台线程调用，直接碰控件会
+        触发跨线程告警（且首次 statusBar() 会在错的线程里创建控件）。
         """
         if _NO_MODAL or getattr(self, "_web_engine", False):
-            self.statusBar().showMessage(f"{title}：{text}", ms)
+            self.status_flash.emit(f"{title}：{text}", int(ms))
             return
         QMessageBox.information(self, title, text)
+
+    def _on_status_flash(self, text, ms):
+        """status_flash 的落地槽（永远在主线程执行）。"""
+        try:
+            self.statusBar().showMessage(str(text), int(ms))
+        except Exception:
+            pass
 
     # ================= 设置 =================
     def _on_settings_saved(self, s):
