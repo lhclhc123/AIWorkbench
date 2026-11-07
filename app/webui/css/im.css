@@ -187,8 +187,10 @@
 .cli-modal{
   position:fixed;inset:0;z-index:80;
   display:flex;align-items:center;justify-content:center;
-  background:rgba(15,18,22,.42);
-  backdrop-filter:blur(2px);
+  /* ★ v9.22.5：去掉了 backdrop-filter:blur(2px)。整屏毛玻璃在软件渲染下
+     每帧都要重算一遍全视口模糊，弹窗一出现整页就掉帧，用户甚至会以为
+     「窗口卡死了、点完成没反应」。用纯半透明遮罩，视觉差别很小。 */
+  background:rgba(15,18,22,.46);
 }
 .cli-modal[hidden]{display:none;}
 
@@ -201,6 +203,9 @@
   border:1px solid var(--border);border-radius:14px;
   box-shadow:var(--shadow-2,0 18px 44px rgba(0,0,0,.24));
   animation:cliIn .16s ease-out;
+  /* ★ v9.22.5：内容再多也不能把「完成 / ✕」挤出可视区（旧版没有 overflow，
+     步骤一多底部按钮就被顶到屏幕外，用户以为"窗口关不掉"）。 */
+  overflow:hidden;
 }
 @keyframes cliIn{from{opacity:0;transform:translateY(8px) scale(.985);}to{opacity:1;transform:none;}}
 
@@ -245,8 +250,11 @@
 
 .cli-hint{font-size:12px;color:var(--text-2);line-height:1.5;word-break:break-word;}
 
-/* 四步状态 */
-.cli-steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px;}
+/* 四步状态：可滚动，保证底部按钮永远留在框里 */
+.cli-steps{
+  list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px;
+  flex:0 1 auto;min-height:0;overflow-y:auto;max-height:38vh;
+}
 .cli-step{display:flex;align-items:flex-start;gap:9px;font-size:12.5px;line-height:1.45;}
 .cli-step-ic{
   flex:0 0 auto;width:16px;height:16px;border-radius:50%;
@@ -281,7 +289,7 @@
   background:var(--surface);white-space:pre-wrap;word-break:break-all;
 }
 
-.cli-foot{display:flex;align-items:center;gap:8px;padding-top:2px;}
+.cli-foot{display:flex;align-items:center;gap:8px;padding-top:2px;flex:0 0 auto;}
 .cli-elapsed{font-size:11px;color:var(--text-3);flex:1;}
 
 /* ============================================================

@@ -998,7 +998,22 @@ class MainWindow(QMainWindow):
         if app is None:
             themes.tokens()
             return
-        return themes.apply(app, self.settings.get("theme", "light"))
+        ret = themes.apply(app, self.settings.get("theme", "light"))
+        # ★ v9.22.5：主题同步到两个 Web 页。以前只在建页时随 init 推一次，
+        #   切主题后钉钉页还停在旧配色（im 页以前连 init 都收不到）。
+        self._push_theme_to_web()
+        return ret
+
+    def _push_theme_to_web(self):
+        """把当前主题推给对话页与钉钉页（任一页不存在就跳过）。"""
+        theme = "dark" if self.settings.get("theme") == "dark" else "light"
+        for attr in ("_web_bridge", "_im_bridge"):
+            bridge = getattr(self, attr, None)
+            try:
+                if bridge is not None:
+                    bridge.emit_event("theme", {"theme": theme})
+            except Exception:
+                pass
 
     def _toggle_theme(self):
         self.settings["theme"] = "dark" if self.settings.get("theme") != "dark" else "light"
@@ -2292,7 +2307,15 @@ class MainWindow(QMainWindow):
                                      for k, v in dt.items()}
             except Exception:
                 pass
-            return {"settings": s}
+            try:
+                _ws_path = str(getattr(self.workspace, "path", "") or "")
+            except Exception:
+                _ws_path = ""
+            return {"settings": s,
+                    # ★ v9.22.5：设置页以前只在收到 workspace_changed 事件时才更新
+                    #   「当前工作区」，所以一进设置页永远显示「当前工作区未知」。
+                    #   这里把真实路径一起返回，前端 init 就能显示出来。
+                    "workspace": _ws_path}
         if method == "settings.save":
             patch = dict(args.get("patch", {}) or {})
             if not patch:
@@ -2538,14 +2561,42 @@ class MainWindow(QMainWindow):
 
         ★ v9.22.1：这是「自动检测一直检查中」的修复点之一 —— 后台 probe 完成后
         必须主动推 im_refresh，前端才知道结果出来了。
+        ★ v9.22.5：加节流（200ms 一次）。npm / dws 一次安装会吐几十上百行日志，
+        旧代码**每行**都推一次 im_refresh；前端每收到一次就整体重拉 im_get_state
+        并全量重绘消息/设置/标签，于是配置窗口一弹出来整页就卡成幻灯片，用户
+        连「完成 / ✕」都点不动。被合并掉的那次用一个延时线程补推，保证最终
+        状态一定会到。
         """
         if not getattr(self, "_web_engine", False):
             return
         bridge = getattr(self, "_im_bridge", None)
         if bridge is None:
             return
+        lock = getattr(self, "_im_push_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._im_push_lock = lock
+        now = time.time()
+        with lock:
+            if now - getattr(self, "_im_push_last", 0.0) < 0.2:
+                if getattr(self, "_im_push_timer", None) is None:
+                    t = threading.Timer(0.24, self._im_push_later)
+                    t.daemon = True
+                    self._im_push_timer = t
+                    t.start()
+                return
+            self._im_push_last = now
         try:
             bridge.emit_event("im_refresh", {})
+        except Exception:
+            pass
+
+    def _im_push_later(self):
+        """节流补推：把被合并掉的最后一次刷新真正发出去。"""
+        self._im_push_timer = None
+        self._im_push_last = 0.0
+        try:
+            self._notify_im_refresh()
         except Exception:
             pass
 
@@ -2749,18 +2800,74 @@ class MainWindow(QMainWindow):
                 "tags": t.get("tags", []),
                 "tag_auto": t.get("tag_auto", False),
                 "msg_count": t.get("msg_count", 0),
+                "last_ts": float(t.get("last_ts") or 0.0),
             })
+        # ★ v9.22.5：群聊在前、单聊在后，同类里按最近对话时间倒序。
+        #   字典顺序是写入顺序，看着像"乱序"，用户明确要求按类型+时间排。
+        tag_list.sort(key=lambda x: (0 if x.get("kind") == "group" else 1,
+                                     -float(x.get("last_ts") or 0.0)))
         return {
             "ready": True,
             "running": bool(getattr(self, "assistant", None)
                             and self.assistant.running),
             "ding_status": self._asst_ding_status_text(force=force_ding),
-            "cli": dict(self._im_cli_state_get()),
+            "cli": self._im_cli_state_for_front(),
+            "scan": dict(self._im_scan_state()),
             "rows": rows,
             "settings": st,
             "tags": tag_list,
             "whitelist": st.get("whitelist", []),
         }
+
+    def _im_cli_idle_hint(self):
+        """从没跑过「一键配置」时，给一句基于文件探测的真实状态（不跑子进程）。
+
+        ★ v9.22.5：以前这里恒为空串，前端就显示「尚未检测」—— 而实际上 dws
+        早就装好、也早就登录了。用户看到「尚未检测」会以为 CLI 没配置好，
+        反复点一键配置，越点越觉得「啥也配置不了」。
+        """
+        now = time.time()
+        cache = getattr(self, "_im_cli_idle_cache", None)
+        if cache and now - cache[0] < 60:
+            return cache[1]
+        text = "未自检，点「一键配置钉钉 CLI」可自动检测 / 安装"
+        try:
+            from ..dingtalk import find_dws
+            node, dws = find_dws()
+            if dws:
+                text = "dws 已安装（未自检）。点「一键配置」校验，或点「登录」授权"
+            elif not node:
+                text = "未检测到 Node.js（18+），点「一键配置」会给出安装入口"
+        except Exception:
+            pass
+        self._im_cli_idle_cache = (now, text)
+        return text
+
+    def _im_cli_state_for_front(self):
+        """给前端的 CLI 状态副本：从未运行过时补一句真实的自检提示。"""
+        cli = dict(self._im_cli_state_get())
+        if not cli.get("started_at") and not cli.get("message"):
+            cli["message"] = self._im_cli_idle_hint()
+        return cli
+
+    # ---- v9.22.5：会话扫描（打标签）进度，推给 web 钉钉页 ----
+    def _im_scan_state(self):
+        """打标签扫描的进度。
+
+        以前只有 Qt 版钉钉页有 `set_scan_state`，Web 页的 `#scanState` 元素虽然
+        存在却没有任何人写它 —— 用户点「扫描并打标签」后页面上什么都不动，
+        看着就像功能坏了（实际后台在逐个会话调 AI，可能要几分钟）。
+        """
+        if not hasattr(self, "_im_scan_data"):
+            self._im_scan_data = {"busy": False, "i": 0, "n": 0,
+                                  "name": "", "message": "尚未扫描"}
+        return self._im_scan_data
+
+    def _im_scan_set(self, **kw):
+        st = self._im_scan_state()
+        st.update(kw)
+        self._notify_im_refresh()
+        return st
 
     def _web_im_set_settings(self, args):
         if getattr(self, "im_store", None) is None:
@@ -2841,7 +2948,7 @@ class MainWindow(QMainWindow):
             ok = bool(result.get("ok"))
             if ok:
                 # 配置/校验走完，钉钉登录态可能刚变 —— 让页头状态重新查一次
-                self._ding_status_cache = None
+                self._ding_status_invalidate()
             msg = (result.get("message") or result.get("error")
                    or ("钉钉 CLI 已就绪" if ok else "配置失败"))
             # ★ v9.22.2：收尾时把「还在转圈」的那一步落定，别让进度窗口永远卡在 90%
@@ -3107,7 +3214,7 @@ class MainWindow(QMainWindow):
                     who = s2.get("user_name") or ""
                     self._im_cli_step("auth", "done", who or "已授权", percent=100)
                     # 清掉「钉钉登录状态」的 60s 缓存，否则页头还写着「还没登录」
-                    self._ding_status_cache = None
+                    self._ding_status_invalidate()
                     self._im_cli_state_set(
                         busy=False, ok=True, cancelable=False,
                         message="✓ 登录成功" + (("：" + who) if who else ""))
@@ -5383,20 +5490,26 @@ class MainWindow(QMainWindow):
             return False
 
     def _im_llm(self, messages, thread):
-        """hub 用的模型调用（同步）。
+        """助理用的模型调用（同步）。
 
-        ★ 用户要求「模型不要让用户选，默认 glm」—— 助理固定优先 glm-4-flash，
-          前台对话选什么模型都不影响它。免费档不可用时退到 auto（省钱优先），
-          仍然不需要用户操心。
+        ★ v9.22.5（用户明确要求）：「不要用 GLM 大模型，优先使用超算大模型」。
+        实测同一批会话：GLM 会给「五人群」瞎打「家长、老师、同学、学校」，
+        还会把「编程老师」写成「大学老师」；超算 SCNet-Max 给出的是「家人」
+        「班级群」这种靠谱结果。所以这里改成**超算优先**，失败再退智谱，
+        最后退 auto。
         """
         cli = self.bg_client
-        try:
-            return cli.chat(messages, "glm-4-flash", False, None, 90) or ""
-        except Exception:
+        for model, timeout in (("SCNet-Max", 90), ("glm-4-flash", 60)):
             try:
-                return cli.chat(messages, "auto", False, None, 120) or ""
+                out = cli.chat(messages, model, False, None, timeout) or ""
             except Exception:
-                return ""
+                out = ""
+            if str(out).strip():
+                return out
+        try:
+            return cli.chat(messages, "auto", False, None, 120) or ""
+        except Exception:
+            return ""
 
     def _im_tick(self):
         """定时消息 + 代回时序的心跳（每 10 秒）。失败绝不影响界面。"""
@@ -5476,14 +5589,14 @@ class MainWindow(QMainWindow):
         now = time.time()
         cache = getattr(self, "_ding_status_cache", None)
         if force:
-            self._ding_status_cache = None
-            self._ding_status_loading = False
+            self._ding_status_invalidate()
             cache = None
         if cache and now - cache[0] < 60:
             return cache[1]
         # 缓存 miss → 后台补查，本次先给占位
         if not getattr(self, "_ding_status_loading", False):
             self._ding_status_loading = True
+            gen = int(getattr(self, "_ding_status_gen", 0))
 
             def _probe():
                 text = ""
@@ -5504,6 +5617,11 @@ class MainWindow(QMainWindow):
                     text = "状态读取失败：%s: %s" % (type(exc).__name__, exc)
                 finally:
                     self._ding_status_loading = False
+                # ★ v9.22.5：只有「最新一代」探测有权写缓存。否则一个在登录前
+                #   发起的旧探测晚到，会把「还没登录」盖到刚登录成功的结果上，
+                #   页面会莫名其妙退回未登录（且被缓存 60s）。
+                if gen != int(getattr(self, "_ding_status_gen", 0)):
+                    return
                 self._ding_status_cache = (time.time(), text)
                 # ★ v9.22.1：后台查完必须主动推前端。否则 web 钉钉页 boot 那次
                 #   拿到的是占位串、3 秒后缓存还没填好、之后再无刷新 —— 页面会
@@ -5511,12 +5629,19 @@ class MainWindow(QMainWindow):
                 self._notify_im_refresh()
             threading.Thread(target=_probe, daemon=True,
                              name="awb-ding-status").start()
-        return "检查钉钉登录状态中…"
+        # 文案里必须保留「检查」二字：前端 im.js 靠 /检查/ 判断「还在探测」，
+        # 决定是 0.8s 快速轮询还是 10s 常规轮询。
+        return "正在检查钉钉登录状态…"
+
+    def _ding_status_invalidate(self):
+        """作废登录态缓存，并让在飞的旧探测结果失效（v9.22.5）。"""
+        self._ding_status_cache = None
+        self._ding_status_gen = int(getattr(self, "_ding_status_gen", 0)) + 1
 
     def _asst_ding_login(self, device):
         self._safe_asst_log("已发起 dws 授权登录（%s），请按提示完成授权…"
                             % ("设备码" if device else "浏览器扫码"))
-        self._ding_status_cache = None
+        self._ding_status_invalidate()
         try:
             self._dingtalk_dws_login(bool(device))
         except Exception as exc:
@@ -5525,7 +5650,7 @@ class MainWindow(QMainWindow):
         # 登录完回来刷一次状态（用户不用手动点）
         def _later():
             time.sleep(8)
-            self._ding_status_cache = None
+            self._ding_status_invalidate()
             self._im_refresh_all()
         threading.Thread(target=_later, daemon=True).start()
 
@@ -5710,8 +5835,12 @@ class MainWindow(QMainWindow):
             return
         if not self.ding.dws_available():
             self.page_assistant.set_scan_state("没找到 dws，先把「集成 → 钉钉」配好")
+            self._im_scan_set(busy=False, i=0, n=0, name="",
+                              message="没找到 dws，先到「集成 → 钉钉」配置")
             return
         self.page_assistant.set_scan_state("正在读取钉钉会话列表…")
+        self._im_scan_set(busy=True, i=0, n=0, name="",
+                          message="正在读取钉钉会话列表…")
         self._safe_asst_log("开始扫描全部会话并打标签（一次一个会话，会慢一些）")
 
         outer = self
@@ -5739,23 +5868,36 @@ class MainWindow(QMainWindow):
                 self.done.emit(res)
 
         w = _ScanWorker(self.im_store, self.ding, self._im_llm, outer)
-        w.progress.connect(
-            lambda i, n, nm: self.page_assistant.set_scan_state(f"正在扫描 {i}/{n}：{nm}"))
+        w.progress.connect(self._im_scan_progress)
         w.done.connect(self._im_tag_scan_done)
         self._im_scan_thread = w
         w.start()
+
+    def _im_scan_progress(self, i, n, nm):
+        """扫描进度（扫描线程的 progress 信号 → Qt 页 + Web 页都显示）。"""
+        text = "正在扫描 %s/%s：%s" % (i, n, nm)
+        try:
+            self.page_assistant.set_scan_state(text)
+        except Exception:
+            pass
+        self._im_scan_set(busy=True, i=int(i), n=int(n), name=str(nm),
+                          message=text)
 
     def _im_tag_scan_done(self, res):
         self._im_scan_thread = None
         res = dict(res or {})
         if not res.get("ok"):
-            self.page_assistant.set_scan_state(
-                f"扫描失败：{res.get('reason') or '未知原因'}")
+            reason = res.get("reason") or "未知原因"
+            self.page_assistant.set_scan_state(f"扫描失败：{reason}")
+            self._im_scan_set(busy=False,
+                              message="扫描失败：%s" % reason)
             self._safe_asst_log(f"扫描失败：{res.get('reason')}")
             return
-        self.page_assistant.set_scan_state(
-            "扫描完成：共 %s 个会话，打上 %s 个标签（拿不准的留空了，你可以自己改）"
-            % (res.get("total"), res.get("tagged")))
+        done_text = ("扫描完成：共 %s 个会话，打上 %s 个标签（拿不准的留空了，你可以自己改）"
+                     % (res.get("total"), res.get("tagged")))
+        self.page_assistant.set_scan_state(done_text)
+        self._im_scan_set(busy=False, i=int(res.get("total") or 0),
+                          n=int(res.get("total") or 0), message=done_text)
         self._safe_asst_log(
             "扫描完成：%s 个会话 / %s 个标签" % (res.get("total"), res.get("tagged")))
         try:

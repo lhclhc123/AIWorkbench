@@ -166,7 +166,7 @@ function wire(root) {
   $('#tasksNew', root).addEventListener('click', () => {
     $('#tasksForm', root).hidden = false;
   });
-  $('#tasksCancel', root).addEventListener('click', () => {
+  $('#taskCancel', root).addEventListener('click', () => {
     $('#tasksForm', root).hidden = true;
   });
   $('#taskSave', root).addEventListener('click', async () => {

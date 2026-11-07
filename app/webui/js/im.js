@@ -2,7 +2,7 @@
 // 依赖 bridge.js 的 rpc() 调后端方法；数据全来自后端 IMStore。
 'use strict';
 
-import { rpc, call, on } from './bridge.js';
+import { rpc, call, on, start } from './bridge.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -14,6 +14,7 @@ let state = {
   running: false,
   dingStatus: '',
   cli: {},         // {busy, ok, message, done_at} — 后端 CLI 异步任务状态（v9.22.1）
+  scan: {},        // {busy,i,n,message} — 扫描打标签进度（v9.22.5）
   checkTries: 0,   // 「检查中…」连续重试次数（v9.22.1）
   selected: new Set(),   // 选中的 msgid
   selectedTagId: null,
@@ -31,15 +32,19 @@ function toast(msg) {
  * 背景：后端查 dws 登录态是异步的（最坏 40s）。旧代码只有 boot 后一次性
  * setTimeout(refreshState, 3000)：3 秒时缓存还是占位串，之后再也没有刷新，
  * 页面就永远停在「检查中…」。现在改成：
- *   - 状态含「检查」：每 1.5s 重试，最多 20 次（约 30s），超限显示「状态未知」
+ *   - 状态含「检查」：每 0.8s 重试，最多 30 次（约 24s），超限显示「状态未知」
  *   - 拿到真实状态：每 10s 刷新一次
- *   - 页面隐藏时暂停，回到前台立即刷一次
+ *   - 页面隐藏时降频（不彻底停，否则切回来之前永远不更新）
  *   - 点状态文字 = 立即重新检测
+ *
+ * ★ v9.22.5：旧代码在 checkTries 超限后直接 `return`，轮询链就此断掉 ——
+ *   后端其实早就查好了，页面却一直挂着「状态未知」，除非用户手动点一下。
+ *   现在超限后只降频到 15s 重试，保证最终一定能自愈。
  */
 let statusTimer = null;
-const STATUS_RETRY_MS = 1500;
+const STATUS_RETRY_MS = 800;
 const STATUS_IDLE_MS = 10000;
-const STATUS_MAX_TRIES = 20;
+const STATUS_MAX_TRIES = 30;
 
 function statusIsChecking() {
   return /检查/.test(String(state.dingStatus || ''));
@@ -48,19 +53,21 @@ function statusIsChecking() {
 function scheduleStatusPoll() {
   clearTimeout(statusTimer);
   statusTimer = null;
-  if (document.visibilityState === 'hidden') return;   // 后台不白跑
+  const hidden = document.visibilityState === 'hidden';
   if (statusIsChecking()) {
     state.checkTries = (state.checkTries || 0) + 1;
     if (state.checkTries > STATUS_MAX_TRIES) {
       state.dingStatus = '状态未知，点「重新检测」';
       renderStatus();
-      return;                                          // 超限停止，别无限转圈
+      // 不再「永久放弃」：慢速兜底重试，后端一旦查好就会自动恢复正常
+      statusTimer = setTimeout(refreshState, 15000);
+      return;
     }
-    statusTimer = setTimeout(refreshState, STATUS_RETRY_MS);
-  } else {
-    state.checkTries = 0;
-    statusTimer = setTimeout(refreshState, STATUS_IDLE_MS);
+    statusTimer = setTimeout(refreshState, hidden ? 3000 : STATUS_RETRY_MS);
+    return;
   }
+  state.checkTries = 0;
+  statusTimer = setTimeout(refreshState, hidden ? 30000 : STATUS_IDLE_MS);
 }
 
 function refreshStatusNow() {
@@ -74,8 +81,11 @@ function refreshStatusNow() {
 
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
+    // 回到前台：立刻刷一次并把节奏恢复正常
     if (document.visibilityState === 'visible') refreshStatusNow();
-    else clearTimeout(statusTimer);
+    // 切到后台：不彻底停（旧代码 clearTimeout 后就再也没有人排下一次了），
+    // 改成重新排一个 30s 的慢速轮询，回来时数据是热的。
+    else scheduleStatusPoll();
   });
 }
 
@@ -102,6 +112,13 @@ function startCliWatch(onDone) {
     const cli = state.cli || {};
     if (cli.busy && n < 200) {                 // 最多观察 ~5min
       cliWatchTimer = setTimeout(() => tick(n + 1), 1500);
+      return;
+    }
+    if (cli.busy && n >= 200) {
+      // 观察窗口用尽但任务还在跑（装 npm 包可能很慢）——明确告知，别让按钮
+      // 无声无息地永久卡在「配置中…」。后台任务仍在继续，回来还能看到进度。
+      toast('仍在后台执行，可稍后回到本页查看进度');
+      finish();
       return;
     }
     if (!cli.busy && cli.message) toast(cli.message);
@@ -163,8 +180,9 @@ function renderCli(cli) {
   const busy = !!cli.busy;
   const runId = Number(cli.started_at || 0);
   const steps = cli.steps || [];
-  // 从没跑过就别动（页面平时 10s 轮询一次，不能让它自己冒出来）
-  if (!runId || steps.length === 0) return;
+  // 从没跑过就别动（页面平时 10s 轮询一次，不能让它自己冒出来）。
+  // 但 busy 时允许 steps 还没铺满 —— 否则刚点配置的那一两秒窗口是空白标题。
+  if (!runId || (steps.length === 0 && !busy)) return;
 
   // 新的一次运行（started_at 变了）且正在跑 → 自动弹窗；用户关掉后不再骚扰
   if (busy && runId !== cliShownRun) {
@@ -183,10 +201,15 @@ function renderCli(cli) {
 
   const dot = $('#cliDot');
   if (dot) dot.className = 'cli-dot ' + (busy ? 'on' : (cli.ok ? 'ok' : 'bad'));
+  // 登录只有一步（key=auth），措辞要和「装 CLI」区分开 ——
+  // 用户原话：「登录完成以后也没任何反应，没提示登录成功」。以前这里只会写
+  // 「配置完成」，用户根本不知道自己登没登上。
+  const isLogin = steps.length === 1 && steps[0] && steps[0].key === 'auth';
   const title = $('#cliTitle');
   if (title) {
-    title.textContent = busy ? '正在配置钉钉 CLI'
-      : (cli.ok ? '配置完成' : '配置未完成');
+    if (busy) title.textContent = isLogin ? '等待钉钉授权' : '正在配置钉钉 CLI';
+    else if (cli.ok) title.textContent = isLogin ? '登录成功' : '配置完成';
+    else title.textContent = isLogin ? '登录未完成' : '配置未完成';
   }
   const hint = $('#cliHint');
   if (hint) hint.textContent = cli.message || (busy ? '正在处理…' : '');
@@ -306,7 +329,17 @@ function wireCliModal() {
   $('#cliClose').addEventListener('click', closeCliModal);
   $('#cliDone').addEventListener('click', closeCliModal);
   // 点遮罩空白处也能关（别让用户觉得窗口关不掉）
-  m.addEventListener('click', (e) => { if (e.target === m) closeCliModal(); });
+  // ★ v9.22.5：再加一层**事件委托**兜底 —— 万一某个按钮的单独绑定没生效，
+  //   或者用户点中的是按钮内的 svg/文字节点，也一定能关掉。
+  m.addEventListener('click', (e) => {
+    const t = e.target;
+    const hit = (t && t.closest) ? t.closest('#cliClose,#cliDone') : null;
+    if (hit || t === m) closeCliModal();
+  });
+  // Esc 关闭（键盘用户）
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !m.hidden) closeCliModal();
+  });
   $('#cliLoginGo').addEventListener('click', () => {
     closeCliModal();
     const b = $('#cliLoginBtn');
@@ -539,11 +572,18 @@ function renderTags() {
     btn.innerHTML =
       `<span class="tag-kind"></span><span class="tag-conv"></span><span class="tag-value"></span>`;
     btn.querySelector('.tag-kind').textContent = t.kind === 'p2p' ? '【单聊】' : '【群聊】';
-    btn.querySelector('.tag-conv').textContent = t.name || t.id;
+    // ★ v9.22.5：显示会话昵称（群名 / 对方昵称），绝不把 openConversationId
+    //   当名字显示出来 —— 用户原话：「我不要的是会话的 ID，而是应该是这个的
+    //   昵称，比如说哪个群啊或者谁呀之类的」。
+    const nm = String(t.name || '').trim();
+    const isRawId = !nm || nm === t.id || /^(cid|openConversationId)/i.test(nm);
+    btn.querySelector('.tag-conv').textContent = isRawId ? '（未拿到昵称）' : nm;
     const v = btn.querySelector('.tag-value');
     const tagsArr = Array.isArray(t.tags) ? t.tags : [];
-    v.textContent = tagsArr.length > 0 ? tagsArr.join('、') : (t.tag || '未标注');
-    if (tagsArr.length === 0 && !t.tag) v.classList.add('is-empty');
+    // 没标签就明确写「未知」（后端判定证据不足时也会落一条空记录），
+    // 用户选中后可以在下面手动补。
+    v.textContent = tagsArr.length > 0 ? tagsArr.join('、') : '未知';
+    if (tagsArr.length === 0) v.classList.add('is-empty');
     btn.addEventListener('click', () => {
       state.selectedTagId = t.id;
       $('#tagInput').value = tagsArr.length > 0 ? tagsArr.join('、') : (t.tag || '');
@@ -576,11 +616,64 @@ function renderStatus() {
   const cli = state.cli || {};
   let cliText = cli.message || '';
   if (cli.busy && !cliText) cliText = '正在执行…';
-  if (!cliText) cliText = '尚未检测';
+  if (!cliText) cliText = '未自检，点「一键配置钉钉 CLI」';
   $('#cliStatus').textContent = cliText;
 }
 
+/* ---------------- 扫描打标签进度（v9.22.5） ----------------
+ * 后端 _im_tag_scan 是后台 QThread，逐个会话调 AI，可能要几分钟。以前进度只
+ * 回填 Qt 版钉钉页，Web 页的 #scanState 没人写 —— 用户点完按钮页面毫无变化，
+ * 就以为「打标签不好使」。现在进度直接来自 im_get_state 的 scan 字段。
+ */
+let scanBtnHtml = null;
+
+function renderScan() {
+  const s = state.scan || {};
+  const el = $('#scanState');
+  if (el) {
+    // ★ v9.22.5：有标签数据但本次会话还没扫过时，以前一直写「尚未扫描」，
+    //   跟下面 94 行标签自相矛盾。改成把已有结果统计出来。
+    let msg = s.message || (s.busy ? '正在扫描…' : '');
+    if (!s.busy && (!msg || msg === '尚未扫描')) {
+      const tags = state.tags || [];       // 后端给的是列表，不是字典
+      if (tags.length) {
+        const tagged = tags.filter((t) => (t.tags || []).length > 0).length;
+        msg = `共 ${tags.length} 个会话，已打标签 ${tagged} 个` +
+              (tagged ? '（上次扫描结果，可重新扫描）' : '');
+      } else {
+        msg = '尚未扫描';
+      }
+    }
+    el.textContent = msg;
+  }
+  const btn = $('#scanBtn');
+  if (!btn) return;
+  if (scanBtnHtml === null) scanBtnHtml = btn.innerHTML;
+  if (s.busy) {
+    btn.disabled = true;
+    btn.textContent = s.n ? `扫描中 ${s.i}/${s.n}…` : '扫描中…';
+  } else {
+    btn.disabled = false;
+    if (btn.innerHTML !== scanBtnHtml) btn.innerHTML = scanBtnHtml;
+  }
+}
+
 /* ---------------- 数据刷新 ---------------- */
+let linkErrToasted = false;
+
+/* 只在内容真的变了才重绘。以前每次轮询（0.8s/10s）都全量重建消息双栏 +
+   设置表单 + 标签列表，配置窗口一弹出来叠加 im_refresh 推送就卡成幻灯片。 */
+let sigRows = '';
+let sigSettings = '';
+
+/* 用户正在设置表单里打字时，别用轮询结果把他输入的内容冲掉 */
+function settingsFocused() {
+  const a = document.activeElement;
+  if (!a || a === document.body) return false;
+  const p = document.querySelector('.panel[data-panel="settings"]');
+  return !!(p && p.contains(a));
+}
+
 async function refreshState(forceDing) {
   try {
     const d = await rpc('im_get_state', forceDing ? { force_ding: true } : {});
@@ -595,15 +688,42 @@ async function refreshState(forceDing) {
     state.running = !!d.running;
     state.dingStatus = d.ding_status || '';
     state.cli = d.cli || {};
-    renderMessages();
-    renderSettings();
-    renderTags();
+    state.scan = d.scan || {};
+    linkErrToasted = false;
+
+    const rowsSig = JSON.stringify([state.rows, state.tags, state.whitelist]);
+    if (rowsSig !== sigRows) {
+      sigRows = rowsSig;
+      renderMessages();
+      renderTags();
+    }
+    const setSig = JSON.stringify(state.settings);
+    if (setSig !== sigSettings && !settingsFocused()) {
+      sigSettings = setSig;
+      renderSettings();
+    }
     renderStatus();
+    renderScan();
     renderCli(state.cli);      // ★ v9.22.2：配置进度窗口跟着状态一起刷
   } catch (e) {
     console.error('[im] refreshState 失败', e);
+    // ★ v9.22.5：RPC 超时 / 桥断开时，界面以前会永远停在「正在配置…」的
+    //   前端假状态（后端根本没收到），看着像卡死。这里把真实原因写进界面，
+    //   并允许用户点状态文字重试。
+    state.dingStatus = '连接后端失败，点这里重试';
+    if (state.cli && state.cli.busy) {
+      state.cli = { ok: false, message: '与后端通信失败：' + (e && e.message) };
+    }
+    try {
+      renderStatus();
+      renderCli(state.cli);
+    } catch (_) { /* 渲染失败不影响轮询 */ }
+    if (!linkErrToasted) {
+      linkErrToasted = true;
+      toast('与后端通信失败：' + ((e && e.message) || '未知错误'));
+    }
   } finally {
-    // 每次拉完都重新排下一次（检查中 1.5s / 已就绪 10s / 隐藏时暂停）
+    // 每次拉完都重新排下一次（检查中 0.8s / 已就绪 10s / 隐藏时降频）
     scheduleStatusPoll();
   }
 }
@@ -715,21 +835,15 @@ function wire() {
 
   // 标签
   $('#scanBtn').addEventListener('click', async () => {
-    const btn = $('#scanBtn');
-    const oldHtml = btn.innerHTML;
-    btn.disabled = true;
-    btn.textContent = '扫描中…';
     try {
       await rpc('im_scan_tags', {});
-      toast('已开始扫描打标签');
+      toast('已开始扫描，进度显示在上方');
     } catch (e) {
       toast('扫描失败：' + e.message);
     }
-    setTimeout(async () => {
-      await refreshState();
-      btn.disabled = false;
-      btn.innerHTML = oldHtml;
-    }, 2000);
+    // 按钮的忙碌态与「扫描中 i/n」全部由 renderScan 跟随后端 scan 状态驱动，
+    // 不再在这里手动改文案再定时恢复（以前 2 秒后无条件复位，看着像没开始就结束）。
+    await refreshState();
   });
   $('#tagSave').addEventListener('click', async () => {
     if (!state.selectedTagId) {
@@ -757,11 +871,16 @@ function wire() {
       if (d && d.message) toast(d.message);
       if (d && d.ok === false && !d.async) {
         toast(d.error || '配置失败');
+        state.cli = { ok: false, message: d.error || '配置失败' };
+        renderStatus(); renderCli(state.cli);
         restore();
         return;
       }
     } catch (e) {
       toast('CLI 配置失败：' + e.message);
+      // 不能让界面停在假的「正在配置…」上（这正是用户看到「一直卡着」的来源）
+      state.cli = { ok: false, message: '配置失败：' + e.message };
+      renderStatus(); renderCli(state.cli);
       restore();
       return;
     }
@@ -783,11 +902,15 @@ function wire() {
       if (d && d.message) toast(d.message);
       if (d && d.ok === false && !d.async) {
         toast(d.error || '登录失败');
+        state.cli = { ok: false, message: d.error || '登录失败' };
+        renderStatus(); renderCli(state.cli);
         restore();
         return;
       }
     } catch (e) {
       toast('登录失败：' + e.message);
+      state.cli = { ok: false, message: '登录失败：' + e.message };
+      renderStatus(); renderCli(state.cli);
       restore();
       return;
     }
@@ -801,8 +924,39 @@ function wire() {
 async function boot() {
   wire();
   wireCliModal();
-  // 订阅后端主动推送的 IM 刷新事件（消息到达/状态变化时后端会推 im_refresh）
-  on('im_refresh', () => refreshState());
+  // 订阅后端主动推送的 IM 刷新事件（消息到达/状态变化时后端会推 im_refresh）。
+  // 先注册再 start()，保证连上瞬间推来的事件也不会漏。
+  // ★ v9.22.5：合并 150ms 内的多次推送 —— 装 CLI 时日志是成串来的，以前每个
+  //   im_refresh 都触发一次全量拉取 + 重绘，界面直接卡住。
+  let imRefreshTimer = null;
+  on('im_refresh', () => {
+    clearTimeout(imRefreshTimer);
+    imRefreshTimer = setTimeout(() => {
+      imRefreshTimer = null;
+      refreshState();
+    }, 150);
+  });
+  // 主题跟随主程序（以前 im 页收不到 init，只能用 prefers-color-scheme 猜）
+  on('init', (p) => {
+    if (p && p.theme) document.documentElement.dataset.theme = (p.theme === 'dark' ? 'dark' : 'light');
+  });
+  on('theme', (p) => {
+    if (p && p.theme) document.documentElement.dataset.theme = (p.theme === 'dark' ? 'dark' : 'light');
+  });
+  // ★★★ v9.22.5 致命修复 —— 这一句是整个钉钉页能不能用的分水岭 ★★★
+  //   im.html 是独立页面，有自己独立的 QWebChannel + 独立的 bridge 模块实例。
+  //   bridge.start() 才会把后端的 webui_event 信号接到 dispatch() 上，
+  //   rpc_result 也才能被派发到 rpc() 的 Promise。
+  //   v9.21.2「全 Web 化」重写时漏了这一行，于是：上行 rpc 能到后端干活，
+  //   下行结果永远收不到 → 每个 rpc 都在 30 秒后抛「RPC 超时」。
+  //   用户看到的就是：状态一直检测→状态未知、一键配置卡住最后超时、
+  //   浏览器里登录成功了页面毫无反应。
+  //   实测：补上后 im_get_state 从 30000ms 超时变成 5ms 返回。
+  try {
+    await start();
+  } catch (e) {
+    console.error('[im] 桥接初始化失败', e);
+  }
   await refreshState();
 }
 

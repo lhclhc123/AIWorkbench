@@ -392,6 +392,13 @@ async function refresh(root, force) {
   try {
     const d = await rpc('settings.get', {});
     settings = (d && d.settings) || {};
+    // ★ v9.22.5：一进设置页就显示真实工作区路径（以前只在切工作区后才有值，
+    //   默认一直挂着「当前工作区未知」）。
+    const wsEl = $('#set_workspace', root);
+    if (wsEl) {
+      const wp = (d && (d.workspace || d.workspace_path)) || '';
+      if (wp) wsEl.textContent = '当前工作区：' + wp;
+    }
     $('#setHint', root).textContent = '';
   } catch (e) {
     $('#setHint', root).textContent = '加载失败';

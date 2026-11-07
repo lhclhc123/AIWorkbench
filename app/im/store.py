@@ -77,7 +77,11 @@ _PUNCT = " \t\r\n\u3000。．.,，、:：;；!！?？\"'“”‘’「」『』
 
 
 def _split_tags(raw):
-    """把字符串/列表解析成去重、去空、逐个截断到 12 字的标签列表（保持顺序）。"""
+    """把字符串/列表解析成去重、去空、逐个截断到 12 字的标签列表（保持顺序）。
+
+    ★ v9.22.5：最多保留 5 个（用户要求：「标签的个数限制到最多五个吧，
+    三个有点少了」）。这里是最后一道闸门，模型/手工输入超了都会被截住。
+    """
     if raw is None:
         return []
     if isinstance(raw, (list, tuple)):
@@ -94,6 +98,8 @@ def _split_tags(raw):
             continue
         seen.add(p)
         out.append(p)
+        if len(out) >= 5:
+            break
     return out
 
 
@@ -524,8 +530,14 @@ class IMStore:
     # ------------------------------------------------------------------
     # 会话标签（写进 thread 档案，不另开文件）
     # ------------------------------------------------------------------
-    def set_tag(self, thread_id, tag, note="", auto=False):
-        """给会话打标签（支持单标签字符串或标签列表）。`tag=""` 表示"不知道"（等于清空）。"""
+    def set_tag(self, thread_id, tag, note="", auto=False, name="", kind=None):
+        """给会话打标签（支持单标签字符串或标签列表）。`tag=""` 表示"不知道"（等于清空）。
+
+        ★ v9.22.5：新增 `name` / `kind`。以前这里 `thread(tid, create=True)` 不带
+        昵称，`thread()` 会把 name 默认成 tid —— 于是标签列表里显示的全是
+        「cidxxxxxxx」这种 openConversationId，用户根本不知道是谁。现在把扫描
+        时拿到的真实会话昵称一起写进去。
+        """
         tid = str(thread_id or "").strip()
         if not tid:
             return None
@@ -533,7 +545,17 @@ class IMStore:
         all_t = self.threads()
         t = all_t.get(tid)
         if t is None:
-            t = self.thread(tid, create=True) or {}
+            t = self.thread(tid, create=True,
+                            name=str(name or "").strip(),
+                            kind=(kind or "group")) or {}
+        # 已有档案但名字还是那串 ID（老数据）→ 用真实昵称覆盖
+        nm = str(name or "").strip()
+        if nm and str(t.get("name") or "").strip() in ("", tid):
+            t["name"] = nm
+        # ★ v9.22.5：kind 一律以本次扫描结果为准。老数据因为拿不到类型，
+        #   30 个会话全被存成了 group —— 只在"没有值"时补是修不掉的。
+        if kind:
+            t["kind"] = kind
         t["tags"] = tags_list
         t["tag"] = "、".join(tags_list)
         t["tag_note"] = str(note or "")[:120]

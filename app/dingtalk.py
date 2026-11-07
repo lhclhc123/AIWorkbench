@@ -1366,6 +1366,28 @@ class DingTalkClient:
         return self._run_dws(
             ["chat", "+conversation-list", "--page-size", str(n), "--format", "json"])
 
+    def dws_chat_list(self, types="group,p2p", page_size=100, page_all=True):
+        """列出会话，**带真实类型**（v9.22.5）。
+
+        为什么不用 `+conversation-list`：那个接口只返回
+        `{conversationName, openConversationId}` 两个字段，**根本没有类型**，
+        调用方只能瞎猜 —— 于是钉钉助手把 30 个会话全标成了「群聊」。
+        `+chat-list` 会给出 chatMode(group/p2p)、conversationType(group/direct)、
+        groupType(SINGLE_CHAT/…)、memberCount、lastMsgCreateAt，单聊/群聊一目了然。
+        """
+        try:
+            size = int(page_size)
+        except Exception:
+            size = 100
+        size = max(1, min(100, size))
+        args = ["chat", "+chat-list",
+                "--types", str(types or "group,p2p"),
+                "--page-size", str(size),
+                "--format", "json"]
+        if page_all:
+            args += ["--page-all", "--page-limit", "10"]
+        return self._run_dws(args, timeout=180)
+
     def dws_send_file(self, target, path):
         """用 dws 以「我本人」身份把本地文件直接发到钉钉（群聊或单聊）。
 
