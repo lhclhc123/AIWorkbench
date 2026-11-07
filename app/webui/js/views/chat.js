@@ -542,8 +542,13 @@ function renderConvList() {
     return;
   }
   for (const c of st.convs) {
-    const btn = document.createElement('button');
+    // ★ v9.22.4：外层不能再用 <button>：里面还要放导出/删除两个 <button>，
+    //   嵌套 button 是非法 HTML，浏览器可能提前闭合外层，导致 querySelector
+    //   拿不到 .conv-del、整个会话列表渲染中断。改用 div[role=button]。
+    const btn = document.createElement('div');
     btn.className = 'conv' + (c.id === st.currentConvId ? ' is-active' : '');
+    btn.setAttribute('role', 'button');
+    btn.tabIndex = 0;
     btn.innerHTML =
       `<span class="conv-main"><span class="conv-title"></span><span class="conv-preview"></span></span>` +
       `<button class="conv-export" type="button" title="导出对话" aria-label="导出对话">` +
@@ -569,6 +574,12 @@ function renderConvList() {
       e.stopPropagation();
       call('export_conv', { convId: c.id });
       toast('已导出，正在打开文件夹…');
+    });
+    btn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        btn.click();
+      }
     });
     btn.addEventListener('click', () => {
       // 一步直达：从任意页面（设置/技能…）点左侧对话项，都先切回对话页。
@@ -949,6 +960,23 @@ function bindBridge() {
     toast(msg);
     stateText.textContent = msg;
     finalizeStream();
+  });
+
+  // ★ v9.22.4：上游重置（停止 / 重答 / 供应商重连）时清掉已渲染的半段答复，
+  //   否则同一轮里会出现两段答案叠在一起。后端在 main_window.py 里 emit stream_reset，
+  //   但前端此前从未监听。
+  on('stream_reset', () => {
+    if (streamMsg) {
+      try {
+        streamMsg._text = '';
+        if (streamMsg._body) streamMsg._body.textContent = '';
+      } catch (e) { /* ignore */ }
+    }
+    if (streamThink) {
+      try { streamThink.remove(); } catch (e) { /* ignore */ }
+      streamThink = null;
+    }
+    currentTool = null;
   });
 
   on('attachments', (p) => {

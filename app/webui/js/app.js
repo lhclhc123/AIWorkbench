@@ -2,9 +2,9 @@
 'use strict';
 
 import { getState, patch, subscribe } from './store.js';
-import { start, call, on } from './bridge.js';
+import { start, call, on, rpc } from './bridge.js';
 import { initChat } from './views/chat.js';
-import { initNav } from './nav.js';
+import { initNav, switchTo } from './nav.js';
 
 const root = document.documentElement;
 const $ = (s) => document.querySelector(s);
@@ -163,6 +163,17 @@ function wireShell() {
   newConvBtn.addEventListener('click', () => {
     call('new_conv', {});
   });
+
+  // ★ v9.22.4：非对话页没有导航格子，标题栏给一个「← 对话」兜底，
+  //   否则停在 设置/技能/关于 时（尤其会话列表为空）回不到对话。
+  const backBtn = $('#backToChat');
+  if (backBtn) {
+    backBtn.addEventListener('click', () => switchTo('chat'));
+    document.addEventListener('awb:nav', (e) => {
+      const key = e.detail && e.detail.key;
+      backBtn.hidden = (key === 'chat');
+    });
+  }
 }
 
 /* ---------------- 启动 ---------------- */
@@ -177,6 +188,13 @@ async function boot() {
   // ★ v9.22.2：DeepSeek 网页版连通性提醒（选中网页版模型时后端周期性推）
   on('ds_health', showDsHealth);
   await start();
+  // ★ v9.22.4：标题栏版本号从后端取，别再写死（之前长期停在 v9.22.1）。
+  try {
+    const info = await rpc('app.about_info', {});
+    const v = info && info.version;
+    const el = $('#verLabel');
+    if (el && v) el.textContent = 'v' + v;
+  } catch (e) { /* 未连接时保留 index.html 的兜底版本 */ }
 }
 
 boot();

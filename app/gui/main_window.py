@@ -1814,7 +1814,8 @@ class MainWindow(QMainWindow):
 
         # ---- 钉钉助手（IM）----
         if method == "im_get_state":
-            return self._web_im_state()
+            # ★ v9.22.4：force_ding=True 时绕过 60s 状态缓存（点「重新检测」/登录成功后）
+            return self._web_im_state(force_ding=bool(args.get("force_ding")))
         if method == "im_set_settings":
             return self._web_im_set_settings(args)
         if method == "im_whitelist_add":
@@ -1840,8 +1841,25 @@ class MainWindow(QMainWindow):
         if method == "im_cli_setup":
             return self._web_im_cli_setup()
         if method == "im_cli_login":
-            return self._web_im_cli_login()
+            # device=False → 浏览器扫码；默认 True（设备码，终端环境更稳）
+            return self._web_im_cli_login(
+                device=bool(args.get("device", True)))
+        if method == "im_cli_cancel":
+            return self._web_im_cli_cancel()
         # ---- 通用：模型列表 / 主题（供各页面共用）----
+        if method == "app.open_url":
+            # ★ v9.22.4：网页里 <a target=_blank> 在 QWebEngineView 里默认被吞，
+            #   「授权页 / 去装 Node.js」点不动。统一走系统默认浏览器打开。
+            url = str(args.get("url") or "").strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return {"ok": False, "error": "只允许打开 http(s) 链接"}
+            try:
+                from PyQt6.QtGui import QDesktopServices
+                from PyQt6.QtCore import QUrl
+                ok = QDesktopServices.openUrl(QUrl(url))
+                return {"ok": bool(ok), "url": url}
+            except Exception as exc:
+                return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
         if method == "ds_health_check":
             return self._web_ds_health_check()
         if method == "ds_show_window":
@@ -2530,6 +2548,9 @@ class MainWindow(QMainWindow):
             self._im_cli_state_data = {
                 "busy": False, "ok": None, "message": "", "done_at": 0.0,
                 "started_at": 0.0, "steps": [], "percent": 0, "log": [],
+                # ★ v9.22.4：设备码登录要看得见码/链接；失败要能重试；运行中要能取消
+                "cancelable": False, "device_code": "", "auth_url": "",
+                "need_node": False, "failed_step": "",
             }
         return self._im_cli_state_data
 
@@ -2553,6 +2574,8 @@ class MainWindow(QMainWindow):
         st.update(
             busy=True, ok=None, message="正在配置钉钉 CLI…", done_at=0,
             percent=2, log=[], started_at=time.time(),
+            cancelable=True, device_code="", auth_url="",
+            need_node=False, failed_step="",
             steps=[{"key": k, "label": lbl, "status": "pending", "detail": ""}
                    for k, lbl in self._IM_CLI_STEPS],
         )
@@ -2566,6 +2589,8 @@ class MainWindow(QMainWindow):
                 s["status"] = status
                 if detail:
                     s["detail"] = str(detail)[:400]
+        if status == "fail":
+            st["failed_step"] = key          # 前端据此给「换镜像重试 / 去装 Node」
         if percent is not None:
             st["percent"] = max(0, min(100, int(percent)))
         if message:
@@ -2587,24 +2612,73 @@ class MainWindow(QMainWindow):
             st["percent"] = min(hi, lo + len(lg))
         self._notify_im_refresh()
 
+    def _im_cli_canceled(self):
+        return bool(getattr(self, "_im_cli_cancel_flag", False))
+
+    def _im_cli_kill_proc(self):
+        """杀掉当前 CLI 子进程（npm 安装 / dws 登录共用）。"""
+        p = getattr(self, "_im_cli_proc", None)
+        self._im_cli_proc = None
+        if p is None:
+            return
+        try:
+            import app.winproc as _wp
+            _wp.kill_tree(p)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
     def _im_cli_run_npm(self, args, registry=None, deadline=420):
         """流式跑 npm：边跑边把输出推进进度窗口，返回 (rc, 最后几行文本)。
 
         ★ v9.22.2：老实现是 `_wp.run(..., timeout=300)` 一次性阻塞 —— 用户既看不到
           进度，网慢就直接「超时」。现在改成逐行读 stdout/stderr，日志实时上屏。
+        ★ v9.22.4：`readline()` 本身会无限阻塞 —— 只要 npm 卡住不吐字节（DNS 挂死、
+          源无响应），循环里的 deadline 判断**永远轮不到**，界面就一直转圈。
+          加一条看门狗线程强制到点/取消杀进程，并把 handler 存进 `_im_cli_proc`
+          让「取消」按钮能立刻中断。
         """
+        import threading as _th
         import app.winproc as _wp
         cmd = list(args)
         if registry:
             cmd += ["--registry", registry]
         cmd += ["--no-fund", "--no-audit", "--loglevel", "info"]
         self._im_cli_log("$ " + " ".join(cmd))
+        if self._im_cli_canceled():
+            return -2, "已取消"
         try:
             p = _wp.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding="utf-8", errors="ignore", bufsize=1)
         except Exception as exc:
             return -1, f"启动 npm 失败：{type(exc).__name__}: {exc}"
-        t0 = time.time()
+        self._im_cli_proc = p
+        timed_out = {"v": False}
+
+        def _watchdog():
+            t0 = time.time()
+            while True:
+                if p.poll() is not None:
+                    return
+                if self._im_cli_canceled():
+                    return
+                if time.time() - t0 > deadline:
+                    timed_out["v"] = True
+                    self._im_cli_log("安装超时（>%ds），已终止 npm 进程" % deadline)
+                    try:
+                        _wp.kill_tree(p)
+                    except Exception:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    return
+                time.sleep(1.0)
+
+        _th.Thread(target=_watchdog, daemon=True,
+                   name="awb-npm-watchdog").start()
         try:
             while True:
                 line = p.stdout.readline()
@@ -2613,15 +2687,13 @@ class MainWindow(QMainWindow):
                 if not line.strip():
                     continue
                 self._im_cli_log(line, creep=(25, 70))
-                if time.time() - t0 > deadline:
+                if self._im_cli_canceled():
+                    self._im_cli_log("用户取消，正在终止 npm…")
                     try:
                         _wp.kill_tree(p)
                     except Exception:
-                        try:
-                            p.kill()
-                        except Exception:
-                            pass
-                    return -9, "安装超时（超过 %d 秒），请检查网络后重试" % deadline
+                        pass
+                    break
             try:
                 p.wait(timeout=60)
             except Exception:
@@ -2629,17 +2701,24 @@ class MainWindow(QMainWindow):
                     _wp.kill_tree(p)
                 except Exception:
                     pass
+                self._im_cli_proc = None
                 return -9, "安装进程无响应，已终止"
         except Exception as exc:
             try:
                 p.kill()
             except Exception:
                 pass
+            self._im_cli_proc = None
             return -1, f"安装中断：{type(exc).__name__}: {exc}"
+        self._im_cli_proc = None
+        if self._im_cli_canceled():
+            return -2, "已取消"
+        if timed_out["v"]:
+            return -9, "安装超时（超过 %d 秒），请检查网络后重试" % deadline
         tail = "\n".join((self._im_cli_state_get().get("log") or [])[-8:])
         return p.returncode, tail
 
-    def _web_im_state(self):
+    def _web_im_state(self, force_ding=False):
         """钉钉助手页全量状态：消息双栏 + 设置 + 标签 + 钉钉登录态。"""
         if getattr(self, "im_store", None) is None:
             return {"ready": False, "reason": "IM 底座未初始化"}
@@ -2662,7 +2741,7 @@ class MainWindow(QMainWindow):
             "ready": True,
             "running": bool(getattr(self, "assistant", None)
                             and self.assistant.running),
-            "ding_status": self._asst_ding_status_text(),
+            "ding_status": self._asst_ding_status_text(force=force_ding),
             "cli": dict(self._im_cli_state_get()),
             "rows": rows,
             "settings": st,
@@ -2733,7 +2812,8 @@ class MainWindow(QMainWindow):
         if st.get("busy"):
             return {"ok": True, "async": True, "busy": True,
                     "message": st.get("message") or "正在配置中…"}
-        self._im_cli_state_set(busy=True, ok=None,
+        self._im_cli_cancel_flag = False
+        self._im_cli_state_set(busy=True, ok=None, cancelable=True,
                                message="正在检查 Node/dws…", done_at=0)
 
         def _worker():
@@ -2743,7 +2823,12 @@ class MainWindow(QMainWindow):
                 result = {"ok": False,
                           "error": "自动安装失败：%s: %s"
                                    % (type(exc).__name__, exc)}
+            if self._im_cli_canceled() and not (result or {}).get("ok"):
+                result = {"ok": False, "error": "已取消配置"}
             ok = bool(result.get("ok"))
+            if ok:
+                # 配置/校验走完，钉钉登录态可能刚变 —— 让页头状态重新查一次
+                self._ding_status_cache = None
             msg = (result.get("message") or result.get("error")
                    or ("钉钉 CLI 已就绪" if ok else "配置失败"))
             # ★ v9.22.2：收尾时把「还在转圈」的那一步落定，别让进度窗口永远卡在 90%
@@ -2752,6 +2837,8 @@ class MainWindow(QMainWindow):
                 if s.get("status") == "running":
                     s["status"] = "done" if ok else "fail"
             self._im_cli_state_set(busy=False, ok=ok, message=msg,
+                                   cancelable=False,
+                                   need_node=bool(result.get("need_node")),
                                    percent=100 if ok else st.get("percent", 0))
             self._notify_im_refresh()
 
@@ -2778,10 +2865,12 @@ class MainWindow(QMainWindow):
         node_exe = _find_node()
         if not node_exe:
             self._im_cli_step("node", "fail", "没找到 Node.js")
-            return {"ok": False,
+            return {"ok": False, "need_node": True,
                     "error": "没找到 Node.js。请先安装 Node.js（建议 18 以上），"
                              "装完后重新点一次「一键配置」。"}
         self._im_cli_step("node", "done", node_exe, percent=15)
+        if self._im_cli_canceled():
+            return {"ok": False, "error": "已取消配置"}
 
         # ---------- 步骤 2/4：dws ----------
         self._im_cli_step("dws", "running", "正在查找已安装的 dws…", percent=20,
@@ -2798,7 +2887,7 @@ class MainWindow(QMainWindow):
                                        "node_modules", "npm", "bin", "npm-cli.js")
                 if not os.path.exists(npm_cli):
                     self._im_cli_step("dws", "fail", "没找到 npm")
-                    return {"ok": False,
+                    return {"ok": False, "need_node": True,
                             "error": "这台机器上没找到 npm，无法自动安装 dws。"
                                      "请装 Node.js 完整版（自带 npm）后再试。"}
                 npm_cmd = [node_exe, npm_cli]
@@ -2811,6 +2900,8 @@ class MainWindow(QMainWindow):
             base_args = npm_cmd + ["install", "--prefix", target,
                                    "dingtalk-workspace-cli@latest"]
             rc, tail = self._im_cli_run_npm(base_args)
+            if rc == -2:
+                return {"ok": False, "error": "已取消配置"}
             if rc != 0:
                 # 国内网络下默认源经常拉不动 —— 自动换 npmmirror 再来一次
                 self._im_cli_log("默认源失败（rc=%s），改用国内镜像 registry.npmmirror.com 重试…"
@@ -2819,6 +2910,8 @@ class MainWindow(QMainWindow):
                                   percent=30, message="正在用国内镜像重试安装…")
                 rc, tail = self._im_cli_run_npm(
                     base_args, registry="https://registry.npmmirror.com")
+                if rc == -2:
+                    return {"ok": False, "error": "已取消配置"}
             if rc != 0:
                 self._im_cli_step("dws", "fail", (tail or "")[-300:])
                 return {"ok": False,
@@ -2881,11 +2974,74 @@ class MainWindow(QMainWindow):
             "authenticated": authed,
         }
 
-    def _web_im_cli_login(self):
+    # ---- v9.22.4：把 dws 登录输出里的「授权链接 / 设备码」抓出来给用户看 ----
+    _AUTH_URL_RE = re.compile(r"https?://[^\s<>\"'），。]+")
+    # 设备码常见形态：ABCD-EFGH / 8 位大写字母数字
+    _AUTH_CODE_RE = re.compile(r"\b([A-Z0-9]{4,6}[-–][A-Z0-9]{4,6})\b")
+
+    def _im_cli_parse_auth_line(self, line):
+        """从一行 dws 输出里提取授权链接与设备码，写进 CLI 状态。
+
+        ★ 用户原话：「完善安装钉钉 CLI 时的提示弹出流程」—— 之前设备码登录
+        后台跑，stdout 全丢了，用户只看到「等待授权…」，根本不知道码是啥。
+        """
+        try:
+            s = str(line or "").strip()
+        except Exception:
+            return
+        if not s:
+            return
+        st = self._im_cli_state_get()
+        changed = False
+        m = self._AUTH_URL_RE.search(s)
+        if m:
+            url = m.group(0).rstrip(".,;)]}")
+            if url and url != st.get("auth_url"):
+                st["auth_url"] = url[:400]
+                changed = True
+        m2 = self._AUTH_CODE_RE.search(s)
+        if m2:
+            code = m2.group(1)
+            if code != st.get("device_code"):
+                st["device_code"] = code
+                changed = True
+        if changed:
+            self._im_cli_log(s)
+            self._notify_im_refresh()
+
+    def _web_im_cli_cancel(self):
+        """取消正在跑的「一键配置 / 登录」。
+
+        ★ v9.22.4：老版本一旦点了配置就只能干等（npm 拉不动最长 7 分钟），
+        没有出口。现在置取消位 + 立刻杀掉子进程树，状态收尾成「已取消」。
+        """
+        st = self._im_cli_state_get()
+        if not st.get("busy"):
+            return {"ok": True, "message": "当前没有正在进行的任务"}
+        self._im_cli_cancel_flag = True
+        self._im_cli_kill_proc()
+        self._im_cli_log("用户取消，已终止子进程")
+        self._im_cli_state_set(busy=False, ok=False, cancelable=False,
+                               message="已取消")
+        for s in (st.get("steps") or []):
+            if s.get("status") == "running":
+                s["status"] = "fail"
+                s["detail"] = "已取消"
+            elif s.get("status") == "pending":
+                # 还没轮到的那几步也标灰掉，否则窗口里会留一串「○ 待执行」，
+                # 看着像还在跑（用户会以为取消没生效）
+                s["status"] = "fail"
+                s["detail"] = "未执行（已取消）"
+        self._notify_im_refresh()
+        return {"ok": True, "message": "已取消"}
+
+    def _web_im_cli_login(self, device=True):
         """发起钉钉 CLI 登录（异步）：立即返回，后台等授权结果。
 
         ★ v9.22.1：登录本身要等用户扫码/输设备码（可能几十秒到几分钟），不能
         让 RPC 同步干等，否则 UI 线程被占、前端 120s 后只看到超时。
+        ★ v9.22.4：接上 `on_line` 回调 —— 把 dws 打印的授权链接/设备码抓出来
+        显示进进度窗口；同时支持「取消」，并把登录进程存起来以便随时终止。
         """
         from ..dingtalk import find_dws
         node, dws = find_dws()
@@ -2895,28 +3051,41 @@ class MainWindow(QMainWindow):
         if st.get("busy"):
             return {"ok": True, "async": True, "busy": True,
                     "message": st.get("message") or "正在处理中…"}
+        self._im_cli_cancel_flag = False
         self._im_cli_state_set(
-            busy=True, ok=None,
-            message="请在弹出的窗口/浏览器完成授权…", done_at=0,
+            busy=True, ok=None, cancelable=True,
+            message="请在下方窗口完成授权（扫码或输入设备码）…", done_at=0,
             # ★ v9.22.2：登录也走同一个进度窗口——单独给一步「等待授权」，
             #   否则前端会沿用上一次「一键配置」残留的四步状态，看着像卡住了。
             started_at=time.time(), percent=0, log=[],
+            device_code="", auth_url="", need_node=False, failed_step="",
             steps=[{"key": "auth", "label": "等待钉钉授权完成",
                     "status": "running", "detail": "扫码或输入设备码…"}])
 
         def _worker():
+            proc = [None]
             try:
-                self.ding.dws_login_start(device=True)
+                proc[0] = self.ding.dws_login_start(
+                    device=bool(device),
+                    on_line=self._im_cli_parse_auth_line,
+                    max_seconds=600)
+                self._im_cli_proc = proc[0]
             except Exception as exc:
                 self._im_cli_state_set(
-                    busy=False, ok=False,
+                    busy=False, ok=False, cancelable=False,
                     message="发起登录失败：%s: %s" % (type(exc).__name__, exc))
                 self._notify_im_refresh()
                 return
             # 后台轮询登录态（最多 ~180s），成功后写状态并通知前端
             deadline = time.time() + 180
             while time.time() < deadline:
+                if self._im_cli_canceled():
+                    self._notify_im_refresh()
+                    return
                 time.sleep(5)
+                if self._im_cli_canceled():
+                    self._notify_im_refresh()
+                    return
                 try:
                     s2 = self.ding.dws_auth_status(force=True, timeout=10) or {}
                 except Exception:
@@ -2924,20 +3093,33 @@ class MainWindow(QMainWindow):
                 if s2.get("authenticated"):
                     who = s2.get("user_name") or ""
                     self._im_cli_step("auth", "done", who or "已授权", percent=100)
+                    # 清掉「钉钉登录状态」的 60s 缓存，否则页头还写着「还没登录」
+                    self._ding_status_cache = None
                     self._im_cli_state_set(
-                        busy=False, ok=True,
+                        busy=False, ok=True, cancelable=False,
                         message="✓ 登录成功" + (("：" + who) if who else ""))
                     self._notify_im_refresh()
                     return
+            if self._im_cli_canceled():
+                return
+            # 超时：把进程收掉，别留在后台占着
+            try:
+                if proc[0] is not None:
+                    import app.winproc as _wp
+                    _wp.kill_tree(proc[0])
+            except Exception:
+                pass
+            self._im_cli_proc = None
             self._im_cli_step("auth", "fail", "等不到授权结果", percent=100)
-            self._im_cli_state_set(busy=False, ok=False,
-                                   message="登录未完成 / 已超时，可重试")
+            self._im_cli_state_set(busy=False, ok=False, cancelable=False,
+                                   message="登录未完成 / 已超时，可点「重新登录」再试")
             self._notify_im_refresh()
 
         threading.Thread(target=_worker, daemon=True,
                          name="awb-im-cli-login").start()
+        mode = "设备码" if device else "浏览器扫码"
         return {"ok": True, "async": True,
-                "message": "已发起设备码登录，请在弹窗/浏览器完成授权…"}
+                "message": "已发起%s登录，请在弹窗里按提示完成授权…" % mode}
 
     def _style_input_area(self):
         """按当前主题给输入卡片与图标按钮上色（跟随浅色 / 深色切换）。"""
@@ -2952,7 +3134,10 @@ class MainWindow(QMainWindow):
             self.model_combo.setStyleSheet(
                 f"QComboBox{{background:{t['btn_bg']};color:{t['btn_text']};"
                 f"border:1px solid {t['btn_border']};border-radius:8px;"
-                "padding:3px 8px;font-size:12px;min-width:0;}}"
+                # ★ v9.22.4：这一段是**普通字符串**，写 `}}` 会原样输出两个右花括号，
+                #   整张样式表因此解析失败（启动时刷屏 "Could not parse stylesheet
+                #   of object QComboBox"）。普通串里只能是单个 `}`。
+                "padding:3px 8px;font-size:12px;min-width:0;}"
                 f"QComboBox:hover{{border:1px solid {t['accent']};}}")
             for b in (self.attach_btn, self.mic_btn):
                 b.setStyleSheet(
@@ -5263,15 +5448,21 @@ class MainWindow(QMainWindow):
         self._notify_im_refresh()
 
     # ---------- 钉钉连接（在助理「设置」页里配）----------
-    def _asst_ding_status_text(self):
+    def _asst_ding_status_text(self, force=False):
         """读登录状态（带 60 秒缓存 —— `dws auth status` 是一次子进程，别每次刷都跑）。
 
         ★ v9.21.2 启动提速：第一次（缓存 miss）也**不同步跑子进程**，先返回
         「检查中…」占位并起后台线程查一次填缓存；下次调用（10s 定时器）自动拿到
         真实登录态。避免启动时被 dws 子进程卡约 1.2s。
+        ★ v9.22.4：`force=True` 时清缓存重查（用户点「重新检测」/刚登录成功，
+          否则会拿 60s 前的「未登录」糊弄人）。
         """
         now = time.time()
         cache = getattr(self, "_ding_status_cache", None)
+        if force:
+            self._ding_status_cache = None
+            self._ding_status_loading = False
+            cache = None
         if cache and now - cache[0] < 60:
             return cache[1]
         # 缓存 miss → 后台补查，本次先给占位
@@ -5285,7 +5476,8 @@ class MainWindow(QMainWindow):
                         text = ("没找到 dws（钉钉工作台 CLI）。装了 WorkBuddy 就自带；"
                                 "或自行 npm i -g dingtalk-workspace-cli。")
                     else:
-                        st = self.ding.dws_auth_status() or {}
+                        # force=True：登录刚结束就查，30s 旧缓存会给出「还没登录」
+                        st = self.ding.dws_auth_status(force=True) or {}
                         if st.get("authenticated"):
                             who = st.get("user_name") or "（已登录）"
                             corp = st.get("corp_name") or ""
@@ -5336,14 +5528,24 @@ class MainWindow(QMainWindow):
                 self._safe_asst_log(f"读会话列表失败：{type(exc).__name__}: {exc}")
                 raw = []
             for c in raw:
-                if not isinstance(c, dict):
+                # ★ v9.22.4：dws_list_conversations() 返回的是
+                #   [(conversationName, openConversationId), ...] 元组列表，
+                #   老代码只认 dict（`if not isinstance(c, dict): continue`），
+                #   结果每个元组都被跳过 —— 钉钉「会话」下拉永远为空。
+                #   这里同时兼容元组与 dict 两种形态，避免再被后端返回格式坑。
+                if isinstance(c, dict):
+                    cid = str(c.get("id") or c.get("openConversationId") or "").strip()
+                    name = str(c.get("name") or c.get("conversationName") or cid)
+                    kind = str(c.get("kind") or "group")
+                elif isinstance(c, (tuple, list)) and len(c) >= 2:
+                    name = str(c[0] or "")
+                    cid = str(c[1] or "").strip()
+                    kind = "group"
+                else:
                     continue
-                cid = str(c.get("id") or c.get("openConversationId") or "").strip()
                 if not cid:
                     continue
-                rows.append({"id": cid,
-                             "name": str(c.get("name") or c.get("conversationName") or cid),
-                             "kind": str(c.get("kind") or "group")})
+                rows.append({"id": cid, "name": name or cid, "kind": kind})
             self._asst_ding_convs_back.emit(rows)
         threading.Thread(target=w, daemon=True).start()
 
@@ -6637,6 +6839,18 @@ class MainWindow(QMainWindow):
         if dlg:
             dlg.close()
             self._upd_dlg = None
+        # ★ v9.22.4：Web 模式下前端一直在监听 update_error，后端却从来没 emit 过
+        #   （about.js 的监听形同虚设，点更新失败后界面毫无反应）。这里补发事件，
+        #   并把阶段推到 failed，about.js 会就地显示原因 + 发布页链接。
+        if getattr(self, "_web_engine", False) and self._web_bridge is not None:
+            try:
+                self._web_push_update_progress("failed", None, None, str(err))
+                self._web_bridge.emit_event("update_error", {
+                    "error": str(err),
+                    "url": f"https://github.com/{ver.GITHUB_REPO}/releases",
+                })
+            except Exception:
+                pass
         self._info(f"更新失败：{err}\n\n可以到发布页手动下载安装：\n"
                    f"https://github.com/{ver.GITHUB_REPO}/releases", "自动更新")
 

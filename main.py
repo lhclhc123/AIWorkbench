@@ -111,10 +111,15 @@ def selftest():
         "themes", "trace",
         "tts", "updater", "version", "webcap", "winproc", "worklog",
         "workspace",
+        # ★ v9.22.4：补齐此前“未列入清单”的 8 个模块，否则自检根本没断言它们。
+        "devtools", "downloader", "icons", "ratelimit",
+        "tools_more", "webengine", "webui_bridge", "webui_host",
     ]
     _GUI_MODS = [
         "chat_worker", "main_window", "pages", "panels",
         "startup_dialog", "voice_bar", "widgets",
+        # ★ v9.22.4：补全（此前只在“未列入清单”里出现，没被自检断言）
+        "browser_page", "team_bar",
     ]
     # 历史残留、产品代码零引用、因此不进包（列进来会让冻结版自检误报）。
     # 设置界面早就改成 pages.SettingsPage 了；app/gui/settings_dialog.py 只是早期对话框的遗留文件。
@@ -329,6 +334,14 @@ def selftest():
         from PyQt6.QtWidgets import QApplication
         from app import workspace as ws_mod, themes
         from app.gui.main_window import MainWindow
+        # ★ v9.22.4：awb:// scheme 必须在 QApplication 创建之前注册，
+        #   否则自检走的是“未注册”的降级路径，还会刷
+        #   "Please register the custom scheme 'awb' ..." 警告。
+        try:
+            from app.webui_host import register_scheme as _register_awb
+            _register_awb()
+        except Exception:
+            pass
         # 不能传空列表：argv[0] 缺失时，后面一建 QWebEngineProfile 就静默 exit 127。
         app = QApplication.instance() or QApplication(sys.argv[:1] or ["AIWorkbench"])
         themes.apply(app, "light")

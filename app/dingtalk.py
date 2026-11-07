@@ -162,17 +162,57 @@ def _get_json(url, headers=None, timeout=TIMEOUT, params=None):
 #   self_test 里写的「平台不提供读取会话列表接口」是错的——那条限制只
 #   针对「企业内部应用服务端 API」，dws 这条路不受限。
 def _find_node():
-    """找一个可用的 node 可执行文件（优先 WorkBuddy 自带的托管 node）。"""
+    """找一个可用的 node 可执行文件（优先 WorkBuddy 自带的托管 node）。
+
+    ★ v9.22.4：老实现把托管目录的版本号写死成 ("22.22.2-3", "22.22.2", "22.0.0")，
+      宿主一升 node 就找不到 —— 用户点「一键配置」直接报「没找到 Node.js」，
+      可他机器上明明装着。现在改成 glob 扫 versions/*，再补几个常见安装位置。
+    """
     env = os.environ.get("AIWORKBENCH_NODE_PATH")
     if env and os.path.exists(env):
         return env
     home = os.path.expanduser("~")
-    for ver in ("22.22.2-3", "22.22.2", "22.0.0"):
-        for name in ("node.exe", "node"):
-            p = os.path.join(home, ".workbuddy", "binaries", "node",
-                             "versions", ver, name)
-            if os.path.exists(p):
+    # 1) WorkBuddy 托管的 node：版本目录不确定，扫一遍（深一层，别递归整盘）
+    roots = [
+        os.path.join(home, ".workbuddy", "binaries", "node", "versions"),
+        os.path.join(home, ".workbuddy", "binaries", "node"),
+    ]
+    for root in roots:
+        try:
+            for d in sorted(os.listdir(root), reverse=True):
+                for name in ("node.exe", "node"):
+                    p = os.path.join(root, d, name)
+                    if os.path.isfile(p):
+                        return p
+        except Exception:
+            pass
+    # 2) 常见安装位置（系统装 / 官方安装包 / nvm / volta / scoop）
+    guesses = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "nodejs", "node.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                     "nodejs", "node.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "nodejs",
+                     "node.exe"),
+        os.path.join(home, "AppData", "Roaming", "nvm", "current", "node.exe"),
+        os.path.join(home, ".volta", "bin", "node.exe"),
+        os.path.join(home, "scoop", "apps", "nodejs", "current", "node.exe"),
+    ]
+    for p in guesses:
+        try:
+            if p and os.path.isfile(p):
                 return p
+        except Exception:
+            pass
+    # 3) nvm-windows 的多版本目录：nvm/v<ver>/node.exe
+    nvm = os.path.join(home, "AppData", "Roaming", "nvm")
+    try:
+        for d in sorted(os.listdir(nvm), reverse=True):
+            p = os.path.join(nvm, d, "node.exe")
+            if os.path.isfile(p):
+                return p
+    except Exception:
+        pass
     return shutil.which("node")
 
 

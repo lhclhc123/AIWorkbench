@@ -23,10 +23,11 @@ const PAGES = [
   { key: 'browser',     label: '浏览器',     view: null,          qt: true },
 ];
 
-// 不画格子的页面：tools/team 收进别处；chat 不再占用侧栏格子——
-// 用户直接点左侧对话列表里的某一项即可回到对话页（见 views/chat.js）。
+// 不画格子的页面：只剩 chat —— 对话页不再占用侧栏格子，
+// 用户直接点左侧对话列表里的某一项即可回到对话页（见 views/chat.js），
+// 非对话页则用标题栏的「← 对话」按钮回去（见 app.js 的 awb:nav 监听）。
 // PAGES 里 chat 那条仍保留，供 switchTo('chat') 的页面切换逻辑使用。
-const NAV_SKIP = new Set(['tools', 'team', 'chat']);
+const NAV_SKIP = new Set(['chat']);
 
 let current = 'chat';
 const viewCache = new Map();   // key -> {loaded, init}
@@ -83,6 +84,7 @@ export async function switchTo(key) {
   // browser 页走 Qt
   if (p.qt) {
     await loadView(key);
+    document.dispatchEvent(new CustomEvent('awb:nav', { detail: { key } }));
     return;
   }
   // 隐藏所有 section，显示目标
@@ -97,6 +99,8 @@ export async function switchTo(key) {
   if (cached && typeof cached.init === 'function') {
     try { await cached.init(sec); } catch (e) { console.error('[nav] 视图 init 失败', key, e); }
   }
+  // ★ v9.22.4：通知外壳（app.js）当前页变了，用于显隐标题栏的「← 对话」。
+  document.dispatchEvent(new CustomEvent('awb:nav', { detail: { key } }));
 }
 
 export function initNav() {

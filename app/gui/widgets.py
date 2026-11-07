@@ -1205,7 +1205,8 @@ class ProcessGroup(QWidget):
         bubble.setObjectName("ProcessGroup")
         bubble.setStyleSheet(
             f"#ProcessGroup{{background:{t['chip_bg']};border:none;"
-            "border-radius:8px;}}")
+            # 普通字符串里只能是单个 `}`，写 `}}` 会让整张样式表解析失败
+            "border-radius:8px;}")
         v = QVBoxLayout(bubble)
         v.setContentsMargins(10, 6, 8, 6)
         v.setSpacing(4)

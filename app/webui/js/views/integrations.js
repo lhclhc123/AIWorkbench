@@ -24,6 +24,13 @@ const STYLE = `
 .f-row .input{flex:1;min-width:200px;max-width:420px;}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
 .switch-row input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px;flex:0 0 auto;}
+/* ★ v9.22.4：动作结果就地显示，不再只弹一句 toast（用户看不到到底返回了什么） */
+.int-out{margin:0 0 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden;flex:0 0 auto;}
+.int-out[hidden]{display:none;}
+.int-out-head{display:flex;align-items:center;gap:8px;padding:7px 12px;background:var(--surface-2);font-size:12px;color:var(--text-2);}
+.int-out-head b{color:var(--text);font-weight:600;}
+.int-out-head .spacer{flex:1;}
+.int-out-body{margin:0;padding:9px 12px;max-height:220px;overflow:auto;font-family:var(--mono);font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-word;}
 `;
 
 // 模块级状态：视图只 build 一次，之后每次 init 仅刷新数据
@@ -37,6 +44,32 @@ function setVal(root, sel, v) { const el = $(sel, root); if (el) el.value = (v =
 function setChk(root, sel, v) { const el = $(sel, root); if (el) el.checked = !!v; }
 function setText(root, sel, v) { const el = $(sel, root); if (el) el.textContent = (v == null ? '' : v); }
 
+/* ★ v9.22.4：把动作结果显示在页内结果面板里。
+   老实现无论后端返回什么，都只弹一句「已提交，后台执行中」—— 用户看不到
+   会话列表、自检项、错误原因，出了问题只能猜。 */
+function showOut(root, title, payload) {
+  const box = $('#intOut', root);
+  const body = $('#intOutBody', root);
+  if (!box || !body) return;
+  let txt = '';
+  if (payload == null) txt = '（无返回内容）';
+  else if (typeof payload === 'string') txt = payload;
+  else {
+    try { txt = JSON.stringify(payload, null, 2); }
+    catch (e) { txt = String(payload); }
+  }
+  if (txt.length > 6000) txt = txt.slice(0, 6000) + '\n…（已截断）';
+  setText(root, '#intOutTitle', title || '执行结果');
+  body.textContent = txt;
+  box.hidden = false;
+  box.scrollIntoView({ block: 'nearest' });
+}
+
+function hideOut(root) {
+  const box = $('#intOut', root);
+  if (box) box.hidden = true;
+}
+
 function build(root) {
   root.innerHTML = `
     <style>${STYLE}</style>
@@ -44,6 +77,15 @@ function build(root) {
       <h2>集成</h2>
       <span class="page-hint" id="intHint"></span>
       <span class="spacer"></span>
+    </div>
+
+    <div class="int-out" id="intOut" hidden>
+      <div class="int-out-head">
+        <b id="intOutTitle">执行结果</b>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost" id="intOutClose">收起</button>
+      </div>
+      <pre class="int-out-body" id="intOutBody"></pre>
     </div>
 
     <div class="vtabs" role="tablist">
@@ -279,6 +321,8 @@ function wire(root) {
   root.querySelectorAll('.vtab').forEach((b) => {
     b.addEventListener('click', () => switchTab(root, b.dataset.tab));
   });
+  const outClose = $('#intOutClose', root);
+  if (outClose) outClose.addEventListener('click', () => hideOut(root));
 
   // 钉钉：保存（真实写回）
   $('#dingSave', root).addEventListener('click', async () => {
@@ -292,17 +336,23 @@ function wire(root) {
     }
   });
 
-  // 钉钉：异步动作（test/selftest/contacts/login），调完只提示后台执行
-  const dingAsync = (id, method) => {
+  // 钉钉：异步动作（test/selftest/contacts/login），调完把返回结果显示出来
+  const dingAsync = (id, method, label) => {
     $(id, root).addEventListener('click', async () => {
-      try { await rpc(method, { config: collectDingConfig(root) }); toast('已提交，后台执行中'); }
-      catch (e) { toast('操作失败：' + e.message); }
+      try {
+        const d = await rpc(method, { config: collectDingConfig(root) });
+        toast('已提交，后台执行中');
+        showOut(root, label || method, d);
+      } catch (e) {
+        toast('操作失败：' + e.message);
+        showOut(root, (label || method) + '（失败）', String(e.message));
+      }
     });
   };
-  dingAsync('#dingTest', 'dingtalk.test');
-  dingAsync('#dingSelftest', 'dingtalk.selftest');
-  dingAsync('#dingContacts', 'dingtalk.contacts');
-  dingAsync('#dingLogin', 'dingtalk.login');
+  dingAsync('#dingTest', 'dingtalk.test', '钉钉连通性测试');
+  dingAsync('#dingSelftest', 'dingtalk.selftest', '钉钉自检结果');
+  dingAsync('#dingContacts', 'dingtalk.contacts', '通讯录 / 会话');
+  dingAsync('#dingLogin', 'dingtalk.login', '钉钉登录');
 
   $('#dingGroupSend', root).addEventListener('click', async () => {
     const text = $('#dingGroupText', root).value.trim();
@@ -326,8 +376,14 @@ function wire(root) {
   // dws 工作台
   const dwsAction = (id, method, args) => {
     $(id, root).addEventListener('click', async () => {
-      try { await rpc(method, args || {}); toast('已提交，后台执行中'); }
-      catch (e) { toast('操作失败：' + e.message); }
+      try {
+        const d = await rpc(method, args || {});
+        toast('已提交，后台执行中');
+        showOut(root, method, d);
+      } catch (e) {
+        toast('操作失败：' + e.message);
+        showOut(root, method + '（失败）', String(e.message));
+      }
     });
   };
   dwsAction('#dwsLogin', 'dws.login', { device: false });

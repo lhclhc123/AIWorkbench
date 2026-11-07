@@ -67,7 +67,9 @@ function refreshStatusNow() {
   clearTimeout(statusTimer);
   statusTimer = null;
   state.checkTries = 0;
-  refreshState();
+  // ★ v9.22.4：force_ding 让后端绕过 60s 状态缓存 —— 否则刚登录成功 / 刚点
+  //   「重新检测」，前端拿到的还是缓存里的旧串，看着像没反应。
+  refreshState(true);
 }
 
 if (typeof document !== 'undefined') {
@@ -103,6 +105,8 @@ function startCliWatch(onDone) {
       return;
     }
     if (!cli.busy && cli.message) toast(cli.message);
+    // 收尾时强制绕缓存刷一次登录态：否则页面还挂着 60s 前的「未登录」
+    if (!cli.busy) await refreshState(true);
     finish();
   };
   cliWatchTimer = setTimeout(() => tick(0), 800);
@@ -229,15 +233,72 @@ function renderCli(cli) {
     }
   }
 
+  // 设备码 / 授权链接：登录时 dws 会打印，之前全丢了，用户不知道码是啥（v9.22.4）
+  const code = String(cli.device_code || '').trim();
+  const url = String(cli.auth_url || '').trim();
+  const authBox = $('#cliAuthBox');
+  if (authBox) authBox.hidden = !(code || url);
+  const codeRow = $('#cliCodeRow');
+  if (codeRow) codeRow.hidden = !code;
+  const urlRow = $('#cliUrlRow');
+  if (urlRow) urlRow.hidden = !url;
+  const codeEl = $('#cliCode');
+  if (codeEl && code) codeEl.textContent = code;
+  const urlEl = $('#cliUrl');
+  if (urlEl && url) {
+    urlEl.textContent = url;
+    urlEl.href = url;
+  }
+  const tip = $('#cliAuthTip');
+  if (tip) {
+    tip.textContent = code
+      ? '把上面的设备码填进授权页（或直接点授权页确认），完成后本窗口会自动变成「登录成功」。'
+      : '在浏览器里完成授权后，本窗口会自动变成「登录成功」。';
+  }
+
   // 底部按钮：还没登录 → 给「去登录钉钉」；跑完 → 给「完成」
   const needLogin = !busy && steps.some((s) => s.key === 'auth' && s.status !== 'done');
   const go = $('#cliLoginGo');
   if (go) go.hidden = !needLogin;
   const done = $('#cliDone');
   if (done) done.hidden = busy;
+  // 运行中可取消；失败可重试；缺 Node 给下载入口（v9.22.4）
+  const cancel = $('#cliCancel');
+  if (cancel) cancel.hidden = !busy;
+  const retry = $('#cliRetry');
+  if (retry) retry.hidden = busy || cli.ok !== false;
+  const nodeBtn = $('#cliNode');
+  if (nodeBtn) nodeBtn.hidden = !cli.need_node;
 
   tickCliElapsed();
 }
+
+/* 复制文本：QWebEngineView 里 navigator.clipboard 可能被拒，退回 execCommand */
+async function copyText(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(s);
+      return true;
+    }
+  } catch (e) { /* 继续走兜底 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = s;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+const NODE_DOWNLOAD = 'https://nodejs.org/zh-cn/download';
 
 function wireCliModal() {
   const m = $('#cliModal');
@@ -251,6 +312,81 @@ function wireCliModal() {
     const b = $('#cliLoginBtn');
     if (b && !b.disabled) b.click();
   });
+
+  // ★ v9.22.4：取消 —— 以前点了配置只能干等（npm 卡住最长 7 分钟）
+  const cancel = $('#cliCancel');
+  if (cancel) {
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      cancel.textContent = '取消中…';
+      try {
+        const d = await rpc('im_cli_cancel', {});
+        toast((d && d.message) || '已取消');
+      } catch (e) {
+        toast('取消失败：' + e.message);
+      } finally {
+        cancel.disabled = false;
+        cancel.textContent = '取消';
+        await refreshState();
+      }
+    });
+  }
+
+  // 失败重试：授权步骤失败 → 重新登录；其它 → 重跑一键配置
+  const retry = $('#cliRetry');
+  if (retry) {
+    retry.addEventListener('click', () => {
+      const failed = (state.cli && state.cli.failed_step) || '';
+      const btn = failed === 'auth' ? $('#cliLoginBtn') : $('#cliSetupBtn');
+      closeCliModal();
+      if (btn && !btn.disabled) btn.click();
+    });
+  }
+
+  // 缺 Node.js → 打开官方下载页（网页里 target=_blank 会被吞，走后端开系统浏览器）
+  const nodeBtn = $('#cliNode');
+  if (nodeBtn) {
+    nodeBtn.addEventListener('click', async () => {
+      try {
+        const d = await rpc('app.open_url', { url: NODE_DOWNLOAD });
+        if (!d || !d.ok) toast('打开失败，请手动访问 ' + NODE_DOWNLOAD);
+      } catch (e) {
+        toast('打开失败，请手动访问 ' + NODE_DOWNLOAD);
+      }
+    });
+  }
+
+  const copyCode = $('#cliCopyCode');
+  if (copyCode) {
+    copyCode.addEventListener('click', async () => {
+      const code = ($('#cliCode') && $('#cliCode').textContent) || '';
+      const ok = await copyText(code);
+      toast(ok ? '设备码已复制' : '复制失败，请手动选中复制');
+    });
+  }
+  const copyUrl = $('#cliCopyUrl');
+  if (copyUrl) {
+    copyUrl.addEventListener('click', async () => {
+      const url = ($('#cliUrl') && $('#cliUrl').textContent) || '';
+      const ok = await copyText(url);
+      toast(ok ? '链接已复制' : '复制失败，请手动选中复制');
+    });
+  }
+  // 点链接直接开系统浏览器
+  const urlEl = $('#cliUrl');
+  if (urlEl) {
+    urlEl.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const url = urlEl.textContent || '';
+      if (!url) return;
+      try {
+        const d = await rpc('app.open_url', { url });
+        if (!d || !d.ok) toast('打开失败，请复制链接到浏览器');
+      } catch (err) {
+        toast('打开失败，请复制链接到浏览器');
+      }
+    });
+  }
 }
 
 /* ---------------- tab 切换 ---------------- */
@@ -445,9 +581,9 @@ function renderStatus() {
 }
 
 /* ---------------- 数据刷新 ---------------- */
-async function refreshState() {
+async function refreshState(forceDing) {
   try {
-    const d = await rpc('im_get_state', {});
+    const d = await rpc('im_get_state', forceDing ? { force_ding: true } : {});
     if (!d || !d.ready) {
       toast('钉钉助手未初始化');
       return;
@@ -492,9 +628,17 @@ function wire() {
   const backBtn = $('#backBtn');
   if (backBtn) backBtn.addEventListener('click', () => rpc('nav_to', { key: 'chat' }));
 
-  // 状态文字可点 → 立即重新检测（v9.22.1）
+  // 状态文字可点 → 立即重新检测（v9.22.1）；键盘回车/空格同样生效（v9.22.4）
   const dingEl = $('#dingStatus');
-  if (dingEl) dingEl.addEventListener('click', () => refreshStatusNow());
+  if (dingEl) {
+    dingEl.addEventListener('click', () => refreshStatusNow());
+    dingEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        refreshStatusNow();
+      }
+    });
+  }
 
   // tab
   wireTabs();
@@ -514,8 +658,14 @@ function wire() {
     const oldHtml = btn.innerHTML;
     btn.disabled = true;
     btn.textContent = '已提交…';
-    call('rpc', { method: 'im_process_all', args: {}, reqId: 'all' + Date.now() });
-    toast('已提交全部消息给 AI');
+    // ★ v9.22.4：改用 await rpc —— call() 不等结果，后端抛错前端完全不知情，
+    //   按钮却在 1.5s 后无条件恢复，看着像「点了没反应」。
+    try {
+      await rpc('im_process_all', {});
+      toast('已提交全部消息给 AI');
+    } catch (e) {
+      toast('提交失败：' + e.message);
+    }
     setTimeout(async () => {
       await refreshState();
       btn.disabled = false;
@@ -569,8 +719,12 @@ function wire() {
     const oldHtml = btn.innerHTML;
     btn.disabled = true;
     btn.textContent = '扫描中…';
-    call('rpc', { method: 'im_scan_tags', args: {}, reqId: 'scan' + Date.now() });
-    toast('已开始扫描打标签');
+    try {
+      await rpc('im_scan_tags', {});
+      toast('已开始扫描打标签');
+    } catch (e) {
+      toast('扫描失败：' + e.message);
+    }
     setTimeout(async () => {
       await refreshState();
       btn.disabled = false;

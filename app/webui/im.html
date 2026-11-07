@@ -27,7 +27,9 @@
       <span class="pill-live" id="livePill"><i></i><span id="liveText">未运行</span></span>
     </div>
     <span class="head-spacer"></span>
-    <span class="im-head-extra" id="dingStatus">检查中…</span>
+    <!-- 可点/可键盘触发：span 加 role+tabindex，回车空格等于重检（v9.22.4 可达性） -->
+    <span class="im-head-extra is-action" id="dingStatus" role="button" tabindex="0"
+          aria-live="polite">检查中…</span>
     <button class="btn" id="toggleBtn">启动助理</button>
   </div>
 
@@ -75,7 +77,7 @@
                 <button class="btn" id="cliSetupBtn">一键配置钉钉 CLI</button>
                 <button class="btn btn-ghost" id="cliLoginBtn">登录</button>
               </div>
-              <p class="hint">没装会自动装 Node.js + dws（钉钉工作台 CLI），装完引导你扫码/设备码登录。</p>
+              <p class="hint">没装会自动装 dws（钉钉工作台 CLI），装完弹出窗口显示进度 / 设备码，引导你完成授权。需要 Node.js（18+，自带 npm）。</p>
             </div>
           </div>
 
@@ -209,12 +211,30 @@
     <div class="cli-bar"><i id="cliBar" style="width:2%"></i></div>
     <div class="cli-hint" id="cliHint">准备中…</div>
     <ul class="cli-steps" id="cliSteps"></ul>
+    <!-- ★ v9.22.4：设备码 / 授权链接必须看得见 —— 之前登录后台跑，stdout 全丢，
+         用户只看到「等待授权…」，不知道码是什么、该去哪确认。 -->
+    <div class="cli-auth" id="cliAuthBox" hidden>
+      <div class="cli-auth-row" id="cliCodeRow" hidden>
+        <span class="cli-auth-k">设备码</span>
+        <b class="cli-auth-code" id="cliCode"></b>
+        <button class="btn btn-ghost" id="cliCopyCode">复制</button>
+      </div>
+      <div class="cli-auth-row" id="cliUrlRow" hidden>
+        <span class="cli-auth-k">授权页</span>
+        <a class="cli-auth-url" id="cliUrl" href="#" target="_blank" rel="noopener"></a>
+        <button class="btn btn-ghost" id="cliCopyUrl">复制链接</button>
+      </div>
+      <p class="hint" id="cliAuthTip">在钉钉里确认授权后，本窗口会自动变成「登录成功」。</p>
+    </div>
     <details class="cli-log-wrap" id="cliLogWrap">
       <summary>查看安装日志</summary>
       <pre class="cli-log" id="cliLog"></pre>
     </details>
     <div class="cli-foot">
       <span class="cli-elapsed" id="cliElapsed"></span>
+      <button class="btn btn-ghost" id="cliNode" hidden>去装 Node.js</button>
+      <button class="btn btn-ghost" id="cliRetry" hidden>重试</button>
+      <button class="btn btn-ghost" id="cliCancel" hidden>取消</button>
       <button class="btn btn-ghost" id="cliLoginGo" hidden>去登录钉钉</button>
       <button class="btn" id="cliDone" hidden>完成</button>
     </div>
