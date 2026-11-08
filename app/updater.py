@@ -12,6 +12,7 @@ import ssl
 import time
 import urllib.request
 
+from . import incremental as inc
 from . import version as ver
 
 UA = "AIWorkbench-Updater/9.0 (+https://github.com/lhclhc123/AIWorkbench)"
@@ -396,14 +397,187 @@ def check(repo=None, current=None, token=None, timeout=TIMEOUT):
     return info
 
 
+def _is_patch_asset(asset):
+    """判断某个附件是不是增量包。
+
+    ★ 增量包只装"变化的文件"（本项目一版约 14MB，主要是变了的那 15MB exe），
+    一旦被当成整包装进安装目录，用户拿到的就是一堆缺口
+    （PyQt6 等没变的部分不会补），程序当场起不来。
+    所以"名字里带 patch"的附件在挑整包时必须无条件排除。
+    """
+    name = str((asset or {}).get("name", "")).lower()
+    return "patch" in name
+
+
 def pick_asset(info, prefer=(".zip", ".exe")):
-    """从 releases 里挑一个最适合下载的附件。"""
-    assets = info.get("assets") or []
+    """从 releases 里挑一个最适合下载的附件（永远不返回增量包）。"""
+    # 先在"非增量包"里挑，顺序与旧版一致（.zip 优先于 .exe）。
+    assets = [a for a in (info.get("assets") or []) if not _is_patch_asset(a)]
     for ext in prefer:
         for a in assets:
             if a.get("name", "").lower().endswith(ext):
                 return a
     return assets[0] if assets else None
+
+
+#: 增量包命名规范：``AIWorkbench_patch_v9.22.5_to_v9.22.6.zip``
+PATCH_NAME_FMT = "AIWorkbench_patch_v{base}_to_{tag}.zip"
+
+# 归一化用：去掉版本号前的 'v'（只在"分隔符/开头 + v + 数字"时去，
+# 避免把 aiworkbench 里别的字母当成版本前缀）。
+_VER_PREFIX = re.compile(r"(?<![a-z0-9])v(?=\d)")
+
+
+def _norm_name(text):
+    """把版本号/文件名归一成可比较的样子。
+
+    ``AIWorkbench_patch_v9.22.5_to_v9.22.6.ZIP``
+    → ``aiworkbench.patch.9.22.5.to.9.22.6.zip``
+    （忽略大小写、忽略 'v' 前缀差异、'_' 与 '.' 一视同仁）
+    """
+    s = str(text or "").strip().lower()
+    s = s.replace("_", ".").replace("-", ".")
+    s = _VER_PREFIX.sub("", s)
+    s = re.sub(r"\.{2,}", ".", s)
+    return s.strip(".")
+
+
+def pick_patch_asset(info, base_version, tag=None):
+    """在 release 附件里找"从 base_version 到 tag"的增量包。
+
+    匹配规则故意放宽：忽略大小写、允许有无 ``v`` 前缀、``.`` 与 ``_`` 都试、
+    命名里带 ``patch`` 且同时出现"起始版本"和"目标版本"也算命中
+    （发布脚本改个分隔符风格不至于让老用户退回 236MB 全量下载）。
+
+    Args:
+        info: :func:`check` 返回的 dict（用到 ``assets`` 与 ``tag``）。
+        base_version: 本机当前版本，例如 ``"9.22.5"``。
+        tag: 目标版本；``None`` 时用 ``info["tag"]``。
+
+    Returns:
+        dict | None: 命中则返回该附件，找不到返回 ``None``（调用方回退全量包）。
+    """
+    assets = (info or {}).get("assets") or []
+    base = _norm_name(base_version)
+    if not base:
+        return None
+    tag_text = tag if tag is not None else ((info or {}).get("tag") or "")
+    tag_norm = _norm_name(tag_text)
+    want = ("aiworkbench.patch.%s.to.%s.zip" % (base, tag_norm)) if tag_norm else ""
+
+    loose = []
+    for a in assets:
+        name = str((a or {}).get("name") or "")
+        low = name.lower()
+        if "patch" not in low or not low.endswith(".zip"):
+            continue
+        norm = _norm_name(name)
+        if want and norm == want:
+            return a
+        tokens = re.findall(r"\d+(?:\.\d+)+", norm)
+        base_ok = any(t == base or t.startswith(base + ".") for t in tokens)
+        tag_ok = (not tag_norm) or any(t == tag_norm or t.startswith(tag_norm + ".")
+                                      for t in tokens)
+        if base_ok and tag_ok:
+            loose.append(a)
+    return loose[0] if loose else None
+
+
+def verify_patch_zip(zip_path, require_full=False):
+    """校验一个 zip 是不是"自洽"的更新包（增量包或整包都可）。
+
+    自洽有两层含义，本函数**都**检查：
+
+    1. 必须带 ``manifest.json``（增量包在根目录；整包在 ``AIWorkbench/`` 下，
+       两种布局都认），且里面 ``files`` 是一张非空的表；
+    2. 包里每一个文件都必须在清单里登记，且解压后大小一致
+       —— 否则装上去就是一堆"没人认账"的文件，等于把安装目录搞脏。
+
+    ★ 注意别把第 2 条反过来要求：增量包里的清单描述的是**新版完整文件树**
+    （只有这样才能当下一版的基准），而包里只装变化的文件，
+    所以"清单里的文件必须都在包里"只有整包才成立 —— 需要那种严格检查时
+    传 ``require_full=True``（或在解压后用 :func:`incremental.verify_tree`）。
+
+    Args:
+        zip_path: zip 路径。
+        require_full: 为 True 时额外要求"清单里列的每个文件都在包里"（整包校验）。
+
+    Returns:
+        bool: 校验通过返回 ``True``；任何异常（含文件不存在、坏 zip）返回 ``False``，
+        **绝不抛异常** —— 更新流程要能在坏包上优雅回退到全量下载。
+    """
+    try:
+        import zipfile as _zf
+        with _zf.ZipFile(zip_path) as z:
+            names = []
+            for info in z.infolist():
+                raw = str(info.filename or "").replace("\\", "/")
+                if raw.endswith("/"):           # 目录条目
+                    continue
+                # 路径穿越（'../x' 或 '/x'）各平台解压行为不一致，一律判坏。
+                if raw.startswith("/") or ".." in raw.split("/"):
+                    _log("增量包里有非法路径：%s" % raw)
+                    return False
+                names.append(raw)
+            if inc.MANIFEST_NAME not in names:
+                # 整包（zip 根下套一层 AIWorkbench/）里清单会深一层，也要认。
+                prefix = ""
+                for name in names:
+                    if (name.lower().endswith("/" + inc.MANIFEST_NAME)
+                            and name.count("/") == 1):
+                        prefix = name[:-(len(inc.MANIFEST_NAME) + 1)]
+                        break
+                if not prefix:
+                    _log("更新包缺少 %s" % inc.MANIFEST_NAME)
+                    return False
+            else:
+                prefix = ""
+            manifest_entry = (prefix + "/" + inc.MANIFEST_NAME).lstrip("/")
+            data = json.loads(z.read(manifest_entry).decode("utf-8", "ignore"))
+            files = data.get("files") if isinstance(data, dict) else None
+            if not isinstance(files, dict) or not files:
+                _log("更新包清单为空")
+                return False
+            norm_files = {str(k).replace("\\", "/"): v for k, v in files.items()}
+            # 去掉整包多出来的那一层前缀，统一成"相对安装根"的写法再比对。
+            rel_names = [(n[len(prefix) + 1:] if prefix and n.startswith(prefix + "/")
+                          else n) for n in names]
+
+            for name in rel_names:
+                if name in (inc.MANIFEST_NAME, inc.DELETE_LIST_NAME):
+                    continue
+                meta = norm_files.get(name)
+                if not isinstance(meta, dict):
+                    _log("更新包里有清单未登记的文件：%s" % name)
+                    return False
+                if int(meta.get("size") or 0) != int(
+                        z.getinfo((prefix + "/" + name) if prefix else name).file_size):
+                    _log("更新包文件大小与清单不符：%s" % name)
+                    return False
+
+            # 删除清单：必须在包里、必须能解析（不许绝对路径/穿越），
+            # 而且不许删掉新版清单里还有的文件 —— 那等于装完自废功能。
+            if inc.DELETE_LIST_NAME in rel_names:
+                entry = ((prefix + "/") if prefix else "") + inc.DELETE_LIST_NAME
+                dels = inc.parse_delete_list(
+                    z.read(entry).decode("utf-8", "ignore"))
+                if dels is None:
+                    _log("删除清单内容非法（绝对路径或路径穿越）")
+                    return False
+                for rel in dels:
+                    if rel in norm_files:
+                        _log("删除清单要删的文件在新版清单里仍存在：%s" % rel)
+                        return False
+
+            if require_full:
+                for rel in norm_files:
+                    if rel != inc.MANIFEST_NAME and rel not in rel_names:
+                        _log("整包缺少清单登记的文件：%s" % rel)
+                        return False
+            return True
+    except Exception as e:
+        _log("增量包校验异常：%s: %s" % (type(e).__name__, e))
+        return False
 
 
 def download(url, dest, progress=None, timeout=30, on_stage=None):
@@ -462,8 +636,17 @@ def _download_impl(url, dest, progress=None, timeout=30, on_stage=None):
             best, _stats = _dl.pick_fastest(url, timeout=min(6, timeout))
             _log("选用下载线路：%s" % _dl.describe_channel(best))
             _emit_stage(on_stage, "downloading")
-            _dl.download(url, dest, progress=_progress_bridge,
-                         timeout=(10, timeout), prefer=best)
+            try:
+                # ★ 236MB 的更新包单连接只有 1~3MB/s：优先分段并发（默认 8 段）。
+                #   服务器不支持 Range 时 download_parallel 会自己退回单连接。
+                _dl.download_parallel(best, dest, progress=_progress_bridge,
+                                      timeout=(10, timeout))
+                _log("分段并发下载完成")
+            except Exception as e:
+                # 分段失败（个别镜像对 Range 支持不稳）→ 退回单连接多通道下载。
+                _log("分段下载失败，改用单连接：%s: %s" % (type(e).__name__, e))
+                _dl.download(url, dest, progress=_progress_bridge,
+                             timeout=(10, timeout), prefer=best)
             _emit_stage(on_stage, "downloaded")
             return dest
         except Exception as e:
@@ -516,6 +699,10 @@ def install_package(zip_path, app_dir=None, progress=None, on_stage=None,
 
     这就是「安装进度条/提示」的落点：GUI 下载完成后调本函数即可拿到
     解压/覆盖/重启三个阶段的可视化回调，无需自己写 zipfile + PowerShell。
+
+    ★ 增量包兼容：包根若有 ``__delete__.txt``，会**先按它删掉新版已经没有的
+    旧文件、再覆盖**（全量包没有这个文件，行为与旧版完全一致）；包根的
+    ``__delete__.txt`` 本身不会被拷进安装目录。
 
     ``progress(done, total)``：解压字节进度回调（近似，total 为包内总字节）。
     ``on_stage(stage, text)``：阶段回调，stage ∈
@@ -589,8 +776,15 @@ def _install_impl(zip_path, app_dir=None, progress=None, on_stage=None,
             src = root
             break
     if not src:
-        _log("压缩包里没找到 %s，解压根目录：%s" % (restart_exe, tmp_root))
-        raise RuntimeError("更新包里缺少主程序，无法自动安装，请到发布页重新下载")
+        # ★ 增量包兜底：某一版 exe 本身没变时，包里就只有变化的文件 + manifest.json，
+        #   压根找不到 AIWorkbench.exe。增量包的根目录**就是**安装根目录（路径原样保留），
+        #   所以拿 tmp_root 当 src 直接覆盖安装即可；找不到清单才判定为坏包。
+        if os.path.isfile(os.path.join(tmp_root, inc.MANIFEST_NAME)):
+            _log("增量包里没有 %s（本版未变），按清单覆盖安装" % restart_exe)
+            src = tmp_root
+        else:
+            _log("压缩包里没找到 %s，解压根目录：%s" % (restart_exe, tmp_root))
+            raise RuntimeError("更新包里缺少主程序，无法自动安装，请到发布页重新下载")
 
     _emit_stage(on_stage, "installing")
     if dry_run:
@@ -602,13 +796,45 @@ def _install_impl(zip_path, app_dir=None, progress=None, on_stage=None,
     src_q = src.replace("'", "''")
     dst_q = app_dir.replace("'", "''")
     exe_q = os.path.join(app_dir, restart_exe).replace("'", "''")
+
+    # 删除清单：增量包才有。正常布局里它在解压根目录（与 manifest.json 同级）；
+    # 万一打包时多套了一层目录，就退到 src 同级去找。整包两种情况都不存在，
+    # 下面那段 PowerShell 会自动变成空操作，行为与旧版完全一致。
+    del_txt = os.path.join(tmp_root, inc.DELETE_LIST_NAME)
+    if not os.path.isfile(del_txt):
+        _cand = os.path.join(os.path.dirname(src), inc.DELETE_LIST_NAME)
+        del_txt = _cand if os.path.isfile(_cand) else del_txt
+    del_q = del_txt.replace("'", "''")
+    if os.path.isfile(del_txt):
+        _log("安装前先按删除清单清理旧文件：%s" % del_txt)
+
     ps = (
         "$ErrorActionPreference = 'Stop'\n"
         "Start-Sleep -Seconds 2\n"
         "$ok = $false\n"
         "for ($i = 0; $i -lt 40; $i++) {\n"
-        f"  try {{ Copy-Item -Path '{src_q}\\*' -Destination '{dst_q}' -Recurse -Force\n"
-        "      $ok = $true; break }\n"
+        "  try {\n"
+        # ★ 必须先删再覆盖：增量包只覆盖"变化的文件"，新版删掉/改名的文件
+        #   不显式删掉就会永远留在用户机器上（旧 webui 资源、旧插件…迟早出错）。
+        #   用 -ErrorAction SilentlyContinue 让"本来就不存在"静默跳过，
+        #   被占用删不掉也不在这里抛错（随后的 Copy-Item 会失败并重试）。
+        f"    $delList = '{del_q}'\n"
+        "    if (Test-Path -LiteralPath $delList) {\n"
+        "      Get-Content -LiteralPath $delList -Encoding UTF8 | ForEach-Object {\n"
+        "        $p = $_.Trim()\n"
+        "        if ($p) {\n"
+        f"          $full = Join-Path '{dst_q}' ($p -replace '/','\\')\n"
+        "          if (Test-Path -LiteralPath $full) {\n"
+        "            Remove-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue\n"
+        "          }\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        # -Exclude：__delete__.txt 是安装器的控制文件，绝不能拷进安装目录。
+        f"    Copy-Item -Path '{src_q}\\*' -Destination '{dst_q}' -Recurse -Force"
+        f" -Exclude '{inc.DELETE_LIST_NAME}'\n"
+        "    $ok = $true; break\n"
+        "  }\n"
         "  catch { Start-Sleep -Milliseconds 500 }\n"
         "}\n"
         "if ($ok) {\n"

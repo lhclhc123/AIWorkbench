@@ -45,6 +45,12 @@ SKIP_DIRS = {".git", "__pycache__", "build", "dist_v9", "dist_v93", "node_module
 TEXT_EXT = {".py", ".txt", ".md", ".json", ".yml", ".yaml", ".iss", ".ps1",
             ".spec", ".cfg", ".toml", ".ini", ".bat", ".log"}
 
+# ★ v9.22.6：增量更新的清单文件是**机器生成**的，内容是「相对路径 + 文件大小 +
+#   sha256」，不含任何用户数据。但里面带「@2x」后缀的 PyQt 资源文件名
+#   文件名会被「邮箱」正则命中，长哈希会被「密钥密文」正则命中，全是误报。
+#   这里按前缀整目录跳过（生成逻辑见 app/incremental.py scan_tree）。
+SKIP_PREFIX = ("manifests/",)
+
 
 def staged_files():
     try:
@@ -69,6 +75,8 @@ def main():
     files = all_files() if "--all" in sys.argv else staged_files()
     hits = []
     for rel in files:
+        if rel.replace("\\", "/").startswith(SKIP_PREFIX):
+            continue
         p = os.path.join(ROOT, rel)
         if not os.path.exists(p):
             continue

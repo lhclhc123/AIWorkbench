@@ -20,7 +20,12 @@ sys.path.insert(0, ROOT)
 # 这些目录/文件绝不进 Git（与 .gitignore 对齐），扫描时跳过
 SKIP_DIRS = {"__pycache__", ".git", "build", "dist", "tests", "tools",
              ".workbuddy", "dist_v5", "dist_v6", "dist_v7", "dist_v8",
-             "dist_v9", "dist_v8_prev", "dist_old_v2", "dist_old_v3"}
+             "dist_v9", "dist_v8_prev", "dist_old_v2", "dist_old_v3",
+             # ★ v9.22.6：增量更新清单（每个文件一条 sha256 + 相对路径）。
+             #   内容全是 PyInstaller 产物路径与哈希，没有任何用户数据；
+             #   但 PyQt 资源文件名里带「@2x」这种后缀，会被邮箱正则误判、
+             #   长哈希会被密钥正则误判，所以整目录跳过。
+             "manifests"}
 SKIP_DIR_PREFIX = ("dist_v", "dist_old", "build")
 SKIP_FILE_SUFFIX = (".pyc", ".log", ".png", ".jpg", ".zip", ".exe", ".spec.bak")
 SKIP_FILES = {"AIWorkbench.spec"}

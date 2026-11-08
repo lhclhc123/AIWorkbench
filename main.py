@@ -114,6 +114,9 @@ def selftest():
         # ★ v9.22.4：补齐此前“未列入清单”的 8 个模块，否则自检根本没断言它们。
         "devtools", "downloader", "icons", "ratelimit",
         "tools_more", "webengine", "webui_bridge", "webui_host",
+        # ★ v9.22.6：增量更新（manifest/diff/patch）。updater 顶层 import，
+        #   漏了它冻结版会直接 ModuleNotFoundError。
+        "incremental",
     ]
     _GUI_MODS = [
         "chat_worker", "main_window", "pages", "panels",

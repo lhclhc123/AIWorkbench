@@ -6815,12 +6815,45 @@ class MainWindow(QMainWindow):
         return f"[成功] 已是最新版本（{info.get('current')}）。"
 
     def _do_update_check(self, silent):
+        # ★ v9.22.6：启动自动检查放后台线程。
+        #   以前 updater.check() 直接在 UI 线程里跑网络请求（GitHub API），
+        #   国内经常 3~8 秒甚至更久，期间整个界面是冻的 —— 用户会觉得
+        #   「一启动就卡一下」。静默检查没人等它，没理由阻塞界面。
+        if silent and not _NO_MODAL:
+            if getattr(self, "_upd_checking", False):
+                return
+            self._upd_checking = True
+
+            def _work():
+                info = None
+                try:
+                    info = updater.check(
+                        self.settings.get("update_repo") or ver.GITHUB_REPO,
+                        ver.VERSION,
+                        self.settings.get("github_token") or None)
+                except Exception as e:      # updater.check 自己兜底，这里再兜一层
+                    info = {"ok": False, "has_update": False,
+                            "error": "%s: %s" % (type(e).__name__, e)}
+                finally:
+                    self._upd_checking = False
+                try:
+                    self._after_update_check(info or {}, silent=True)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_work, daemon=True,
+                             name="awb-update-check").start()
+            return
         self.statusBar().showMessage("正在检查更新…")
         QApplication.processEvents()
         info = updater.check(self.settings.get("update_repo") or ver.GITHUB_REPO,
                              ver.VERSION,
                              self.settings.get("github_token") or None)
-        self._pending_update = info
+        self._after_update_check(info, silent)
+
+    def _after_update_check(self, info, silent):
+        """检查结果统一落地：更新缓存、推前端、按需提示/自动下载。"""
+        self._pending_update = info or {}
         try:
             self.page_integrations.show_update_result(info)
         except Exception:
@@ -6843,9 +6876,32 @@ class MainWindow(QMainWindow):
         if silent:
             self.statusBar().clearMessage()
             if info.get("ok") and info.get("has_update"):
-                if _NO_MODAL or getattr(self, "_web_engine", False):
+                # ★ v9.22.6：Web 模式下**必须真的弹出来**。
+                #   以前这里只 statusBar 写一行字就 return —— 用户根本注意不到，
+                #   于是「检测到了新版本但不会自动弹下载安装」（用户原话）。
+                #   现在推 update_available，由外壳 app.js 弹全局对话框，
+                #   并带一条全局进度条（不管当前在哪个页面都能看到）。
+                if _NO_MODAL:
                     self.statusBar().showMessage(
                         f"发现新版本 {info.get('tag')}（当前 {ver.VERSION}）", 15000)
+                    return
+                if getattr(self, "_web_engine", False):
+                    try:
+                        asset = updater.pick_asset(info, prefer=(".zip", ".exe")) or {}
+                        _patch = self._pick_patch_asset(info) or {}
+                        if self._web_bridge is not None:
+                            self._web_bridge.emit_event("update_available", {
+                                "tag": str(info.get("tag") or ""),
+                                "current": ver.VERSION,
+                                "size": int(asset.get("size") or 0),
+                                "name": str(asset.get("name") or ""),
+                                "patch_size": int(_patch.get("size") or 0),
+                                "html_url": str(info.get("html_url") or ""),
+                            })
+                    except Exception:
+                        pass
+                    self.statusBar().showMessage(
+                        f"发现新版本 {info.get('tag')}，正在提示更新…", 15000)
                     return
                 r = QMessageBox.question(
                     self, "发现新版本",
@@ -6864,8 +6920,37 @@ class MainWindow(QMainWindow):
             else ("已是最新" if info.get("ok") else "检查更新失败（见集成页说明）"), 6000)
 
     # ---------- 自动更新：下载 -> 解压 -> 换文件 -> 重启 ----------
+    def _pick_patch_asset(self, info):
+        """有「从当前版本升级」的增量包就返回它，否则 None。
+
+        ★ v9.22.6：用户要「任何电脑上安装都特别特别快」。整包 236MB 里
+          `_internal/PyQt6` 占 532MB（未压缩）几乎永不变化，每版真正变的只有
+          AIWorkbench.exe（PyInstaller 把 PYZ 编进 exe）和 `_internal/app/webui/**`。
+          增量包只要几 MB，下载 70s → 几秒。
+        判定条件（缺一不可，任何一条不满足就走整包，绝不冒险）：
+          1. 本机安装目录有 manifest.json 且版本号 == 当前运行版本
+             （保证「本地是干净的原版 vX」，diff 出来的变化文件才成立）；
+          2. Release 里确实有 `AIWorkbench_patch_vX_to_vY.zip`；
+          3. 附件大小合理（> 1KB 且 < 40MB，明显不是整包）。
+        """
+        try:
+            from app import incremental as inc
+            lm = inc.local_manifest()
+            base = str((lm or {}).get("version") or "")
+            if not base or base != ver.VERSION:
+                return None
+            pa = updater.pick_patch_asset(info, base, info.get("tag"))
+            if not pa:
+                return None
+            size = int(pa.get("size") or 0)
+            if size and not (1024 <= size <= 40 * 1048576):
+                return None
+            return pa
+        except Exception:
+            return None
+
     def _update_apply(self):
-        """下载新版本压缩包并自动应用。UI 线程只管弹进度，下载在后台线程。"""
+        """下载新版本并自动应用。UI 线程只管弹进度，下载在后台线程。"""
         info = getattr(self, "_pending_update", None)
         if not (info and info.get("ok") and info.get("has_update")):
             msg = "当前没有待安装的更新。先点「检查更新」看看。"
@@ -6874,7 +6959,9 @@ class MainWindow(QMainWindow):
             else:
                 self._info(msg, "自动更新")
             return
-        asset = updater.pick_asset(info, prefer=(".zip", ".exe"))
+        full = updater.pick_asset(info, prefer=(".zip", ".exe"))
+        patch = self._pick_patch_asset(info) if full else None
+        asset, is_patch = (patch, True) if patch else (full, False)
         if not asset:
             msg = f"这个 Release 没有附件，请到发布页手动下载：\n{info.get('html_url')}"
             if getattr(self, "_web_engine", False):
@@ -6884,11 +6971,13 @@ class MainWindow(QMainWindow):
             return
         import tempfile as _tf
         dest = os.path.join(_tf.gettempdir(), "AIWorkbench_update_" + asset["name"])
+        fallback = full if (is_patch and full) else None
         if getattr(self, "_web_engine", False):
             # ★ v9.22.3：Web 版真正跑下载+安装，进度通过 update_progress 事件推前端
-            #   （about.js 已支持「一行人话 + 进度条」渲染，无需 Qt 对话框）。
-            threading.Thread(target=self._web_update_worker, args=(asset, dest),
-                            daemon=True, name="awb-web-update").start()
+            #   （app.js / about.js 都监听，外壳那个任何页面可见）。
+            threading.Thread(target=self._web_update_worker,
+                             args=(asset, dest, is_patch, fallback),
+                             daemon=True, name="awb-web-update").start()
             return
         # ---- Qt 模式：原有 QProgressDialog 流程 ----
         from PyQt6.QtWidgets import QProgressDialog
@@ -6909,8 +6998,23 @@ class MainWindow(QMainWindow):
                 updater.download(asset["url"], dest,
                                  progress=lambda d, t: self._update_progress.emit(d, t),
                                  on_stage=lambda s, det: self._update_stage.emit(s, det))
-                self._update_done.emit(dest)
+                if is_patch and not updater.verify_patch_zip(dest):
+                    raise RuntimeError("增量包不完整")
             except Exception as e:
+                # 增量包失败 → 静默退回整包，用户只会看到进度重新开始，不会更新失败
+                if fallback:
+                    try:
+                        d2 = os.path.join(_tf.gettempdir(),
+                                          "AIWorkbench_update_" + fallback["name"])
+                        self._update_stage.emit("downloading", "增量包不可用，改为下载完整安装包…")
+                        updater.download(fallback["url"], d2,
+                                         progress=lambda d, t: self._update_progress.emit(d, t),
+                                         on_stage=lambda s, det: self._update_stage.emit(s, det))
+                        self._update_done.emit(d2)
+                        return
+                    except Exception as e2:
+                        self._update_fail.emit(updater.human_error(e2))
+                        return
                 # ★ v9.22.2：交给 updater.human_error 翻译成人话，
                 #   不要在界面上出现「RuntimeError: ...」这种技术栈信息。
                 self._update_fail.emit(updater.human_error(e))
@@ -6938,8 +7042,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _web_update_worker(self, asset, dest):
-        """Web 模式下在后台线程跑 下载→安装，进度逐段推前端；结束退出本进程交 PowerShell 重启。"""
+    def _web_update_worker(self, asset, dest, is_patch=False, fallback=None):
+        """Web 模式下在后台线程跑 下载→安装，进度逐段推前端；结束退出本进程交 PowerShell 重启。
+
+        ★ v9.22.6：`is_patch=True` 时下的是增量包（几 MB）。增量包任何环节出问题
+          （下载不全 / 结构不对）都**静默退回整包**继续更新 —— 对用户只是进度重新
+          从 0 开始，绝不会出现「更新失败，你自己去下载吧」。
+        """
+        import tempfile as _tf
         import threading  # noqa: F401（保持与 Qt 分支一致）
         cur = {"stage": "downloading"}
 
@@ -6950,9 +7060,28 @@ class MainWindow(QMainWindow):
         def _on_progress(d, t):
             self._web_push_update_progress(cur["stage"], d, t)
 
+        def _fetch(a, d, patch):
+            cur["stage"] = "downloading"
+            updater.download(a["url"], d, progress=_on_progress, on_stage=_on_stage)
+            if patch and not updater.verify_patch_zip(d):
+                raise RuntimeError("增量包不完整")
+            return d
+
         try:
-            updater.download(asset["url"], dest,
-                             progress=_on_progress, on_stage=_on_stage)
+            try:
+                _fetch(asset, dest, is_patch)
+            except Exception as e:
+                if not fallback:
+                    raise
+                _log = getattr(updater, "_log", None)
+                if callable(_log):
+                    _log("增量包不可用，改下整包：%s: %s" % (type(e).__name__, e))
+                self._web_push_update_progress(
+                    "downloading", None, None,
+                    "增量包用不了，正在改为下载完整安装包（会久一点）…")
+                dest = os.path.join(_tf.gettempdir(),
+                                    "AIWorkbench_update_" + fallback["name"])
+                _fetch(fallback, dest, False)
             self._web_push_update_progress("extracting", None, None, "正在解压更新包…")
             cur["stage"] = "installing"
             updater.install_package(dest,
