@@ -209,13 +209,29 @@ class Recorder:
         return max(0.0, time.time() - self._started)
 
     @property
+    def recorded_seconds(self):
+        """已录到的音频**实际**时长（按帧数算）。
+
+        seconds 是墙钟时间，设备缓冲/丢帧时会和真实音频长度有偏差；
+        滑动窗口要靠它算「窗口起点」和「已确认前缀」，用帧数更准。
+        """
+        with self._lock:
+            sizes = [len(f) for f in self._frames]
+        return sum(sizes) / float(max(1, self.rate * self.channels * 2))
+
+    @property
     def recording(self):
         """是否正在录音（录音线程还活着且没有被要求停止）。"""
         t = self._thread
         return bool(t is not None and t.is_alive() and not self._stop_flag.is_set())
 
-    def snapshot_wav(self, prefix="snap"):
+    def snapshot_wav(self, prefix="snap", window_seconds=0):
         """把"当前已经录到的音频"立刻写成一份完整可解码的 WAV，返回路径。
+
+        window_seconds > 0 时**只导出最近 N 秒**：按本机采样率的 16bit PCM
+        字节数计算（默认 16k 单声道 = 32000 B/s）。这是 v9.22.11 去卡顿的
+        关键 —— 流式识别每轮只吃固定长度的尾巴，单轮计算量不随录音总长增长。
+        window_seconds <= 0 时行为与旧版完全一致（导出整段）。
 
         与 stop() 的区别：不停录音、不关闭设备，只取一个快照，
         供"边说边出字"的流式识别每轮拿一份完整文件去请求 ASR。
@@ -230,7 +246,31 @@ class Recorder:
             rate = self.rate
         if not frames:
             raise ASRError("还没有录到音频")
-        data = b"".join(frames)
+        try:
+            window = float(window_seconds or 0.0)
+        except (TypeError, ValueError):
+            window = 0.0
+        frame_bytes = max(1, channels * 2)
+        if window > 0:
+            keep = int(rate * channels * 2 * window)
+            keep = (keep // frame_bytes) * frame_bytes
+            if keep > 0:
+                # 只从尾部取够 N 秒的块，避免把整段音频都 join 一遍
+                picked = []
+                total = 0
+                for chunk in reversed(frames):
+                    picked.append(chunk)
+                    total += len(chunk)
+                    if total >= keep:
+                        break
+                picked.reverse()
+                data = b"".join(picked)
+                if len(data) > keep:
+                    data = data[len(data) - keep:]
+            else:
+                data = b"".join(frames)
+        else:
+            data = b"".join(frames)
         if not data:
             raise ASRError("还没有录到音频")
         path = new_wav_path(prefix)
@@ -310,34 +350,44 @@ def _rms(data):
 
 # ------------------------------------------------------------------ 流式识别
 class StreamingSession:
-    """边说边出字：后台线程周期性把"已录到的音频"整段送去识别。
+    """边说边出字：滑动窗口 + 已确认前缀（v9.22.11 去卡顿版）。
 
-    现有三家后端（智谱 / 硅基流动 / 百炼）都只有同步 HTTP 接口，没有真正的
-    流式 WebSocket，所以这里用「滚动快照 + 全量重识别」逼近流式体验：
+    旧版每轮把「整段已录音频」全量重跑一次离线识别，音频越长单轮越慢，
+    CPU 被占满 → 界面卡顿。现在改成：
 
-      - 每轮调用 recorder.snapshot_wav() 拿一份完整 WAV（不停录音）；
-      - 音频没有明显增长（< 0.4s）就跳过这一轮，避免白发请求；
-      - 识别成功且有文本就 on_text(text)，界面逐次**整段替换**；
-      - 说完由 VoiceInput.finish() 再做一次整段识别作为最终结果。
+      - 每轮只取**最近 window 秒**（默认 8s）的快照去识别，
+        单轮计算量与录音总长无关，恒定；
+      - 更早的音频按静音边界（预览文本里由停顿/语义规则生成的标点）
+        累计成「已确认前缀」，on_text 发「前缀 + 本轮预览文本」；
+      - 每轮前检查 _busy，绝不并发识别（上一轮没完就跳过）；
+      - 录音超过 max_window（默认 45s）就停增量，交给 finish() 整段识别定稿。
 
-    线程模型：整个循环（含 HTTP 请求与写盘）都在守护线程里跑，
-    绝不在 UI 线程做网络/磁盘操作；回调由调用方（Qt 信号）自行跨线程投递。
+    现有后端（本机 Paraformer / 智谱 / 硅基流动 / 百炼）都只有同步接口，
+    没有真正的流式 WebSocket，所以用滑动窗口逼近流式体验；
+    说完由 VoiceInput.finish() 再做一次整段识别作为最终结果。
+
+    线程模型：整个循环（含网络请求、模型计算与写盘）都在守护线程里跑，
+    绝不在 UI 线程做重活；回调由调用方（Qt 信号）自行跨线程投递。
     同一时刻最多只有一个识别请求在跑——上一轮没回来就等它，
     不排队、不堆积请求。
     """
 
     MIN_GROWTH = 0.4          # 音频至少增长这么多秒才值得再识别一次
     REQUEST_TIMEOUT = 12      # 单轮识别超时（秒）——慢就慢，不能卡死循环
+    DEFAULT_MAX_WINDOW = 45.0  # 默认超过 45s 就停增量，交给整段识别定稿
 
     def __init__(self, recorder, keys_provider, prefer="auto",
-                 on_text=None, on_error=None, interval=1.6, max_window=0):
+                 on_text=None, on_error=None, interval=1.6, max_window=0,
+                 window=8.0):
         """recorder：Recorder（或同接口对象，需有 snapshot_wav()/seconds）。
         keys_provider：无参函数，返回 {"zhipu": "...", ...}（每轮都重新取，改 Key 即时生效）。
-        on_text：识别到文本时的回调（str）。
+        on_text：识别到文本时的回调（str）——已是「已确认前缀 + 本轮预览」。
         on_error：出错回调（str），整个会话最多回调一次，避免刷屏。
-        interval：音频 <20s 时的识别间隔（秒）。
-        max_window：>0 时，录音超过这么多秒就停止增量识别（超长音频每轮都变慢），
-            交给 finish() 的整段识别定稿；0 表示不限制。
+        interval：音频 <8s 时的识别间隔上限（秒，默认 1.6，实际压到 1.2）。
+        max_window：>0 时录音超过这么多秒就停止增量识别；0 = 用默认 45s；
+            <0 = 不限制（旧版语义，仅调试用）。
+        window：滑动窗口长度（秒，默认 8.0）。★ 新增参数，只能追加在最后，
+            旧调用（旧参数顺序 / 默认值 / 含义）完全不受影响。
         """
         self.recorder = recorder
         self._keys_provider = keys_provider or (lambda: {})
@@ -345,13 +395,30 @@ class StreamingSession:
         self.on_text = on_text
         self.on_error = on_error
         self.base_interval = float(interval or 1.6)
-        self.max_window = float(max_window or 0)
+        try:
+            given = float(max_window or 0)
+        except (TypeError, ValueError):
+            given = 0.0
+        self.max_window = self.DEFAULT_MAX_WINDOW if given == 0 else given
+        try:
+            self.window = float(window or 8.0)
+        except (TypeError, ValueError):
+            self.window = 8.0
+        self.window = max(2.0, min(30.0, self.window))
         self._stop_flag = threading.Event()
         self._thread = None
         self._busy = False            # 是否有一轮识别请求在跑
-        self._last_duration = 0.0     # 上一轮送去识别的音频时长
+        self._last_duration = 0.0     # 上一轮识别时录音的**总**时长
         self._last_text = ""          # 上一次回调的文本（去重）
         self._error_reported = False
+        # ---- 滑动窗口 / 已确认前缀状态 ----
+        self._confirmed_prefix = ""   # 已经滚出窗口的音频对应的文字
+        self._committed_end = 0.0     # 已确认前缀覆盖到的音频时间（秒）
+        self._prev_start = 0.0        # 上一轮窗口起点（秒，绝对时间）
+        self._prev_end = 0.0          # 上一轮窗口终点（秒，绝对时间）
+        self._prev_text = ""          # 上一轮窗口识别出的文本
+        self._prev_commit_index = 0   # 上一轮文本里「已经进前缀」的字符数
+                                      # （窗口是重叠的，绝不重复提交同一段字）
 
     # ---- 生命周期 ----
     def start(self):
@@ -417,23 +484,33 @@ class StreamingSession:
             self._sleep(self._interval_for(self._last_duration) if attempted else 0.25)
 
     def _recognize_once(self):
-        """做一轮：快照 -> 判断增长 -> 识别 -> 回调。返回是否真的发了请求。"""
+        """做一轮：尾部窗口快照 -> 增长判断 -> 累计前缀 -> 识别 -> 回调。
+
+        返回是否真的发了请求。★ 每轮识别的音频恒为最近 window 秒（不够则
+        取全部），单轮计算量与录音总长无关 —— 这是「根治卡顿」的核心。
+        """
+        if self._busy:                 # ★ 绝不并发识别
+            return False
+        path = None
         try:
-            path = self.recorder.snapshot_wav()
+            path = self._snapshot_window()
         except ASRError:
             # 刚开始录音、还没攒到音频：正常情况，等下一轮，不算错误
             return False
         try:
-            dur = wav_duration(path)
-            if dur <= 0:
-                dur = float(getattr(self.recorder, "seconds", 0.0) or 0.0)
-            if dur - self._last_duration < self.MIN_GROWTH:
+            win_dur = wav_duration(path)
+            if win_dur <= 0:
+                return False
+            total = self._total_seconds(win_dur)
+            if total - self._last_duration < self.MIN_GROWTH:
                 return False            # 没有新内容，跳过这一轮
-            if self.max_window > 0 and dur > self.max_window:
+            if self.max_window > 0 and total > self.max_window:
                 # 太长了：增量识别的性价比已经很低，收工等整段识别
                 self._stop_flag.set()
                 return False
-            self._last_duration = dur
+            win_start = max(0.0, total - win_dur)
+            self._commit_prefix(win_start)
+            self._last_duration = total
             self._busy = True
             try:
                 text, _backend = transcribe(
@@ -443,15 +520,142 @@ class StreamingSession:
         finally:
             self._cleanup(path)
 
-        text = (text or "").strip()
-        if text and text != self._last_text and not self._stop_flag.is_set():
-            self._last_text = text
+        preview = (text or "").strip()
+        self._prev_start = win_start
+        self._prev_end = total
+        self._prev_text = preview
+        self._prev_commit_index = 0   # 新窗口还没提交过任何字
+        combined = self._confirmed_prefix + preview
+        if combined and combined != self._last_text and not self._stop_flag.is_set():
+            self._last_text = combined
             try:
                 if self.on_text is not None:
-                    self.on_text(text)
+                    self.on_text(combined)
             except Exception as e:      # 回调异常也不能打断循环
                 self._report_error(e)
         return True
+
+    # ---- 滑动窗口：只认最近 window 秒 ----
+    def _snapshot_window(self):
+        """取最近 window 秒的快照。
+
+        优先用 Recorder.snapshot_wav(prefix, window_seconds) 直接导出尾巴；
+        若调用方给的是旧接口 / 测试桩（snapshot_wav 只收 0~1 个参数），
+        就退回整段快照，再复用 to_16k_mono() 就地裁剪成同样长度。
+        """
+        try:
+            return self.recorder.snapshot_wav("snap", self.window)
+        except TypeError:
+            path = self.recorder.snapshot_wav("snap")
+            self._crop_in_place(path, self.window)
+            return path
+
+    @staticmethod
+    def _crop_in_place(path, window_seconds):
+        """旧接口兜底：转成 16k 单声道后只留最后 N 秒，原地覆盖快照文件。"""
+        wav16 = to_16k_mono(path)
+        try:
+            with wave.open(wav16, "rb") as w:
+                data = w.readframes(w.getnframes())
+            keep = int(RATE * 2 * max(0.1, float(window_seconds or 8.0)))
+            keep -= keep % 2
+            if 0 < keep < len(data):
+                data = data[-keep:]
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(RATE)
+                w.writeframes(data)
+        finally:
+            if wav16 != path:
+                try:
+                    if os.path.exists(wav16):
+                        os.remove(wav16)
+                except OSError:
+                    pass
+
+    def _total_seconds(self, win_dur):
+        """录音总时长（秒）。
+
+        优先用 Recorder.recorded_seconds（按帧数算出的真实音频长度），
+        没有该属性的旧实现 / 测试桩退回墙钟 seconds，最后再退回整段快照实测。
+        """
+        try:
+            total = float(getattr(self.recorder, "recorded_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            total = 0.0
+        if total <= 0:
+            try:
+                total = float(getattr(self.recorder, "seconds", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                total = 0.0
+        if total <= 0:
+            # 兼容没有 seconds 的测试桩：量一次整段快照（只写盘，不跑模型）
+            p = None
+            try:
+                try:
+                    p = self.recorder.snapshot_wav("dur")
+                except TypeError:
+                    p = self.recorder.snapshot_wav()
+                total = wav_duration(p)
+            except Exception:
+                total = 0.0
+            finally:
+                StreamingSession._cleanup(p)
+        return max(win_dur, total)
+
+    # ---- 已确认前缀 ----
+    @property
+    def confirmed_prefix(self):
+        """已经滚出窗口、被累计下来的文字（测试 / 调试可读）。"""
+        return self._confirmed_prefix
+
+    def _commit_prefix(self, win_start):
+        """把已经滚出本轮窗口的音频累计成「已确认前缀」。
+
+        切点按上一轮文本里的**标点位置**就近吸附 —— 那些标点正是
+        asr_punct.restore() 按停顿 / 语义（静音边界）插进去的，
+        因此不会把一个词劈成两半。前缀覆盖到 win_start，本轮窗口
+        从 win_start 开始，两者不重不漏。
+
+        ★ 窗口是重叠的：必须只提交「上一次已提交位置 → 本次该提交位置」
+          之间的新字，否则同一句话会被反复追加进前缀（踩过这个坑）。
+        """
+        if win_start <= self._committed_end + 0.05:
+            return
+        prev = self._prev_text
+        span = self._prev_end - self._prev_start
+        if not prev or span <= 0:
+            # 还没有可确认的文本：宁可让预览暂时重复，也不能吞掉已说过的话
+            return
+        target = min(win_start, self._prev_end)
+        frac = max(0.0, min(1.0, (target - self._prev_start) / span))
+        k_hi = int(round(len(prev) * frac))
+        k_hi = max(0, min(len(prev), self._snap_to_boundary(prev, k_hi)))
+        k_lo = max(0, min(len(prev), self._prev_commit_index))
+        if k_hi > k_lo:
+            self._confirmed_prefix += prev[k_lo:k_hi]
+        self._prev_commit_index = k_hi
+        self._committed_end = max(self._committed_end, target)
+
+    @staticmethod
+    def _snap_to_boundary(text, k):
+        """把切点吸附到最近的标点之后（标点即静音边界）；没有就原样返回。"""
+        from . import asr_punct
+        if not text:
+            return k
+        tolerance = max(2, len(text) // 8)
+        best = None
+        for i, ch in enumerate(text):
+            if ch not in asr_punct.PUNCT_CHARS:
+                continue
+            pos = i + 1                  # 标点之后才是干净的断点
+            if pos >= len(text):
+                continue
+            dist = abs(pos - k)
+            if dist <= tolerance and (best is None or dist < best[0]):
+                best = (dist, pos)
+        return best[1] if best else k
 
     # ---- 小工具 ----
     def _keys(self):
@@ -471,12 +675,17 @@ class StreamingSession:
         return bool(flag)
 
     def _interval_for(self, duration):
-        """自适应间隔：音频越长，请求越慢，间隔就放大，避免越跑越堵。"""
+        """自适应间隔（v9.22.11）：短句跟得紧，长句让开 CPU。
+
+        <8s 用 1.2s、8~20s 用 2.5s、>20s 用 4s。旧版要等到 >20s 才
+        升到 3s，前 20 秒每 1.6s 就全量重识别一次，正是卡顿的起点。
+        caller 显式传了更短的 interval 时仍然尊重它。
+        """
+        if duration < 8.0:
+            return max(0.5, min(float(self.base_interval or 1.2), 1.2))
         if duration < 20.0:
-            return max(0.5, self.base_interval)
-        if duration < 60.0:
-            return 3.0
-        return 5.0
+            return 2.5
+        return 4.0
 
     def _sleep(self, seconds):
         """可被 stop() 立刻打断的睡眠（分片等待，最长 0.2s 醒一次）。"""
@@ -537,13 +746,15 @@ def _asr_local(path, keys, timeout):
     模型可能还没下载完（首次使用），这里**等**它 —— 这个函数只会在后台线程里
     被调用（recognize_file_async / StreamingSession），等多久都不会卡界面。
     """
-    from . import asr_local
+    from . import asr_local, asr_punct
     if not asr_local.installed():
         raise ASRError("本机没有离线语音引擎组件")
     if not asr_local.ready():
         if not asr_local.ensure(timeout=min(300, max(30, timeout * 3))):
             raise ASRError(asr_local.status_text())
-    return asr_local.recognize(path)
+    # Paraformer 输出不带标点：用真实停顿位置把「，」「。」补回去
+    text, pauses = asr_local.recognize_with_pauses(path)
+    return asr_punct.restore(text, pauses)
 
 
 def _asr_zhipu(path, keys, timeout):
@@ -693,7 +904,13 @@ def transcribe(path, keys, prefer="auto", timeout=90):
         try:
             text = fn(wav16, keys, timeout)
             if text and text.strip():
-                return text.strip(), label
+                final = text.strip()
+                # ★ v9.22.11 统一兜底：一个标点都没有时补逗号/句号。
+                #   云端后端自带标点的文本一个字符都不动，别把人家的结果改坏。
+                from . import asr_punct
+                if not asr_punct.has_punctuation(final):
+                    final = asr_punct.restore(final)
+                return final, label
             errors.append(f"{label}：返回空结果")
         except Exception as e:
             errors.append(f"{label}：{e}")

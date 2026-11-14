@@ -36,7 +36,8 @@ sherpa-onnx + 中文 Paraformer 小模型（int8 量化）
     ready()              引擎在 + 模型齐 → 真的能识别
     status_text()        给界面用的一句人话（含下载进度）
     ensure_async(cb)     后台准备模型（可重复调用，只会跑一次）
-    recognize(path)      WAV(16k/单声道/16bit) → 文本
+    recognize(path)              WAV(16k/单声道/16bit) → 文本（签名不变）
+    recognize_with_pauses(path)  WAV → (文本, 停顿点列表)，供自动加标点
 """
 import os
 import sys
@@ -48,8 +49,8 @@ import threading
 
 __all__ = [
     "MODEL_NAME", "MODEL_BYTES", "installed", "ready", "status_text",
-    "progress", "ensure_async", "ensure", "recognize", "model_dir",
-    "reset_cache", "warm_async",
+    "progress", "ensure_async", "ensure", "recognize",
+    "recognize_with_pauses", "model_dir", "reset_cache", "warm_async",
 ]
 
 MODEL_NAME = "paraformer-zh-small"
@@ -342,11 +343,15 @@ def warm_async():
 def _make_recognizer():
     import sherpa_onnx
     d = model_dir()
-    n = os.cpu_count() or 4
+    n = os.cpu_count() or 2
+    # ★ v9.22.11：离线识别每 1.2~4s 就要跑一轮，线程开多了会把 UI 线程的
+    #   CPU 抢光（用户反馈「连续说话时略微卡顿」）。实测 2 线程足够跑满
+    #   RTF≈0.04 的小模型，剩下的核全部留给 Qt 主线程。
+    num_threads = 1 if n <= 2 else 2
     return sherpa_onnx.OfflineRecognizer.from_paraformer(
         paraformer=os.path.join(d, "model.int8.onnx"),
         tokens=os.path.join(d, "tokens.txt"),
-        num_threads=max(1, min(4, n // 2)),
+        num_threads=num_threads,
         sample_rate=16000,
         feature_dim=80,
         decoding_method="greedy_search",
@@ -390,18 +395,49 @@ def _read_wav_16k(path):
     return [s / 32768.0 for s in a]
 
 
-def recognize(path):
-    """识别一段 WAV，返回文本（可能为空串）。模型没准备好时抛 RuntimeError。"""
+def _detect_pauses(samples):
+    """按 20ms 帧算 RMS，找出 >300ms 的静音段。
+
+    复用 asr_punct.detect_pause_ratios() 这个纯函数，避免两处各写一份
+    能量检测。返回 [(段中心 / 总时长, 停顿秒数), ...]，可直接喂给
+    asr_punct.restore(text, pauses)：普通停顿插「，」，长停顿插「。」。
+    """
+    from . import asr_punct
+    out = []
+    for ratio, seconds, _is_long in asr_punct.detect_pause_ratios(samples):
+        out.append((ratio, seconds))
+    return out
+
+
+def recognize_with_pauses(path):
+    """识别一段 WAV，返回 (文本, 停顿点列表)。
+
+    ★ 模型仍只通过 _get_recognizer() 取那一个常驻实例，绝不重复加载；
+      停顿检测是纯 Python 的 RMS 计算，开销远小于模型推理。
+    模型没准备好时抛 RuntimeError（与 recognize() 一致）。
+    """
     if not ready():
         raise RuntimeError(status_text())
     samples = _read_wav_16k(path)
     if not samples:
-        return ""
+        return "", []
+    pauses = _detect_pauses(samples)
     rec = _get_recognizer()
     stream = rec.create_stream()
     stream.accept_waveform(16000, samples)
     rec.decode_stream(stream)
     try:
-        return (stream.result.text or "").strip()
+        text = (stream.result.text or "").strip()
     except Exception:
-        return ""
+        text = ""
+    return text, pauses
+
+
+def recognize(path):
+    """识别一段 WAV，返回文本（可能为空串）。
+
+    签名与返回类型保持向后兼容：内部转调 recognize_with_pauses()，
+    丢掉停顿信息。模型没准备好时抛 RuntimeError。
+    """
+    text, _pauses = recognize_with_pauses(path)
+    return text

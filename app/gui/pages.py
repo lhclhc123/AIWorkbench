@@ -81,13 +81,15 @@ NAV_PRIMARY = ("chat", "assistant", "tools", "settings")
 #     （main_window._open_page 用 PAGES 的下标当 stack 下标），
 #     删一项会把后面所有页面全部错位。所以这里只是"不画那一格"。
 # ---------------------------------------------------------------------------
-NAV_SKIP = ("tools", "team")   # 不画格子的页面
+NAV_SKIP = ("tools", "team", "browser")   # 不画格子的页面（★ v9.22.11 起浏览器格子移除）
 
 # 「对话」是主战场，单独占第一行；其余按这个顺序 3 列排布。
-# 9 项正好排满 3 行（3 列 × 3 行），不用再多一行半。
-NAV_CHIPS = ("assistant", "skills", "browser",
-             "tasks", "bg", "memory",
-             "integrations", "settings", "about")
+# ★ v9.22.11：按用户要求「去掉浏览器的那个按键」，`browser` 从侧栏格子里移除，
+#   改成主界面右边缘的窄竖条入口（见 main_window._build_shell 的 SideDock）。
+#   PAGES / NAV_TOGGLES 仍保留 browser 项，老代码与回归用例的下标约定不变。
+NAV_CHIPS = ("assistant", "skills", "tasks",
+             "bg", "memory", "integrations",
+             "settings", "about")
 
 NAV_COLS = 3
 

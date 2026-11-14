@@ -18,19 +18,30 @@ class LevelMeter(QWidget):
         super().__init__(parent)
         self.bars = bars
         self.values = [0.0] * bars
+        self._last_values = list(self.values)
         self.setFixedHeight(26)
         self.setMinimumWidth(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.active = False
 
     def push(self, v):
-        self.values.append(max(0.0, min(1.0, v)))
+        """推入一个新电平；整条波形没变化就不重绘（v9.22.11 去卡顿）。"""
+        try:
+            value = max(0.0, min(1.0, float(v or 0.0)))
+        except (TypeError, ValueError):
+            value = 0.0
+        self.values.append(value)
         while len(self.values) > self.bars:
             self.values.pop(0)
+        # 静音时 160ms 里推上来的全是 0，波形一点没变，没必要触发 paintEvent
+        if self._last_values == self.values:
+            return
+        self._last_values = list(self.values)
         self.update()
 
     def reset(self):
         self.values = [0.0] * self.bars
+        self._last_values = list(self.values)
         self.update()
 
     def paintEvent(self, event):
@@ -66,6 +77,9 @@ class VoiceInput(QWidget):
     status = pyqtSignal(str)           # 状态提示
     failed = pyqtSignal(str)           # 出错
     model_progress = pyqtSignal(int, str)   # 离线模型下载进度（百分比, 一句话）
+    # 内部信号：后台识别线程 → UI 线程。QTimer 不是线程安全的，必须先跨线程
+    # 排队回主线程，再做 200ms 节流，否则 start() 会在工作线程里被误调用。
+    _stream_text = pyqtSignal(str)
 
     def __init__(self, keys_provider=None, settings_provider=None, parent=None):
         super().__init__(parent)
@@ -79,6 +93,14 @@ class VoiceInput(QWidget):
         self._last_model_text = ""
         # 下载线程 → 界面：信号是跨线程排队的，安全
         self.model_progress.connect(self._on_model_progress)
+        # 增量识别线程 → 界面：先排队回 UI 线程，再节流
+        self._stream_text.connect(self._on_stream_text)
+        self._pending_partial = None
+        self._stream_active = False
+        self._partial_timer = QTimer(self)
+        self._partial_timer.setSingleShot(True)
+        self._partial_timer.setInterval(200)
+        self._partial_timer.timeout.connect(self._flush_partial)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -101,7 +123,8 @@ class VoiceInput(QWidget):
         row.addWidget(self.hint)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(90)
+        # v9.22.11：90ms → 160ms，重绘频率砍掉四成（配合 LevelMeter 跳过无变化帧）
+        self._timer.setInterval(160)
         self._timer.timeout.connect(self._tick)
 
     # ------------------------------------------------------------------
@@ -171,7 +194,7 @@ class VoiceInput(QWidget):
         if not text or text == self._last_model_text:
             return
         self._last_model_text = text
-        # 录音中 _tick 每 90ms 会重写 hint，别跟它抢；只走状态栏
+        # 录音中 _tick 每 160ms 会重写 hint，别跟它抢；只走状态栏
         if self.recorder is None:
             self.hint.setText(text)
         self.status.emit(text)
@@ -179,17 +202,41 @@ class VoiceInput(QWidget):
     def _start_streaming(self, settings):
         """开一路后台增量识别，让文字边说边出（失败不影响正常录音/整段识别）。"""
         self._stream_error = None
+        self._stream_active = False
         try:
             self.session = asr_mod.StreamingSession(
                 self.recorder,
                 self._keys_provider,
                 (settings or {}).get("asr_prefer", "auto"),
-                on_text=self.partial.emit,
+                on_text=self._stream_text.emit,
                 on_error=self._on_stream_error)
             self.session.start()
+            self._stream_active = True
         except Exception as e:
             self.session = None
+            self._stream_active = False
             self._on_stream_error(e)
+
+    def _on_stream_text(self, text):
+        """增量识别线程来的预览（已跨线程排队回 UI）：只缓存最后一条。
+
+        200ms 内最多刷一次输入框 —— 之前每轮识别结果都直接 emit，
+        长句时 WebUI 的 JS 会被高频 voice_partial 事件拖慢。
+        finish()/cancel() 之后排队中的旧预览一律丢弃，别回头覆盖定稿。
+        """
+        if not self._stream_active:
+            return
+        self._pending_partial = str(text or "")
+        if not self._partial_timer.isActive():
+            self._partial_timer.start()
+
+    def _flush_partial(self):
+        """把缓存的最后一条预览真正发出去。"""
+        if self._pending_partial is None:
+            return
+        text = self._pending_partial
+        self._pending_partial = None
+        self.partial.emit(text)
 
     def _on_stream_error(self, msg):
         """增量识别出错：不打扰用户（结束时仍会整段识别），只记一次。"""
@@ -201,6 +248,11 @@ class VoiceInput(QWidget):
         """停掉增量识别。stop() 在等网络时会立刻返回，绝不卡住 UI 线程。"""
         s = self.session
         self.session = None
+        self._stream_active = False
+        # 收尾时把节流缓存里最后一条预览补发出去，别丢字；
+        # 之后 finish() 的整段结果会覆盖它（前端按整段替换，不会叠加）。
+        self._partial_timer.stop()
+        self._flush_partial()
         if s is not None:
             try:
                 s.stop()

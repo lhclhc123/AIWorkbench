@@ -122,12 +122,18 @@ def selftest():
         # ★ v9.22.10：离线语音识别（本机跑 sherpa-onnx，不依赖账户余额）。
         #   asr.py 里是函数内 import，但打包时必须真的被带上，所以列进自检。
         "asr_local",
+        # ★ v9.22.11：语音自动标点（纯函数）。asr.py / asr_local.py 里都是
+        #   函数内 import，漏了它在冻结版会用不了自动加逗号，所以列进自检。
+        "asr_punct",
     ]
     _GUI_MODS = [
         "chat_worker", "main_window", "pages", "panels",
         "startup_dialog", "voice_bar", "widgets",
         # ★ v9.22.4：补全（此前只在“未列入清单”里出现，没被自检断言）
         "browser_page", "team_bar",
+        # ★ v9.22.11：右侧面板文件预览（browser_page 顶层 import，
+        #   但列进自检才能确认冻结版真的带上了图片/Word/PPT/Excel 预览）。
+        "preview_pane",
     ]
     # 历史残留、产品代码零引用、因此不进包（列进来会让冻结版自检误报）。
     # 设置界面早就改成 pages.SettingsPage 了；app/gui/settings_dialog.py 只是早期对话框的遗留文件。

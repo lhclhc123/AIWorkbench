@@ -119,13 +119,17 @@ QComboBox {{
     border-radius: 10px; background: {t['input_bg']}; min-width: 220px;
 }}
 QComboBox:hover {{ border: 1px solid {t['accent']}; }}
+/* 下拉弹窗属于独立 popup 窗口：容器上的 padding 会在每次弹出/重绘时被
+   反复累加进 sizeHint，表现为白色空白框缓慢向下无限拉长。留白改由
+   ::item 承担并给固定 height，容器用 min/max-height 兜底尺寸。 */
 QComboBox QAbstractItemView {{
     border: 1px solid {t['input_border']}; border-radius: 8px;
     background: {t['input_bg']}; color: {t['text']};
     selection-background-color: {t['list_sel_bg']};
     selection-color: {t['list_sel_text']};
-    padding: 4px; outline: none;
+    min-height: 0; max-height: 320px; outline: none;
 }}
+QComboBox QAbstractItemView::item {{ padding: 4px 8px; height: 24px; }}
 
 QCheckBox {{ color: {t['text']}; spacing: 8px; padding: 5px 10px; font-size: 14px; }}
 QCheckBox:hover {{ color: {t['accent_text']}; }}
@@ -163,7 +167,7 @@ QScrollBar::handle:vertical {{
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 
 QStatusBar {{ background: {t['status_bg']}; color: {t['accent_text']}; }}
-QToolTip {{ color: {t['text']}; background: {t['panel_bg']}; border: 1px solid {t['border']}; }}
+QToolTip {{ color: {t['text']}; background: {t['chip_bg']}; border: 1px solid {t['border']}; }}
 
 /* ---------- v9：侧边导航 ---------- */
 /* ---------- v9.18.0（需求 10）：全局侧栏 + 几行导航小格子 ---------- */
@@ -334,19 +338,45 @@ QLabel#BrowserStatus {{
     padding: 3px 10px 5px 10px; background: transparent;
 }}
 QWidget#BrowserViewStack {{ background: {t['panel_bg']}; border: none; }}
-/* ⋯ 菜单（浏览器面板里的那个，顺带把全局弹出菜单统一成同一套观感） */
+/* ⋯ 菜单（浏览器面板里的那个，顺带把全局弹出菜单统一成同一套观感）
+   注意：弹出菜单是独立 popup 窗口，容器上设 padding / border-radius 会让 Qt
+   在每次弹出或重绘时把留白反复累加进 sizeHint，表现为白色空白框不断向下拉长。
+   因此容器只保留配色与边框，留白放到 ::item 上并配固定 height 兜底。 */
 QMenu {{
     background: {t['panel_bg']}; color: {t['text']};
-    border: 1px solid {t['border']}; border-radius: 10px; padding: 6px;
+    border: 1px solid {t['border']}; max-height: 420px;
 }}
-QMenu::item {{ padding: 6px 20px 6px 14px; border-radius: 7px; font-size: 12px; }}
+QMenu::item {{
+    padding: 6px 20px 6px 14px; height: 26px;
+    border-radius: 7px; font-size: 12px;
+}}
 QMenu::item:selected {{ background: {t['list_sel_bg']}; color: {t['list_sel_text']}; }}
-QMenu::separator {{ height: 1px; background: {t['border']}; margin: 5px 10px; }}
-QGroupBox {{
-    border: 1px solid {t['border']}; border-radius: 10px;
-    margin-top: 14px; padding-top: 10px; font-size: 13px; color: {t['text']};
+QMenu::separator {{ height: 1px; background: {t['border']}; margin: 2px 8px; }}
+/* v9.22.10 曾在此新增全局 QGroupBox / QGroupBox::title 规则，会给所有分组框
+   加边框、圆角与标题偏移，改变全站观感；v9.22.11 已移除，恢复 v9.22.9 及之前
+   的默认分组框外观。这里不再另行设置。 */
+
+/* ---------- v9.22.11：右侧停靠小按钮（可收起的竖条拉手） ---------- */
+/* 主窗口使用 SideDockHost / SideDockBtn / SideDockHint 这三个 objectName：
+   贴在窗口右侧边缘的一列窄按钮，用于唤出或收起右侧面板。颜色一律取自当前
+   主题 token，浅色与深色主题都可读；按钮用固定内边距，避免 popup 尺寸累加。 */
+QWidget#SideDockHost {{ background: transparent; }}
+QPushButton#SideDockBtn {{
+    background: transparent; color: {t['text']}; border: none;
+    border-radius: 8px; padding: 8px 5px; font-size: 12px;
+    text-align: center; min-width: 0;
 }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; color: {t['accent_text']}; }}
+QPushButton#SideDockBtn:hover {{
+    background: {t['nav_hover_bg']}; color: {t['accent_text']};
+}}
+QPushButton#SideDockBtn:pressed {{ background: {t['btn_hover_bg']}; }}
+QPushButton#SideDockBtn:checked {{
+    background: {t['nav_active_bg']}; color: {t['nav_active_text']};
+    font-weight: bold;
+}}
+QLabel#SideDockHint {{
+    color: {t['text_muted']}; font-size: 11px; background: transparent;
+}}
 """
 
 

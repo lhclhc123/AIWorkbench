@@ -36,18 +36,20 @@ v9.18.0 的第一版是「一条 QPushButton 横排 + 一个大 QLineEdit + 一�
 （见 webengine.py 的踩坑记录），所以主程序要在建 QApplication 前先 import 本模块
 （pages.py 顶部 import，而 pages 是在 main.py 建 app 之前被 import 的）。
 """
+import html as _html
 import os
 import re
 
 from PyQt6.QtCore import Qt, QUrl, QThread, QPoint, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
+    QSizePolicy, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .. import themes, webengine
 from ..icons import ic
+from .preview_pane import FilePreview, is_supported, supported_extensions
 
 # 命名 profile 的**强引用**：QWebEngineProfile 由 Python 侧持有更保险，
 # 否则极端情况下（页面还没建好就触发 GC）profile 被回收会连带丢 cookie。
@@ -68,6 +70,141 @@ SEARCH_URL = "https://www.bing.com/search?q={q}"
 # 标签页标题最多显示这么多字（超出省略号）；真正的省略由 QFontMetrics 按像素做，
 # 这里只是给"还没量到宽度"时的一个上限。
 TAB_TITLE_MAX_CHARS = 28
+
+# ---------------------------------------------------------------------------
+# 新标签页（内联、离线、深浅色自适应）
+#
+# 用户原话：「加号新建的每个界面都要有默认首页内容，别空白难看」。
+# 以前 new_tab(None) 什么都不 load，标签直接 about:blank 白屏。
+# 现在每个空标签都 setHtml(start_page_html(), QUrl("about:blank"))。
+#
+# 硬性约束：**不引用任何 CDN / 外链字体 / 外链图片**。样式、图标（纯 CSS
+# 圆角方块 + 站点首字）、脚本全部内联；外链只出现在 <a href> 和「提交搜索」
+# 的 JS 里 —— 也就是只有用户主动点击时才联网，页面渲染本身完全离线。
+# ---------------------------------------------------------------------------
+_QUICK_SITES = (
+    ("Bing", "https://www.bing.com"),
+    ("百度", "https://www.baidu.com"),
+    ("GitHub", "https://github.com"),
+    ("知乎", "https://www.zhihu.com"),
+    ("哔哩哔哩", "https://www.bilibili.com"),
+    ("腾讯文档", "https://docs.qq.com"),
+    ("CSDN", "https://www.csdn.net"),
+    ("微博", "https://weibo.com"),
+)
+
+_START_PAGE_HEAD = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>新标签页</title>
+<style>
+:root{
+  --bg:#f5f7fa; --card:#ffffff; --fg:#1f2328; --muted:#7a828b;
+  --line:#e3e6ea; --accent:#2196F3; --soft:#e3f2fd;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#1e2126; --card:#252a31; --fg:#e6edf3; --muted:#9aa4af;
+    --line:#363c45; --accent:#3b82f6; --soft:#22303f;
+  }
+}
+*{box-sizing:border-box;}
+html,body{height:100%;margin:0;}
+body{
+  background:var(--bg);color:var(--fg);
+  font-family:"Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+  display:flex;align-items:center;justify-content:center;padding:24px;
+}
+.wrap{width:100%;max-width:720px;text-align:center;}
+.brand{font-size:12px;letter-spacing:3px;color:var(--muted);margin:0 0 10px;}
+h1{font-size:26px;font-weight:600;margin:0 0 8px;color:var(--fg);}
+.sub{font-size:13px;color:var(--muted);margin:0 0 26px;}
+form{display:flex;gap:8px;margin:0 auto 28px;max-width:560px;}
+#q{
+  flex:1;min-width:0;padding:12px 16px;border-radius:999px;
+  border:1px solid var(--line);background:var(--card);color:var(--fg);
+  font-size:14px;outline:none;
+}
+#q:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--soft);}
+button{
+  padding:12px 22px;border-radius:999px;border:none;
+  background:var(--accent);color:#ffffff;font-size:14px;cursor:pointer;
+}
+button:hover{opacity:0.9;}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 26px;}
+.tile{
+  display:flex;flex-direction:column;align-items:center;gap:8px;
+  padding:14px 6px;border-radius:14px;border:1px solid var(--line);
+  background:var(--card);color:var(--fg);text-decoration:none;font-size:12px;
+}
+.tile:hover{border-color:var(--accent);background:var(--soft);}
+.ico{
+  width:38px;height:38px;border-radius:12px;background:var(--soft);
+  color:var(--accent);display:flex;align-items:center;justify-content:center;
+  font-size:16px;font-weight:600;
+}
+.hint{
+  border:1px dashed var(--line);border-radius:14px;padding:14px 16px;
+  background:var(--card);color:var(--muted);font-size:12px;line-height:1.9;
+}
+.hint b{color:var(--accent);font-weight:600;}
+.foot{margin-top:18px;font-size:11px;color:var(--muted);}
+@media (max-width:560px){
+  .tiles{grid-template-columns:repeat(2,1fr);}
+  h1{font-size:22px;}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<p class="brand">AI 工作台</p>
+<h1>AI 工作台 · 新标签页</h1>
+<p class="sub">在下面搜索，或点快捷入口开始；这个页面完全本地生成，离线也好看。</p>
+<form onsubmit="awbSearch(event)">
+<input id="q" type="text" placeholder="输入关键词，按回车用 Bing 搜索" autocomplete="off">
+<button type="submit">搜索</button>
+</form>
+<div class="tiles">
+"""
+
+_START_PAGE_TAIL = """</div>
+<div class="hint">
+<b>打开本地文件预览</b>：点工具行的「▤」按钮选一个文件，或直接把文件拖进这个面板。<br>
+<b>拖入文件即可预览</b>：图片、Word、PPT、Excel、PDF 和常见文本格式，全部在本地解析，不上传、不联网。
+</div>
+<p class="foot">搜索与快捷入口只在你点击时才联网；页面本身的样式与图标全部内联。</p>
+</div>
+<script>
+function awbSearch(ev){
+  if(ev && typeof ev.preventDefault === 'function'){ ev.preventDefault(); }
+  var box = document.getElementById('q');
+  var q = box ? box.value.trim() : '';
+  if(!q){ return; }
+  window.location.href = 'https://www.bing.com/search?q=' + encodeURIComponent(q);
+}
+</script>
+</body>
+</html>
+"""
+
+
+def start_page_html() -> str:
+    """生成完全内联、不联网的新标签页 HTML。
+
+    返回的字符串可以直接交给 ``QWebEngineView.setHtml(html, QUrl("about:blank"))``。
+    页面里没有 ``<link>`` / ``<img src="http...">`` / ``@import`` / 外链字体，
+    只有用户点击链接或提交搜索时才会联网。
+    """
+    tiles = "".join(
+        '<a class="tile" href="' + _html.escape(url, quote=True) + '">'
+        '<span class="ico">' + _html.escape(name[:1]) + '</span>'
+        '<span class="nm">' + _html.escape(name) + '</span></a>'
+        for name, url in _QUICK_SITES
+    )
+    return _START_PAGE_HEAD + tiles + _START_PAGE_TAIL
+
 
 # ---------------------------------------------------------------------------
 # 浏览器专用字形
@@ -96,6 +233,9 @@ _GLYPH = {
     "newtab": "+",          # +  新建标签
     "closetab": "\u2715",   # ✕  关闭标签
     "hide": "\u2715",       # ✕  收起面板
+    # ▤ U+25A4：文字呈现的单色几何字形，app/icons.py 里已被逐像素验过，
+    # 不走彩色 emoji（tests/probe_icons_v9180.py 会扫全部 UI 字面量）。
+    "preview": "\u25A4",    # ▤  打开文件预览
 }
 
 
@@ -140,6 +280,104 @@ def _is_private_host(host):
         except Exception:
             return False
     return False
+
+
+def _is_clean_addr(url: str) -> bool:
+    """这个 URL 能不能安全地显示进地址栏。
+
+    ``setHtml()`` 之后 ``view.url()`` 通常是 ``about:blank``，个别 Qt 版本
+    会给出一整段 ``data:text/html;...``（把整页 HTML 当成 URL）。这两种都
+    不能塞进地址栏：前者显示空占位符，后者会把一整页源码糊到界面上。
+    """
+    if not url or len(url) > 2048:
+        return False
+    low = url.lower()
+    return not low.startswith(("about:", "data:", "javascript:", "blob:"))
+
+
+class LocalStartPage(QWidget):
+    """内核不可用时的本地新标签页：纯 Qt 控件，绝不白屏。
+
+    只在 ``_make_view()`` 失败 / 内核未装时出现。它和 ``FilePreview`` 一样
+    是「非 WebEngine 标签」，BrowserPane 里所有会调 ``.page()/.url()`` 的
+    方法都通过 ``_web_view()`` 把它过滤掉。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BrowserStartPage")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.body = QTextBrowser()
+        self.body.setObjectName("BrowserStartBody")
+        self.body.setReadOnly(True)
+        self.body.setOpenExternalLinks(False)
+        self.body.setOpenLinks(False)
+        lay.addWidget(self.body, 1)
+        self.refresh_theme()
+
+    def title(self) -> str:
+        """标签标题（不是 QWidget.windowTitle，别混）。"""
+        return "新标签页"
+
+    def refresh_theme(self) -> None:
+        """主题切换后重新取色，深浅色都保持可读。"""
+        t = themes.tokens()
+        fg = t.get("text", "#1f2328")
+        muted = t.get("text_muted", "#7a828b")
+        line = t.get("border", "#e3e6ea")
+        card = t.get("card_bg", "#ffffff")
+        bg = t.get("panel_bg", "#ffffff")
+        accent = t.get("accent_text", "#0d47a1")
+        rows = "".join(
+            "<tr>"
+            f'<td style="padding:4px 16px 4px 0;color:{fg};font-weight:bold;">'
+            f'{_html.escape(name)}</td>'
+            f'<td style="padding:4px 0;color:{muted};">{_html.escape(url)}</td>'
+            "</tr>"
+            for name, url in _QUICK_SITES)
+        self.body.setHtml(
+            f'<div style="font-family:\'Microsoft YaHei\';color:{fg};padding:24px 28px;">'
+            f'<p style="font-size:12px;color:{muted};letter-spacing:2px;margin:0 0 8px;">'
+            f'AI 工作台</p>'
+            f'<h1 style="font-size:24px;color:{fg};margin:0 0 8px;">新标签页</h1>'
+            f'<p style="font-size:12px;color:{muted};margin:0 0 18px;">'
+            f'浏览器内核暂不可用，网页浏览已停用；本地文件预览完全可用。</p>'
+            f'<div style="border:1px solid {line};background:{card};'
+            f'border-radius:10px;padding:12px 16px;">'
+            f'<p style="font-size:13px;color:{accent};font-weight:bold;margin:0 0 8px;">'
+            f'常用站点（复制网址到地址栏打开）</p>'
+            f'<table border="0" cellspacing="0" cellpadding="0" '
+            f'style="font-size:12px;">{rows}</table>'
+            f'</div>'
+            f'<p style="font-size:12px;color:{muted};margin:16px 0 0;line-height:1.9;">'
+            f'打开本地文件预览：点工具行的「▤」按钮，或直接把文件拖进这个面板。<br>'
+            f'拖入文件即可预览：图片、Word、PPT、Excel、PDF 和常见文本格式，'
+            f'全部在本地解析，不上传。</p>'
+            f'</div>')
+        self.body.setStyleSheet(
+            f"QTextBrowser{{background:{bg};color:{fg};border:none;}}")
+
+
+def _web_view(view):
+    """把标签里的对象收敛成「能调 WebEngine API 的视图」或 ``None``。
+
+    ⚠ 这里必须用**鸭子类型能力检测**而不是 ``isinstance(QWebEngineView)``：
+    ``tests/probe_browser_ui_v92210.py`` 会用一个纯 Python 的 ``_FakeView``
+    替换标签视图来验证 ``analyze_current()``，它不是 QWebEngineView 却必须
+    继续走网页分析路径。反过来，``FilePreview`` / ``LocalStartPage`` 是
+    QWidget，没有 ``page()/url()/load()``，必须被挡在门外。
+    """
+    if view is None:
+        return None
+    if isinstance(view, (FilePreview, LocalStartPage)):
+        return None
+    for name in ("page", "url", "load", "back", "forward", "reload",
+                 "stop", "history"):
+        if not callable(getattr(view, name, None)):
+            return None
+    return view
 
 
 def normalize_url(text):
@@ -453,11 +691,16 @@ class BrowserPane(QWidget):
         self._build_toolbar(root)
         self._build_body(root)
         self._wire_chrome()
+        # 文件预览支持拖放：把本地文件拖进面板即可开一个预览标签。
+        self.setAcceptDrops(True)
 
         if self._available:
             self.new_tab(None, activate=True)
         else:
             self._show_engine_tip()
+            # 内核不可用也别白屏：再补一个纯 Qt 的本地新标签页。
+            # new_tab() 在不可用时会走 _new_local_start_tab()，不建 Chromium。
+            self.new_tab(None, activate=True)
 
     # ================= 外壳：标签条 / 工具行 / 内容区 =================
     def _build_tab_strip(self, root):
@@ -503,7 +746,13 @@ class BrowserPane(QWidget):
         self.btn_fwd = _ChromeButton(glyph("forward"), "前进", bar)
         self.btn_reload = _ChromeButton(glyph("reload"), "刷新", bar)
         self.btn_home = _ChromeButton(glyph("home"), "回到首页", bar)
-        for b in (self.btn_back, self.btn_fwd, self.btn_reload, self.btn_home):
+        # 「打开文件预览」：▤ 是单色几何字形，不是彩色 emoji；objectName 沿用
+        # _ChromeButton 默认的 "BrowserBtn"，跟其它工具按钮共用同一套 QSS。
+        self.btn_preview = _ChromeButton(
+            glyph("preview"),
+            "打开文件预览（图片 / Word / PPT / Excel / PDF / 文本）", bar)
+        for b in (self.btn_back, self.btn_fwd, self.btn_reload,
+                  self.btn_home, self.btn_preview):
             h.addWidget(b, 0)
 
         h.addSpacing(4)
@@ -600,6 +849,7 @@ class BrowserPane(QWidget):
         self.btn_fwd.clicked.connect(self.go_forward)
         self.btn_reload.clicked.connect(self.reload_or_stop)
         self.btn_home.clicked.connect(self.go_home)
+        self.btn_preview.clicked.connect(self._choose_preview_file)
         self.btn_new_tab.clicked.connect(lambda: self.new_tab(None, True))
         self.btn_hide.clicked.connect(self.hide_requested.emit)
         self.btn_menu.clicked.connect(self._show_menu)
@@ -657,15 +907,23 @@ class BrowserPane(QWidget):
         return view
 
     def new_tab(self, url=None, activate=True):
-        """新建标签页并返回它的 view；内核不可用时返回 None。"""
+        """新建标签页并返回它的 view；内核不可用时返回 None。
+
+        ★ v9.22 变更：``url`` 为空时用 ``setHtml(start_page_html(),
+        QUrl("about:blank"))`` 显示一张完全内联的本地新标签页，而不是留一个
+        ``about:blank`` 白屏。内核不可用 / 建视图失败时也不白屏：补一个纯
+        Qt 的 ``LocalStartPage`` 标签（同样让 ``tabs_count()`` 递增），
+        只是返回值仍为 None，语义是「没有 WebEngine view」。
+        """
         if not self._available:
-            self.status.setText("未安装浏览器内核，无法新建标签页。")
-            return None
+            self.status.setText("未安装浏览器内核，已显示本地新标签页；"
+                                "可用「打开文件预览」看本地文件。")
+            return self._new_local_start_tab(activate)
         try:
             view = self._make_view()
         except Exception as e:                       # noqa: BLE001
             self.status.setText(f"浏览器内核启动失败：{type(e).__name__}: {e}")
-            return None
+            return self._new_local_start_tab(activate)
 
         chip = _TabChip("新标签页", self._tabs_host)
         chip.activated.connect(self._on_chip_activated)
@@ -677,13 +935,145 @@ class BrowserPane(QWidget):
         self._stack.addWidget(view)
         self._wire_view(view)
 
-        if url:
-            qurl = normalize_url(url)
-            if qurl is not None:
-                view.load(qurl)
+        qurl = normalize_url(url) if url else None
+        if qurl is not None:
+            view.load(qurl)
+        else:
+            # 空标签 / 非法网址：一律显示内联首页，绝不留白屏。
+            try:
+                view.setHtml(start_page_html(), QUrl("about:blank"))
+            except Exception:                       # noqa: BLE001
+                pass
+            if url:
+                self.status.setText("网址无法解析，已显示新标签页。")
         if activate or self._active < 0:
             self.activate_tab(len(self._tabs) - 1)
         return view
+
+    def _new_local_start_tab(self, activate=True):
+        """内核不可用时也建一个「本地首页」标签；返回 None（没有 WebEngine view）。"""
+        try:
+            widget = LocalStartPage()
+        except Exception as e:                       # noqa: BLE001
+            self.status.setText(f"首页控件初始化失败：{type(e).__name__}: {e}")
+            return None
+        chip = _TabChip("新标签页", self._tabs_host)
+        chip.activated.connect(self._on_chip_activated)
+        chip.close_clicked.connect(self._on_chip_close)
+        self._tabs_layout.addWidget(chip)
+        tab = _Tab(chip=chip, view=widget)
+        self._tabs.append(tab)
+        self._stack.addWidget(widget)
+        if activate or self._active < 0:
+            self.activate_tab(len(self._tabs) - 1)
+        self.status.setText(
+            "浏览器内核未就绪：已显示本地新标签页，本地文件预览仍可使用。")
+        return None
+
+    # ================= 本地文件预览 =================
+    def preview_file(self, path: str) -> bool:
+        """新建一个标签预览本地文件，切过去并返回是否解析成功。
+
+        这个入口**不依赖 Chromium**：即使 WebEngine 内核没装，图片 / Word /
+        PPT / Excel / PDF / 文本照样能看。失败时标签里是一张中文说明页，
+        绝不把异常抛到 UI。
+        """
+        p = str(path or "").strip().strip('"')
+        if not p:
+            self.status.setText("没有选择文件。")
+            return False
+        if not os.path.isfile(p):
+            self.status.setText(f"文件不存在：{p}")
+            return False
+        try:
+            widget = FilePreview()
+        except Exception as e:                       # noqa: BLE001
+            self.status.setText(f"预览控件初始化失败：{type(e).__name__}: {e}")
+            return False
+        try:
+            ok = bool(widget.preview(p))
+        except Exception as e:                       # noqa: BLE001
+            ok = False
+            try:
+                widget.show_error(f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+        name = widget.title() or os.path.basename(p) or "文件预览"
+        chip = _TabChip(name, self._tabs_host)
+        chip.activated.connect(self._on_chip_activated)
+        chip.close_clicked.connect(self._on_chip_close)
+        self._tabs_layout.addWidget(chip)
+        tab = _Tab(chip=chip, view=widget)
+        self._tabs.append(tab)
+        self._stack.addWidget(widget)
+        self.activate_tab(len(self._tabs) - 1)
+        if ok:
+            suffix = "" if is_supported(p) else "（暂无内置解析器，只显示文件信息）"
+            self.status.setText(f"本地预览：{name}{suffix}")
+        else:
+            self.status.setText(f"预览失败：{name}，已显示说明页。")
+        return ok
+
+    def _choose_preview_file(self):
+        """工具行「▤」按钮：弹文件对话框选一个本地文件去预览。"""
+        # 离屏自动化（QT_QPA_PLATFORM=offscreen）没有可用的原生文件对话框，
+        # 这里直接给出提示，避免自动测试被一个模态对话框挂住。
+        if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() == "offscreen":
+            self.status.setText(
+                "离屏环境不弹文件对话框：把文件拖进面板，或调用 preview_file(路径)。")
+            return
+        exts = " ".join("*" + e for e in supported_extensions())
+        filt = f"可预览的文件 ({exts});;所有文件 (*.*)"
+        try:
+            path, _selected = QFileDialog.getOpenFileName(
+                self, "选择要预览的本地文件", "", filt)
+        except Exception as e:                       # noqa: BLE001
+            self.status.setText(f"打开文件对话框失败：{type(e).__name__}: {e}")
+            return
+        if path:
+            self.preview_file(path)
+
+    # ================= 拖放 =================
+    def dragEnterEvent(self, event):                 # noqa: N802（Qt 回调）
+        """只接本地文件 URL；其它拖入内容一律忽略。"""
+        try:
+            mime = event.mimeData()
+            if mime is not None and mime.hasUrls():
+                for url in mime.urls():
+                    if url.isLocalFile():
+                        event.acceptProposedAction()
+                        return
+        except Exception:
+            pass
+        event.ignore()
+
+    def dropEvent(self, event):                      # noqa: N802（Qt 回调）
+        """本地文件拖进来就各开一个预览标签。"""
+        handled = False
+        try:
+            mime = event.mimeData()
+            urls = mime.urls() if (mime is not None and mime.hasUrls()) else []
+            for url in urls:
+                if not url.isLocalFile():
+                    continue
+                p = url.toLocalFile()
+                if p and os.path.isfile(p):
+                    self.preview_file(p)
+                    handled = True
+        except Exception as e:                       # noqa: BLE001
+            self.status.setText(f"拖入文件预览失败：{type(e).__name__}: {e}")
+        if handled:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def web_view(self):
+        """当前标签里能调 WebEngine API 的视图；本地预览 / 起始页返回 None。
+
+        所有需要 ``.page()/.url()/.load()`` 的方法都必须先过这一层，
+        否则在文件预览标签上点前进/后退/刷新会直接抛 AttributeError。
+        """
+        return _web_view(self.current_view())
 
     def _wire_view(self, view):
         view.urlChanged.connect(
@@ -700,7 +1090,12 @@ class BrowserPane(QWidget):
             lambda st, code, v=view: self._on_render_terminated(st, code, v))
 
     def current_view(self):
-        """当前活动标签的 view（没有就 None）。"""
+        """当前活动标签的 view（没有就 None）。
+
+        ⚠ 它可能是 ``QWebEngineView``，也可能是 ``FilePreview`` /
+        ``LocalStartPage``（本地预览 / 无内核首页）。所有调用方都必须先用
+        ``web_view()`` 过滤，绝不直接 ``.page()/.url()/.load()``。
+        """
         if 0 <= self._active < len(self._tabs):
             return self._tabs[self._active].view
         return None
@@ -709,7 +1104,7 @@ class BrowserPane(QWidget):
         return len(self._tabs)
 
     def activate_tab(self, index):
-        """切到第 index 个标签。"""
+        """切到第 index 个标签（本地预览标签会自动禁用导航按钮）。"""
         if not (0 <= index < len(self._tabs)):
             return
         self._active = index
@@ -725,14 +1120,21 @@ class BrowserPane(QWidget):
         self._set_reload_state(False)
         title = ""
         try:
-            title = tab.view.title() or ""
+            fn = getattr(tab.view, "title", None)
+            title = str(fn() or "") if callable(fn) else ""
         except Exception:
-            pass
-        self.status.setText(f"{title} — {self.current_url()}" if title
-                            else (self.current_url() or "就绪"))
+            title = ""
+        if isinstance(tab.view, FilePreview):
+            self.status.setText(
+                f"本地预览：{title or '文件'}（可用工具行按钮打开其它文件）")
+        elif _web_view(tab.view) is None:
+            self.status.setText(f"本地新标签页：{title or '新标签页'}")
+        else:
+            self.status.setText(f"{title} — {self.current_url()}" if title
+                                else (self.current_url() or "就绪"))
 
     def close_tab(self, index):
-        """关掉第 index 个标签；最后一个关掉后自动补一个新空白标签。"""
+        """关掉第 index 个标签；最后一个关掉后自动补一个新首页标签。"""
         if not (0 <= index < len(self._tabs)):
             return
         tab = self._tabs.pop(index)
@@ -745,7 +1147,9 @@ class BrowserPane(QWidget):
             pass
         try:
             self._stack.removeWidget(tab.view)
-            tab.view.stop()
+            w = _web_view(tab.view)
+            if w is not None:
+                w.stop()
             tab.view.hide()
             tab.view.setParent(None)
             tab.view.deleteLater()
@@ -776,26 +1180,43 @@ class BrowserPane(QWidget):
 
     # ================= 导航动作 =================
     def go_back(self):
-        v = self.current_view()
-        if v is not None:
-            v.back()
+        """本地预览 / 起始页没有浏览历史，直接返回（绝不调 .back()）。"""
+        w = self.web_view()
+        if w is None:
+            return
+        try:
+            w.back()
+        except Exception:
+            pass
 
     def go_forward(self):
-        v = self.current_view()
-        if v is not None:
-            v.forward()
+        """同 go_back：不是 WebEngine 视图就什么也不做。"""
+        w = self.web_view()
+        if w is None:
+            return
+        try:
+            w.forward()
+        except Exception:
+            pass
 
     def reload_or_stop(self):
-        """↻ / ✕：加载中就是「停止」，否则是「刷新」。"""
-        v = self.current_view()
-        if v is None:
+        """↻ / ✕：加载中就是「停止」，否则是「刷新」。
+
+        本地文件预览标签没有可刷新的网页，给一行中文提示就返回。
+        """
+        w = self.web_view()
+        if w is None:
+            self.status.setText("当前是本地文件预览，没有网页可刷新。")
             return
-        if self._loading:
-            v.stop()
-            self._set_reload_state(False)
-            self.status.setText("已停止加载。")
-        else:
-            v.reload()
+        try:
+            if self._loading:
+                w.stop()
+                self._set_reload_state(False)
+                self.status.setText("已停止加载。")
+            else:
+                w.reload()
+        except Exception as e:                       # noqa: BLE001
+            self.status.setText(f"刷新失败：{type(e).__name__}: {e}")
 
     def go_home(self):
         self.load(HOME_URL)
@@ -810,10 +1231,12 @@ class BrowserPane(QWidget):
         self.status.setText(f"缩放：{int(self._zoom * 100)}%")
 
     def _apply_zoom(self, view):
-        if view is None:
+        """只有 WebEngine 视图才有 setZoomFactor；本地预览直接跳过。"""
+        w = _web_view(view)
+        if w is None:
             return
         try:
-            view.setZoomFactor(self._zoom)
+            w.setZoomFactor(self._zoom)
         except Exception:
             pass
 
@@ -845,11 +1268,12 @@ class BrowserPane(QWidget):
 
     def clear_site_data(self):
         """清除本站数据：HTTP 缓存 + Cookie + localStorage / sessionStorage。"""
-        v = self.current_view()
-        if v is None:
+        w = self.web_view()
+        if w is None:
+            self.status.setText("本地文件预览没有网站数据需要清除。")
             return
         try:
-            v.page().runJavaScript(
+            w.page().runJavaScript(
                 "try{localStorage.clear();sessionStorage.clear();}catch(e){}")
         except Exception:
             pass
@@ -865,22 +1289,24 @@ class BrowserPane(QWidget):
             pass
         self.status.setText("已清除本站缓存与登录数据。")
         try:
-            v.reload()
+            w.reload()
         except Exception:
             pass
 
     def open_devtools(self):
         """开发者工具：挂在当前页上，单独一个小窗口（用户点了才开）。"""
-        from PyQt6.QtWebEngineWidgets import QWebEngineView
-        v = self.current_view()
-        if v is None:
+        w = self.web_view()
+        if w is None:
+            self.status.setText("本地文件预览没有开发者工具。")
             return
         try:
+            # 内核缺失时这行 import 会抛，必须在 try 里，不能放函数开头。
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
             if self._devtools is None:
                 self._devtools = QWebEngineView()
                 self._devtools.setWindowTitle("开发者工具")
                 self._devtools.resize(920, 620)
-            v.page().setDevToolsPage(self._devtools.page())
+            w.page().setDevToolsPage(self._devtools.page())
             self._devtools.show()
             self._devtools.raise_()
             self.status.setText("已打开开发者工具。")
@@ -929,38 +1355,65 @@ class BrowserPane(QWidget):
         self.load_url(qurl, qurl.toString())
 
     def load_url(self, qurl, display=None):
-        """内部用：直接加载一个 QUrl（搜索走的也是这条路）。"""
+        """内部用：直接加载一个 QUrl（搜索走的也是这条路）。
+
+        当前标签是本地文件预览时**另开一个网页标签**再加载 —— 不能对
+        ``FilePreview`` 调 ``.load()``，那样会直接抛 AttributeError。
+        """
+        if qurl is None:
+            return
         if not self._available:
-            self.status.setText("未安装浏览器内核，无法加载页面。")
+            self.status.setText(
+                "未安装浏览器内核，无法加载页面；可用「打开文件预览」看本地文件。")
             return
         if not self._tabs:
             self.new_tab(None, activate=True)
-        v = self.current_view()
-        if v is None:
+        w = self.web_view()
+        if w is None:
+            self.new_tab(None, activate=True)
+            w = self.web_view()
+        if w is None:
             self.status.setText("浏览器内核未就绪，稍后再试。")
             return
         self.addr.setText(display or qurl.toString())
         self.status.setText("加载中…")
         self._set_reload_state(True)
-        v.load(qurl)
+        try:
+            w.load(qurl)
+        except Exception as e:                       # noqa: BLE001
+            self._set_reload_state(False)
+            self.status.setText(f"加载失败：{type(e).__name__}: {e}")
 
     def current_url(self):
-        """当前地址（优先取浏览器实际地址，其次取地址栏文本）。"""
-        v = self.current_view()
-        if v is not None:
-            u = v.url().toString()
-            if u and u != "about:blank":
-                return u
+        """当前地址；本地预览 / 首页返回空串，绝不把 data: 长 HTML 塞出来。"""
+        w = self.web_view()
+        if w is None:
+            return ""
+        try:
+            qurl = w.url()
+            u = qurl.toString() if qurl is not None else ""
+        except Exception:
+            u = ""
+        if _is_clean_addr(u):
+            return u
         return self.addr.text().strip()
 
     def _sync_addr(self):
-        v = self.current_view()
-        if v is None:
+        """同步地址栏；预览页 / 起始页一律留空，让占位符说话。"""
+        w = self.web_view()
+        if w is None:
+            if self.addr.text():
+                self.addr.setText("")
             return
-        u = v.url().toString()
-        if u and u != "about:blank" and u != self.addr.text():
-            self.addr.setText(u)
-        elif not u:
+        try:
+            qurl = w.url()
+            u = qurl.toString() if qurl is not None else ""
+        except Exception:
+            u = ""
+        if _is_clean_addr(u):
+            if u != self.addr.text():
+                self.addr.setText(u)
+        elif self.addr.text():
             self.addr.setText("")
 
     def _update_addr_icon(self):
@@ -968,8 +1421,12 @@ class BrowserPane(QWidget):
         if self._addr_action is None:
             return
         t = themes.tokens()
-        v = self.current_view()
-        url = v.url().toString().lower() if v is not None else ""
+        v = self.web_view()
+        try:
+            qurl = v.url() if v is not None else None
+            url = (qurl.toString() if qurl is not None else "").lower()
+        except Exception:
+            url = ""
         if url.startswith("https://"):
             pm = _glyph_pixmap(glyph("key"), t["success"], 14)
             tip = "安全连接（HTTPS）"
@@ -994,14 +1451,17 @@ class BrowserPane(QWidget):
         """
         url = self.current_url()
         if not url or url.startswith("about:"):
-            self.status.setText("还没有打开任何页面，先在地址栏输入网址。")
+            if self.web_view() is None:
+                self.status.setText("当前是本地文件预览，没有网页地址可分析。")
+            else:
+                self.status.setText("还没有打开任何页面，先在地址栏输入网址。")
             return
         if self._worker is not None and self._worker.isRunning():
             self.status.setText("上一次分析还在进行中，请稍候…")
             return
-        v = self.current_view()
-        if v is None:
-            self.status.setText("未安装浏览器内核，无法读取页面。")
+        w = self.web_view()
+        if w is None:
+            self.status.setText("当前是本地文件预览，没有网页 DOM 可分析。")
             return
         try:
             self.act_analyze.setEnabled(False)
@@ -1009,7 +1469,7 @@ class BrowserPane(QWidget):
             pass
         self.status.setText("正在读取当前页面的渲染内容…")
         try:
-            v.page().toHtml(self._on_html_ready)
+            w.page().toHtml(self._on_html_ready)
         except Exception as e:                       # noqa: BLE001
             try:
                 self.act_analyze.setEnabled(True)
@@ -1028,9 +1488,10 @@ class BrowserPane(QWidget):
                 "读取当前页面失败（页面可能还没加载完），请稍后重试。")
             return
         title = ""
-        v = self.current_view()
+        w = self.web_view()
         try:
-            title = v.title() if v is not None else ""
+            fn = getattr(w, "title", None) if w is not None else None
+            title = str(fn() or "") if callable(fn) else ""
         except Exception:
             pass
         res = {
@@ -1049,11 +1510,19 @@ class BrowserPane(QWidget):
 
     # ================= 页面回调 =================
     def _on_url_changed(self, qurl, view=None):
+        """首页 setHtml 会带 about:blank / data: 回来，这两种绝不进地址栏。"""
         if view is not None and view is not self.current_view():
             return
-        u = qurl.toString()
-        if u and u != self.addr.text():
-            self.addr.setText(u)
+        try:
+            u = qurl.toString() if qurl is not None else ""
+        except Exception:
+            u = ""
+        if _is_clean_addr(u):
+            if u != self.addr.text():
+                self.addr.setText(u)
+        elif not u or u.lower().startswith(("about:", "data:")):
+            if self.addr.text():
+                self.addr.setText("")
         self._update_addr_icon()
         self._sync_nav()
 
@@ -1113,18 +1582,21 @@ class BrowserPane(QWidget):
             self.btn_reload.set_glyph(glyph("reload"), "刷新")
 
     def _sync_nav(self):
-        """前进 / 后退按钮是否可用，跟着**当前标签**的实际浏览历史走。"""
-        v = self.current_view()
-        if v is None:
+        """前进 / 后退 / 刷新跟着当前标签走；本地预览一律禁用三个按钮。"""
+        w = self.web_view()
+        if w is None:
             self.btn_back.setEnabled(False)
             self.btn_fwd.setEnabled(False)
+            self.btn_reload.setEnabled(False)
             return
+        self.btn_reload.setEnabled(True)
         try:
-            h = v.history()
+            h = w.history()
             self.btn_back.setEnabled(bool(h.canGoBack()))
             self.btn_fwd.setEnabled(bool(h.canGoForward()))
         except Exception:
-            pass
+            self.btn_back.setEnabled(False)
+            self.btn_fwd.setEnabled(False)
 
     def _on_download(self, item):
         """页面内点下载链接时，选保存位置并开始下载。"""
@@ -1169,4 +1641,12 @@ class BrowserPane(QWidget):
         self.status.setStyleSheet(f"color:{t['text_muted']};")
         for tab in self._tabs:
             tab.chip.refresh_theme()
+            # 本地预览 / 起始页用 tokens() 现取色，主题变了要重新生成 HTML。
+            # QWebEngineView 没有这个方法，getattr 会静默跳过。
+            try:
+                fn = getattr(tab.view, "refresh_theme", None)
+                if callable(fn):
+                    fn()
+            except Exception:
+                pass
         self._update_addr_icon()

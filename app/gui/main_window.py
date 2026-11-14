@@ -406,6 +406,23 @@ class MainWindow(QMainWindow):
             config.GITHUB_TOKEN = str(settings.get("github_token", "") or "")
         except Exception:
             pass
+        # ★ v9.22.11：用户反馈「是不是把我的字放大了，看着很奇怪」。查到用户工作区
+        #   settings.json 里 font_scale 被存成了 85，而 qss() 里大量 font-size 是
+        #   写死的 14/15px、不走 themes.px() 缩放 —— 于是「整体缩了、局部没缩」，
+        #   看起来就是字忽大忽小、排版错乱。这里做**一次性**归一：把非 100 的旧值
+        #   恢复成标准 100 并落盘；之后用户主动按 Ctrl +/- 调缩放仍然照常生效
+        #   （_font_scale_restored_v92211 标记保证只归一次，不会每次启动都重置）。
+        try:
+            _fs = int(self.settings.get("font_scale", 100) or 100)
+        except Exception:
+            _fs = 100
+        if _fs != 100 and not self.settings.get("_font_scale_restored_v92211"):
+            self.settings["font_scale"] = 100
+            self.settings["_font_scale_restored_v92211"] = True
+            try:
+                self.workspace.save_settings(self.settings)
+            except Exception:
+                pass
         themes.set_font_scale(self.settings.get("font_scale", 100))
 
         self.client = llm_client.LLMClient()
@@ -1118,12 +1135,12 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self.side)
 
-        # ---------- 主内容区 + 右侧内嵌浏览器（v9.22.10）----------
-        # 用户原话：「将浏览器改为类似参考图右侧那种内嵌形式的样式……不要在左侧按钮
-        # 区域，改为独立合理的布局位置」。所以浏览器从「左侧导航里的一页」变成
-        # **窗口右侧一栏**：分栏可拖拽、默认约占 42%（≥420px）、最小 320px。
-        # 左边仍然是对话页（或 web 版对话页），打开浏览器**不顶掉**对话 ——
-        # 用户要的是「边聊边看网页」。
+        # ---------- 主内容区 + 右侧内嵌面板（v9.22.10 建，v9.22.11 重做入口）----------
+        # ★ v9.22.11 用户原话：「去掉浏览器的那个按键，然后改为就是在主界面整个的
+        #   右边有一个小的像窗口一样那种东西，一点一下就在右侧会多弹出来一样这么个界面」。
+        #   所以：侧栏格子删掉，改为主界面右边缘一条常驻窄竖条；点击才展开右栏。
+        #   **默认收起** —— 首屏恢复成原来的全宽布局（上一版默认展开占 42%，
+        #   把对话页和欢迎卡片挤窄，用户反馈「最开始那个原始界面没了、看着奇怪」）。
         self.main_split = QSplitter(Qt.Orientation.Horizontal)
         self.main_split.setObjectName("MainSplit")
         self.main_split.setChildrenCollapsible(False)
@@ -1131,11 +1148,10 @@ class MainWindow(QMainWindow):
         self._browser_split_done = False
         self._browser_user_dragged = False
         self._splitting = False
-        # ★ v9.22.10：面板展开/收起用**显式状态位**，不要只靠 isVisible()。
-        #   QWidget.isVisible() 是「连祖先一起算」的有效可见性：窗口还没 show、
-        #   或收到托盘里时它恒为 False，于是「再点一下收起」会被算成「还没展开」
-        #   而重新展开 —— 开关失灵。browser_visible() 以这个状态位为准。
-        self._browser_shown = True      # 默认展开（用户要的「边聊边看」）
+        # 面板展开/收起用**显式状态位**，不要只靠 isVisible()：
+        # QWidget.isVisible() 连祖先一起算，窗口未 show / 收进托盘时恒为 False，
+        # 拿它当开关状态会让「再点一下收起」失灵。
+        self._browser_shown = False
 
         self.stack = QStackedWidget()
         # ★ 必须允许左区被压窄：各页面内部（聊天卡片 / 输入区 / 设置表单）的
@@ -1145,8 +1161,7 @@ class MainWindow(QMainWindow):
         self.stack.setMinimumWidth(320)
         self.main_split.addWidget(self.stack)
 
-        # 浏览器面板的宿主：真正的 BrowserPage 在所有页面建完之后才塞进来
-        # （BrowserPage 是懒加载的，见 pages.py；这里只先占好位置）。
+        # 浏览器 / 文件预览面板的宿主：真正的 BrowserPage 在所有页面建完之后才塞进来
         self.browser_host = QWidget()
         self.browser_host.setObjectName("BrowserHost")
         self.browser_host.setMinimumWidth(320)
@@ -1156,9 +1171,42 @@ class MainWindow(QMainWindow):
         self.main_split.addWidget(self.browser_host)
 
         self.main_split.setStretchFactor(0, 1)      # 左边（对话）吃掉多余宽度
-        self.main_split.setStretchFactor(1, 0)      # 右边（浏览器）保持拖出来的宽度
+        self.main_split.setStretchFactor(1, 0)      # 右边（面板）保持拖出来的宽度
         self.main_split.splitterMoved.connect(self._on_splitter_moved)
         root.addWidget(self.main_split, 1)
+
+        # ---- 右边缘的小型窗口式入口（v9.22.11）----
+        # 两个竖排小按钮：浏览 = 展开/收起右栏；预览 = 展开右栏并挑一个本地文件。
+        # ⚠️ 全程「先 addWidget 拿到父窗口，再设可见性/勾选态」，遵守本仓库
+        #    「控件还没父窗口时 setVisible(True) 会当场变成顶层窗口」的血泪纪律。
+        self.side_dock = QWidget()
+        self.side_dock.setObjectName("SideDockHost")
+        self.side_dock.setFixedWidth(32)
+        dv = QVBoxLayout(self.side_dock)
+        dv.setContentsMargins(2, 8, 2, 8)
+        dv.setSpacing(8)
+        dv.addStretch(1)
+
+        self.btn_side_dock = QPushButton("▤\n浏\n览")
+        self.btn_side_dock.setObjectName("SideDockBtn")
+        self.btn_side_dock.setCheckable(True)
+        self.btn_side_dock.setFixedWidth(28)
+        self.btn_side_dock.setMinimumHeight(84)
+        self.btn_side_dock.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_side_dock.setToolTip("展开 / 收起右侧浏览器面板（网页不关闭、登录态保留）")
+        self.btn_side_dock.clicked.connect(lambda _=False: self.toggle_browser())
+        dv.addWidget(self.btn_side_dock, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.btn_side_preview = QPushButton("▦\n预\n览")
+        self.btn_side_preview.setObjectName("SideDockBtn")
+        self.btn_side_preview.setFixedWidth(28)
+        self.btn_side_preview.setMinimumHeight(84)
+        self.btn_side_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_side_preview.setToolTip("在右侧面板预览本地文件（图片 / Word / PPT / Excel / PDF 等）")
+        self.btn_side_preview.clicked.connect(lambda _=False: self._open_preview_file())
+        dv.addWidget(self.btn_side_preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        dv.addStretch(1)
+        root.addWidget(self.side_dock, 0)
 
         self.page_chat = self._build_chat_page()
         self.stack.addWidget(self.page_chat)
@@ -1316,6 +1364,12 @@ class MainWindow(QMainWindow):
         #   所以不用担心"连的时候 pane 还没建"。
         self.page_browser = BrowserPage()
         self._browser_host_layout.addWidget(self.page_browser, 1)
+        # ★ v9.22.11：默认收起右栏（⚠️ 必须在 addWidget **之后**才动可见性：
+        #   控件还没有父窗口时调 setVisible(True) 等价于 show()，会当场变成
+        #   一个真实顶层窗口）。只 hide、不销毁 —— 展开时复用同一个 BrowserPane，
+        #   网页与登录态都不丢。
+        self.browser_host.hide()
+        self.btn_side_dock.setChecked(False)
         self.page_browser.fetched.connect(self._on_browser_fetched)
         # 面板顶部的「✕ 收起」= 折叠这一栏（网页不销毁、登录态保留）
         self.page_browser.back_requested.connect(self.hide_browser)
@@ -3553,7 +3607,16 @@ class MainWindow(QMainWindow):
         return bool(getattr(self, "_browser_shown", True))
 
     def _sync_browser_chip(self):
-        """侧栏「浏览器」格子的勾选态 == 右栏是否展开（它现在是个开关）。"""
+        """右侧窄竖条的勾选态 == 右栏是否展开。
+
+        ★ v9.22.11：入口从「侧栏浏览器格子」搬到主界面右边缘，所以这里同步的是
+        `btn_side_dock`；侧栏格子已从 NAV_CHIPS 移除，下面只是给旧皮肤/旧用例兜底。
+        """
+        try:
+            if hasattr(self, "btn_side_dock"):
+                self.btn_side_dock.setChecked(self.browser_visible())
+        except Exception:
+            pass
         try:
             btn = self.nav.buttons.get("browser")
             if btn is not None:
@@ -3571,6 +3634,11 @@ class MainWindow(QMainWindow):
           · 用户**拖过**之后：一律听用户的，只在 `force=True` 时覆盖。
         """
         if not hasattr(self, "main_split") or getattr(self, "_splitting", False):
+            return
+        # ★ v9.22.11：收起时绝不重算分栏比例 —— 否则 showEvent/resizeEvent 会把
+        #   隐藏的右栏又分到 42% 宽度，首屏对话页被挤窄，正是用户反馈
+        #   「最开始那个原始界面没了」的根因之一。
+        if not self.browser_visible():
             return
         if self._browser_user_dragged and not force:
             return
@@ -3635,8 +3703,33 @@ class MainWindow(QMainWindow):
             pass
 
     def hide_browser(self):
-        """收起右侧浏览器面板（面板顶部 ✕ / 再点一次侧栏格子）。"""
+        """收起右侧浏览器面板（面板顶部 ✕ / 再点一次右边缘窄条）。"""
         self.show_browser(False)
+
+    def _open_preview_file(self):
+        """右侧「预览」小按钮：展开右栏 → 选一个本地文件 → 交给面板预览。
+
+        支持图片 / Word / PPT / Excel / PDF / 文本；真正的解析在
+        `app.gui.preview_pane.FilePreview`，由 `BrowserPane.preview_file()` 分派。
+        面板内的「打开文件」按钮与拖放走的是同一条路径。
+        """
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要预览的文件", "",
+            "常见文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.docx *.pptx "
+            "*.xlsx *.xlsm *.csv *.pdf *.txt *.md *.json);;所有文件 (*.*)")
+        if not path:
+            return
+        self.show_browser(True)
+        try:
+            pane = self.page_browser.ensure_pane()
+            if pane is not None and hasattr(pane, "preview_file"):
+                if not pane.preview_file(path):
+                    self.statusBar().showMessage("这个文件暂时无法预览", 5000)
+            else:
+                self.statusBar().showMessage("预览组件尚未就绪", 5000)
+        except Exception as e:                     # noqa: BLE001
+            self.statusBar().showMessage(f"预览失败：{e}", 6000)
 
     def toggle_browser(self):
         """展开 ↔ 收起（侧栏「浏览器」格子点一下就走这里）。"""
@@ -4746,6 +4839,15 @@ class MainWindow(QMainWindow):
         else:
             self._new_conversation(silent=True)
         self._refresh_all()
+        # ★ v9.22.11：首屏「原始界面」兜底。上一版右栏默认展开占 42%，把对话页
+        #   连同 WelcomeView 的快捷卡片挤到几乎看不见，用户以为欢迎界面没了。
+        #   现在右栏默认收起，并在这里明确保证空对话时欢迎卡片一定铺上；
+        #   有历史消息时保持原行为（直接回到上次对话，不硬塞欢迎页）。
+        try:
+            if not (getattr(self, "conv", None) or {}).get("messages"):
+                self._stack_welcome()
+        except Exception:
+            pass
         # ★ v9.20.0：IM 仓库（会话档案 / 消息流水 / 定时任务 / 日志本 / 记忆）
         self._init_im()
         self._maybe_start_dingtalk_stream()
