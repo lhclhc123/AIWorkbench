@@ -285,7 +285,7 @@ MODEL_TIMEOUT_RETRY = 1      # 纯超时（不是限流）最多重试几次
 # v9.22.1：新增两条硬规范 ——「读代码必须先定位，不许整文件通读，一次读超过 400 行
 #   等于没读」与「能写脚本就别堆命令，先写 .py/.bat/.ps1 到工作区再跑」；
 #   同期 find_lines 的 context 上限 5 -> 10，read_file 超 400 行会在结果末尾追加提醒。
-PROMPT_VERSION = 35
+PROMPT_VERSION = 36
 
 # ★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
 #   流式输出里"**把前面已经发出去的内容作废、从头重来**"的标记。
@@ -501,6 +501,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "【文档生成（重点能力）】\n"
     "- create_document：把 **Markdown 正文**写成真正的 Word / Excel / PPT / PDF 文件。\n"
     "  参数：path（目标文件名，扩展名决定格式：.docx/.xlsx/.pptx/.pdf）、content（Markdown 正文）、可选 title。\n"
+    "  **PPT 另有可选参数 template（成品模板）**：汇报蓝（report_blue）/ 科技深色（tech_dark）/\n"
+    "  国风红（guofeng_red）/ 极简灰（minimal_gray）。用户说「要国风 / 科技感 / 商务简约 /\n"
+    "  汇报风格」时就带上它；不传则用默认的清爽学术白底。\n"
     "  **用户要「生成 Word / 表格 / PPT / PDF / 报告 / 周报 / 简历 / 课件」时就用它**，\n"
     "  不要只把文字打在聊天里——用户要的是能打开的文件。\n"
     "  content 支持：# 一级标题、## 二级标题、- 列表、1. 有序列表、**加粗**、| 表格 |、\n"

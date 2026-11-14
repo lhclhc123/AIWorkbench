@@ -35,9 +35,11 @@ MAX_MSGS_READ = 60          # 默认取最近多少条做上下文
 MAX_LINES_PER_THREAD = 4000  # 单个会话流水超过这个行数就压缩一次
 
 MODES = {
-    "secretary": "秘书模式 —— 默认主动汇报、提醒；群里不闲聊，只在有明确指令或 @ 时发言",
-    "colleague": "同事模式 —— 像同事一样正常聊天，被 @ 或被叫到名字时接话",
-    "group_bot": "群助手模式 —— 盯住群聊，按指令/关键词回，@ 优先",
+    # ★ v9.22.8：三种模式**不再影响「接不接」**（群聊一律只回 @ 我的，铁律在
+    #   policy.should_reply 里）。这里只决定「以什么身份、什么口吻」说话。
+    "secretary": "秘书模式 —— 默认主动汇报、提醒；群里只有被 @ 时才接话，没 @ 一律不插嘴",
+    "colleague": "同事模式 —— 像同事一样正常聊天；群里被 @ 或被叫到名字时才接话",
+    "group_bot": "群助手模式 —— 群里只回 @ 你的消息；私聊正常接",
 }
 DEFAULT_MODE = "group_bot"
 
@@ -488,6 +490,12 @@ class IMStore:
         # ★ v9.22.7：老配置文件里没有 auto_send 字段 → 一律当成 False。
         #   `settings()` 已经用默认值兜过，这里再兜一次，防止有人手改出 "1"/"true"。
         s["auto_send"] = bool(s.get("auto_send") is True)
+        # ★ v9.22.8：`scope_at_me` 一律强制 True。
+        #   历史根因：im.html 的 #scopeAtMe 复选框没有 checked 属性，用户点过一次
+        #   「保存」就把 false 写进了 im_settings.json，于是后端把群里每条消息都
+        #   当成可回复（用户反馈的「群里什么话都回」）。现在**群聊只回 @ 我**是铁律，
+        #   这个开关只用于兼容老配置，读出来一律纠正成 True。
+        s["scope_at_me"] = True
         return s
 
     def set_settings(self, **kw):

@@ -18,8 +18,9 @@
 对外接口（保持向后兼容，``app/agent.py`` 只用到 ``create(path, content, title=, base_dir=)``）
 =========================================================================================
 - ``create(path, content, title=None, base_dir=None, theme=None, author=None,
-          subtitle=None, date=None) -> (label, size)``
+          subtitle=None, date=None, template=None) -> (label, size)``
 - ``write_docx / write_xlsx / write_pptx / write_pdf(path, blocks, title=None, base_dir=None, ...)``
+  （``template`` 只对 .pptx 有意义：汇报蓝 / 科技深色 / 国风红 / 极简灰）
 - ``supported(path)`` / ``format_label(path)`` / ``parse_blocks(text)``
 
 Markdown 约定（都是可选的「加分项」，不写也能出好看的文档）
@@ -44,15 +45,15 @@ import re
 try:  # 正常情况：app.docwrite 作为 app 包的子模块被导入
     from .officetpl import (
         PPT_FONT, PPT_FONT_CJK, PPT_FONT_MONO,
-        DOCX_SPEC, XLSX_SPEC, NUMERIC_RATIO, MIN_ROWS_FOR_STATS,
-        get_theme, get_palette, is_score_column, match_keyword,
+        DOCX_SPEC, XLSX_SPEC, PPTX_SPEC, NUMERIC_RATIO, MIN_ROWS_FOR_STATS,
+        get_theme, get_palette, get_preset, is_score_column, match_keyword,
         fit_font_size, estimate_height_in, wrap_lines, text_em, split_pages,
     )
 except ImportError:  # pragma: no cover - 直接以脚本方式加载时兜底
     from officetpl import (  # type: ignore
         PPT_FONT, PPT_FONT_CJK, PPT_FONT_MONO,
-        DOCX_SPEC, XLSX_SPEC, NUMERIC_RATIO, MIN_ROWS_FOR_STATS,
-        get_theme, get_palette, is_score_column, match_keyword,
+        DOCX_SPEC, XLSX_SPEC, PPTX_SPEC, NUMERIC_RATIO, MIN_ROWS_FOR_STATS,
+        get_theme, get_palette, get_preset, is_score_column, match_keyword,
         fit_font_size, estimate_height_in, wrap_lines, text_em, split_pages,
     )
 
@@ -1618,15 +1619,39 @@ def write_xlsx(path, blocks, title=None, base_dir=None, theme=None, **kw):
 # ================================================================ PPT (.pptx)
 
 # 画布与栅格（单位：英寸，16:9）
-SLIDE_W = 13.333
-SLIDE_H = 7.5
-MARGIN_X = 0.85
-CONTENT_W = SLIDE_W - 2 * MARGIN_X
-TITLE_Y = 0.55
-TITLE_H = 0.95
-BODY_TOP = 1.92
-BODY_BOTTOM = 6.72
-FOOTER_Y = 6.92
+# 这里不再是「定义」，而是「读取」——所有数值来自 ``app/officetpl/pptx_spec.py``。
+# 保留这些模块级别名是为了向后兼容（外部有按 docwrite.MARGIN_X 取值的代码）。
+_PPT_SPEC = PPTX_SPEC
+_PPT_MARGIN = _PPT_SPEC["margin"]
+_PPT_GRID = _PPT_SPEC["grid"]
+_PPT_SPACING = _PPT_SPEC["spacing"]
+_PPT_COVER = _PPT_SPEC["cover"]
+_PPT_SECTION = _PPT_SPEC["section"]
+_PPT_END = _PPT_SPEC["end"]
+_PPT_TEXT = _PPT_SPEC["text"]
+
+SLIDE_W = _PPT_SPEC["slide"]["width_in"]
+SLIDE_H = _PPT_SPEC["slide"]["height_in"]
+MARGIN_X = _PPT_MARGIN["left"]
+CONTENT_W = _PPT_MARGIN["content_w"]
+TITLE_Y = _PPT_MARGIN["title_y"]
+TITLE_H = _PPT_MARGIN["title_h"]
+BODY_TOP = _PPT_MARGIN["body_top"]
+BODY_BOTTOM = _PPT_MARGIN["body_bottom"]
+FOOTER_Y = _PPT_MARGIN["footer_y"]
+
+
+def _ppt_size(th, key, delta=0.0):
+    """从当前主题取字号（pt）。
+
+    主题自带 ``size`` 字典，是字号的第一权威来源；万一某套自定义主题缺键，
+    回落到 ``PPTX_SPEC['size'][key]['default']``，绝不让渲染崩。
+    """
+    size_map = th.get("size") or {}
+    val = size_map.get(key)
+    if val is None:
+        val = (_PPT_SPEC["size"].get(key) or {}).get("default", 20.0)
+    return float(val) + float(delta)
 
 
 def _ptx():
@@ -1712,13 +1737,18 @@ def _ppt_rect(slide, x, y, w, h, fill=None, line=None, shape="rect",
     return sh
 
 
-def _ppt_bullet(p, glyph="•", marl=0.42, hanging=0.28, numbered=False, level=0):
+def _ppt_bullet(p, glyph="•", marl=None, hanging=None, numbered=False, level=0):
     """给段落加真项目符号（python-pptx 没有 bullet API，得自己写 pPr）。"""
     from pptx.util import Inches
     from pptx.oxml.ns import qn
     from lxml import etree
+    bs = _PPT_SPACING["bullet"]
+    if marl is None:
+        marl = bs["marl"]
+    if hanging is None:
+        hanging = bs["hanging"]
     pPr = p._p.get_or_add_pPr()
-    indent = marl + 0.40 * level
+    indent = marl + bs["level_step"] * level
     pPr.set("marL", str(int(Inches(indent))))
     pPr.set("indent", str(-int(Inches(hanging))))
     if numbered:
@@ -1726,7 +1756,7 @@ def _ppt_bullet(p, glyph="•", marl=0.42, hanging=0.28, numbered=False, level=0
         num.set("type", "arabicPeriod")
     else:
         bf = etree.SubElement(pPr, qn("a:buFont"))
-        bf.set("typeface", "Arial")
+        bf.set("typeface", bs["font"])
         bc = etree.SubElement(pPr, qn("a:buChar"))
         bc.set("char", glyph)
     return p
@@ -1773,10 +1803,13 @@ def _ppt_drop_empty_placeholders(slide, keep=(0,)):
             continue
 
 
-def _ppt_fit_size(text, width_in, base_size, min_size=14, bold=True):
+def _ppt_fit_size(text, width_in, base_size, min_size=None, bold=True):
     """标题/单行文字按宽度自动缩字号。"""
     size = float(base_size)
-    while size > min_size and text_em(text, bold) * size / 72.0 > width_in * 0.97:
+    if min_size is None:
+        min_size = _PPT_SPACING["fit_min"]
+    ratio = _PPT_SPACING["fit_ratio"]
+    while size > min_size and text_em(text, bold) * size / 72.0 > width_in * ratio:
         size -= 1.0
     return size
 
@@ -1803,44 +1836,53 @@ def _ppt_title(slide, th, text, width=None):
     p.alignment = PP_ALIGN.LEFT
     run = p.add_run()
     run.text = inline_plain(text)
-    size = _ppt_fit_size(run.text, w - 0.4, th["size"]["slide_title"])
+    size = _ppt_fit_size(run.text, w - _PPT_SPACING["title_fit_pad"],
+                         _ppt_size(th, "slide_title"))
     _ppt_font_run(run, PPT_FONT, size, th["text"], bold=True)
 
+    rule = _PPT_SPACING["title_rule"]
     style = th.get("title_style")
     if style == "dot":
-        _ppt_rect(slide, MARGIN_X - 0.30, TITLE_Y + 0.36, 0.11, 0.11,
-                  fill=th["primary"], shape="oval")
-        _ppt_rect(slide, MARGIN_X - 0.02, TITLE_Y + TITLE_H + 0.06, w, 0.014,
-                  fill=th["line"])
+        d = rule["dot"]
+        _ppt_rect(slide, MARGIN_X + d["dot_x"], TITLE_Y + d["dot_y"],
+                  d["dot"], d["dot"], fill=th["primary"], shape="oval")
+        _ppt_rect(slide, MARGIN_X - 0.02, TITLE_Y + TITLE_H + d["line_y"], w,
+                  d["line_h"], fill=th["line"])
     elif style == "rule":
-        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + 0.02, w, 0.02,
-                  fill=th["primary"])
-        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + 0.10, w * 0.32, 0.008,
-                  fill=th["accent"])
+        d = rule["rule"]
+        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + d["bar_y"], w,
+                  d["bar_h"], fill=th["primary"])
+        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + d["accent_y"],
+                  w * d["accent_ratio"], d["accent_h"], fill=th["accent"])
     else:  # bar
-        _ppt_rect(slide, MARGIN_X - 0.26, TITLE_Y + 0.22, 0.09, 0.52,
-                  fill=th["primary"])
-        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + 0.06, w, 0.02,
-                  fill=th["line"])
-        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + 0.06, 1.1, 0.02,
-                  fill=th["primary"])
+        d = rule["bar"]
+        _ppt_rect(slide, MARGIN_X + d["bar_x"], TITLE_Y + d["bar_y"],
+                  d["bar_w"], d["bar_h"], fill=th["primary"])
+        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + d["line_y"], w,
+                  d["line_h"], fill=th["line"])
+        _ppt_rect(slide, MARGIN_X, TITLE_Y + TITLE_H + d["line_y"],
+                  d["accent_w"], d["line_h"], fill=th["primary"])
 
 
 def _ppt_footer(slide, th, page_no):
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
-    box = _ppt_textbox(slide, MARGIN_X, FOOTER_Y, CONTENT_W * 0.6, 0.3)
+    fs = _PPT_SPACING["footer"]
+    box = _ppt_textbox(slide, MARGIN_X, FOOTER_Y,
+                       CONTENT_W * fs["name_ratio"], _PPT_MARGIN["footer_h"])
     p = box.text_frame.paragraphs[0]
     r = p.add_run()
     r.text = th["name"]
-    _ppt_font_run(r, PPT_FONT, th["size"]["footer"], th["muted"])
+    _ppt_font_run(r, PPT_FONT, _ppt_size(th, "footer"), th["muted"])
 
-    box2 = _ppt_textbox(slide, SLIDE_W - MARGIN_X - 1.6, FOOTER_Y, 1.6, 0.3)
+    box2 = _ppt_textbox(slide, SLIDE_W - MARGIN_X - fs["page_w"], FOOTER_Y,
+                        fs["page_w"], _PPT_MARGIN["footer_h"])
     p2 = box2.text_frame.paragraphs[0]
     p2.alignment = PP_ALIGN.RIGHT
     r2 = p2.add_run()
     r2.text = f"{page_no:02d}"
-    _ppt_font_run(r2, PPT_FONT, th["size"]["footer"] + 1, th["muted"], bold=True)
+    _ppt_font_run(r2, PPT_FONT, _ppt_size(th, "footer", fs["page_size_add"]),
+                  th["muted"], bold=True)
 
 
 def _ppt_bullets_body(slide, th, items, x=MARGIN_X, y=BODY_TOP,
@@ -1852,31 +1894,35 @@ def _ppt_bullets_body(slide, th, items, x=MARGIN_X, y=BODY_TOP,
     if not items:
         return True
 
+    sp = _PPT_SPACING
+    gb = _PPT_GRID["bullets"]
+    body0 = _ppt_size(th, "body")
+
     paras = [(inline_plain(it[0]), it[1] if len(it) > 1 else 0) for it in items]
-    two_col = len(items) > 8 and width2 is None
+    two_col = len(items) > gb["two_col_over"] and width2 is None
     if two_col:
         half = (len(items) + 1) // 2
         groups = [items[:half], items[half:]]
-        col_w = (w - 0.55) / 2.0
+        col_w = (w - gb["gap"]) / 2.0
         fits_all = True
         for gi, grp in enumerate(groups):
-            gx = x + gi * (col_w + 0.55)
+            gx = x + gi * (col_w + gb["gap"])
             p_paras = [(inline_plain(it[0]), it[1] if len(it) > 1 else 0)
                        for it in grp]
             size, ok = fit_font_size(
-                p_paras, col_w - 0.5, h, [th["size"]["body"], th["size"]["body"] - 1,
-                                          th["size"]["body"] - 2, 16, 15, 14],
-                line_spacing=1.28, space_after_pt=10, indent_em=0.5)
+                p_paras, col_w - gb["col_width_slack"], h,
+                [body0, body0 - 1, body0 - 2, 16, 15, 14],
+                line_spacing=sp["line"], space_after_pt=sp["space_after"],
+                indent_em=0.5)
             fits_all = fits_all and ok
             box = _ppt_textbox(slide, gx, y, col_w, h)
             _ppt_render_paras(box, th, grp, size)
         return fits_all
 
     size, ok = fit_font_size(
-        paras, w - 0.6, h,
-        [th["size"]["body"], th["size"]["body"] - 1, th["size"]["body"] - 2,
-         th["size"]["body"] - 3, 17, 16, 15, 14],
-        line_spacing=1.28, space_after_pt=10, indent_em=0.5)
+        paras, w - gb["width_slack"], h,
+        [body0, body0 - 1, body0 - 2, body0 - 3, 17, 16, 15, 14],
+        line_spacing=sp["line"], space_after_pt=sp["space_after"], indent_em=0.5)
     box = _ppt_textbox(slide, x, y, w, h)
     _ppt_render_paras(box, th, items, size)
     return ok
@@ -1885,6 +1931,8 @@ def _ppt_bullets_body(slide, th, items, x=MARGIN_X, y=BODY_TOP,
 def _ppt_render_paras(box, th, items, size):
     """把 [(text, level, ordered, plain?)] 画进文本框。"""
     from pptx.enum.text import PP_ALIGN
+    from pptx.util import Pt
+    sp = _PPT_SPACING
     tf = box.text_frame
     tf.word_wrap = True
     first = True
@@ -1896,9 +1944,8 @@ def _ppt_render_paras(box, th, items, size):
         p = tf.paragraphs[0] if first else tf.add_paragraph()
         first = False
         p.alignment = PP_ALIGN.LEFT
-        p.line_spacing = 1.28
-        p.space_after = __import__("pptx.util", fromlist=["Pt"]).Pt(
-            4 if plain else 10)
+        p.line_spacing = sp["line"]
+        p.space_after = Pt(sp["space_after_plain"] if plain else sp["space_after"])
         p.space_before = 0
         if plain:
             pPr = p._p.get_or_add_pPr()
@@ -1911,54 +1958,75 @@ def _ppt_render_paras(box, th, items, size):
             _ppt_bullet(p, th["bullet_glyph"], level=level, numbered=ordered)
         run = p.add_run()
         run.text = text
-        fs = size if level == 0 else max(size - 3.5, 13)
+        fs = size if level == 0 else max(size - sp["level_font_step"],
+                                         sp["level_font_min"])
         _ppt_font_run(run, PPT_FONT, fs,
                       th["text"] if level == 0 else th["muted"],
                       bold=(level == 0 and plain))
 
 
-def _ppt_cover(prs, th, deck_title, subtitle, meta_lines):
-    """封面：按主题的 cover_style 走三套完全不同的版式。"""
+def _ppt_cover(prs, th, deck_title, subtitle, meta_lines, align="left"):
+    """封面：按主题的 cover_style 走四套完全不同的版式。
+
+    ``align`` 来自模板预设的 ``cover_align``：``left``（默认，历史行为）或
+    ``center``。只有显式选了居中的预设才会走新分支，默认渲染不变。
+    """
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
 
     slide = _ppt_new_slide(prs, th, 0)   # Title Slide：真标题 + 副标题占位符
     style = th.get("cover_style")
-    title_w = 10.4
-    title_y = 2.35
+    cfg = _PPT_COVER
+    sp = _PPT_SPACING
+    deco = cfg["deco"].get(style) or cfg["deco"]["bar"]
+    title_w = deco.get("title_w", cfg["title_w"])
+    title_y = deco.get("title_y", cfg["title_y"])
 
     if style == "bar":                      # 清爽学术：左侧主色竖条
-        _ppt_rect(slide, 0, 0, 0.42, SLIDE_H, fill=th["primary"])
-        _ppt_rect(slide, 0, 0, 0.42, 2.1, fill=th["accent"])
-        _ppt_rect(slide, 8.6, 4.0, 5.2, 5.2, fill=th["bg_alt"], shape="oval")
-        title_x = 1.45
+        _ppt_rect(slide, 0, 0, deco["rail_w"], SLIDE_H, fill=th["primary"])
+        _ppt_rect(slide, 0, 0, deco["rail_w"], deco["rail_accent_h"],
+                  fill=th["accent"])
+        _ppt_rect(slide, deco["oval_x"], deco["oval_y"], deco["oval"],
+                  deco["oval"], fill=th["bg_alt"], shape="oval")
+        title_x = deco["title_x"]
     elif style == "glow":                   # 深色科技：角落光斑 + 细线
-        _ppt_rect(slide, 9.4, -1.6, 5.6, 5.6, fill=th["bg_alt"], shape="oval")
-        _ppt_rect(slide, 10.6, 3.6, 4.6, 4.6, fill=th["primary_dark"], shape="oval")
-        _ppt_rect(slide, 0.95, 1.35, 0.9, 0.02, fill=th["primary"])
-        _ppt_rect(slide, 0, 6.2, SLIDE_W, 0.02, fill=th["line"])
-        title_x = 1.0
-        title_y = 2.45
+        _ppt_rect(slide, deco["oval_x"], deco["oval_y"], deco["oval"],
+                  deco["oval"], fill=th["bg_alt"], shape="oval")
+        _ppt_rect(slide, deco["oval2_x"], deco["oval2_y"], deco["oval2"],
+                  deco["oval2"], fill=th["primary_dark"], shape="oval")
+        _ppt_rect(slide, deco["rule_x"], deco["rule_y"], deco["rule_w"],
+                  deco["rule_h"], fill=th["primary"])
+        _ppt_rect(slide, 0, deco["bottom_line_y"], SLIDE_W, deco["rule_h"],
+                  fill=th["line"])
+        title_x = deco["title_x"]
     elif style == "frame":                  # 国风暖色：双细框 + 印章色方块
-        _ppt_rect(slide, 0.42, 0.42, SLIDE_W - 0.84, SLIDE_H - 0.84,
+        _ppt_rect(slide, deco["inset1"], deco["inset1"],
+                  SLIDE_W - 2 * deco["inset1"], SLIDE_H - 2 * deco["inset1"],
                   fill=None, line=th["line"], line_w=1.2)
-        _ppt_rect(slide, 0.52, 0.52, SLIDE_W - 1.04, SLIDE_H - 1.04,
+        _ppt_rect(slide, deco["inset2"], deco["inset2"],
+                  SLIDE_W - 2 * deco["inset2"], SLIDE_H - 2 * deco["inset2"],
                   fill=None, line=th["accent"], line_w=0.75)
-        _ppt_rect(slide, 10.75, 4.55, 0.62, 0.62, fill=th["primary"],
-                  shape="round")
-        title_x = 1.35
-        title_w = 10.2
+        _ppt_rect(slide, deco["seal_x"], deco["seal_y"], deco["seal"],
+                  deco["seal"], fill=th["primary"], shape="round")
+        title_x = deco["title_x"]
     else:                                   # 商务简约：底部色带
-        _ppt_rect(slide, 0, 5.72, SLIDE_W, 1.78, fill=th["primary_dark"])
-        _ppt_rect(slide, 0, 5.72, SLIDE_W, 0.05, fill=th["accent"])
-        _ppt_rect(slide, 0.85, 1.05, 1.4, 0.05, fill=th["primary"])
-        title_x = 0.85
-        title_y = 2.15
+        _ppt_rect(slide, 0, deco["band_y"], SLIDE_W, deco["band_h"],
+                  fill=th["primary_dark"])
+        _ppt_rect(slide, 0, deco["band_y"], SLIDE_W, deco["accent_h"],
+                  fill=th["accent"])
+        _ppt_rect(slide, deco["rule_x"], deco["rule_y"], deco["rule_w"],
+                  deco["rule_h"], fill=th["primary"])
+        title_x = deco["title_x"]
+
+    center = str(align or "left").strip().lower() == "center"
+    if center:
+        title_x = (SLIDE_W - title_w) / 2.0
+    p_align = PP_ALIGN.CENTER if center else PP_ALIGN.LEFT
 
     ph = slide.shapes.title
     if ph is not None:
         ph.left, ph.top = Inches(title_x), Inches(title_y)
-        ph.width, ph.height = Inches(title_w), Inches(1.9)
+        ph.width, ph.height = Inches(title_w), Inches(cfg["title_h"])
         tf = ph.text_frame
         tf.clear()
         tf.word_wrap = True
@@ -1966,15 +2034,16 @@ def _ppt_cover(prs, th, deck_title, subtitle, meta_lines):
         for m in ("margin_left", "margin_right", "margin_top", "margin_bottom"):
             setattr(tf, m, Inches(0))
         p = tf.paragraphs[0]
-        p.alignment = PP_ALIGN.LEFT
-        p.line_spacing = 1.12
+        p.alignment = p_align
+        p.line_spacing = sp["line_tight"]
         run = p.add_run()
         run.text = inline_plain(deck_title)
-        size = _ppt_fit_size(run.text, title_w - 0.2,
-                             th["size"]["cover_title"], min_size=26)
+        base = _ppt_size(th, "cover_title")
+        size = _ppt_fit_size(run.text, title_w - 0.2, base,
+                             min_size=sp["cover_fit_min"])
         # 标题过长时允许折成两行：按长度再压一档
-        if size < th["size"]["cover_title"] - 6:
-            size = max(size, 28)
+        if size < base - 6:
+            size = max(size, sp["cover_two_line_min"])
         _ppt_font_run(run, PPT_FONT, size, th["text"], bold=True)
 
     sub_ph = None
@@ -1984,8 +2053,10 @@ def _ppt_cover(prs, th, deck_title, subtitle, meta_lines):
             break
     if sub_ph is not None:
         if subtitle:
-            sub_ph.left, sub_ph.top = Inches(title_x), Inches(title_y + 1.55)
-            sub_ph.width, sub_ph.height = Inches(title_w * 0.92), Inches(0.9)
+            sub_ph.left, sub_ph.top = (Inches(title_x),
+                                       Inches(title_y + cfg["sub_offset_y"]))
+            sub_ph.width = Inches(title_w * cfg["sub_w_ratio"])
+            sub_ph.height = Inches(cfg["sub_h"])
             tf = sub_ph.text_frame
             tf.clear()
             tf.word_wrap = True
@@ -1993,10 +2064,10 @@ def _ppt_cover(prs, th, deck_title, subtitle, meta_lines):
                       "margin_bottom"):
                 setattr(tf, m, Inches(0))
             p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.LEFT
+            p.alignment = p_align
             run = p.add_run()
             run.text = inline_plain(subtitle)
-            _ppt_font_run(run, PPT_FONT, th["size"]["cover_sub"],
+            _ppt_font_run(run, PPT_FONT, _ppt_size(th, "cover_sub"),
                           th["primary"] if not th["is_dark"] else th["accent"])
         else:
             _ppt_drop_shape(sub_ph)
@@ -2006,56 +2077,70 @@ def _ppt_cover(prs, th, deck_title, subtitle, meta_lines):
     if meta_lines:
         meta = "　　|　　".join([x for x in meta_lines if x])
         color = th["on_primary"] if style == "band" else th["muted"]
-        my = 6.35 if style == "band" else (5.05 if style == "bar" else 5.55)
-        if style == "frame":
-            my = 5.35
-        box = _ppt_textbox(slide, title_x, my, title_w, 0.5)
+        my = cfg["meta_y"].get(style, cfg["meta_y"]["glow"])
+        box = _ppt_textbox(slide, title_x, my, title_w, cfg["meta_h"])
         p = box.text_frame.paragraphs[0]
+        p.alignment = p_align
         r = p.add_run()
         r.text = meta
-        _ppt_font_run(r, PPT_FONT, th["size"]["cover_meta"], color)
+        _ppt_font_run(r, PPT_FONT, _ppt_size(th, "cover_meta"), color)
 
     # 封面上的小标记
     if style in ("bar", "frame"):
-        kick = _ppt_textbox(slide, title_x, 1.55 if style == "bar" else 1.5,
-                            title_w, 0.4)
+        ky = cfg["kicker_y"].get(style, cfg["kicker_y"]["bar"])
+        kick = _ppt_textbox(slide, title_x, ky, title_w, 0.4)
         p = kick.text_frame.paragraphs[0]
+        p.alignment = p_align
         r = p.add_run()
-        r.text = "P R E S E N T A T I O N"
-        _ppt_font_run(r, PPT_FONT, 10, th["accent"])
+        r.text = cfg["kicker_text"]
+        _ppt_font_run(r, PPT_FONT, cfg["kicker_size"], th["accent"])
     return slide
 
 
-def _ppt_toc(prs, th, entries, page_no):
+def _ppt_toc(prs, th, entries, page_no, style=None):
+    """目录页。``style``：``numbered``（默认，带两位序号）/ ``plain``（极简，无序号）。"""
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
+    tc = _PPT_GRID["toc"]
+    tsp = _PPT_SPACING["toc"]
+    plain = str(style or "numbered").strip().lower() == "plain"
+
     slide = _ppt_new_slide(prs, th, 5)
     _ppt_title(slide, th, "目 录")
     n = len(entries)
-    two_col = n > 6
+    two_col = n > tc["two_col_over"]
     per = (n + 1) // 2 if two_col else n
-    col_w = (CONTENT_W - 0.6) / 2.0 if two_col else CONTENT_W
-    y0 = BODY_TOP + 0.15
-    row_h = min(0.78, (BODY_BOTTOM - y0 - 0.1) / max(per, 1))
+    col_w = (CONTENT_W - tc["col_gap"]) / 2.0 if two_col else CONTENT_W
+    y0 = BODY_TOP + tc["top_offset"]
+    row_h = min(tc["row_h_max"],
+                (BODY_BOTTOM - y0 - tc["bottom_pad"]) / max(per, 1))
+    text_w = col_w if plain else col_w - (tc["num_w"] + tsp["text_gap"])
     for i, (num, text) in enumerate(entries):
         ci = 0 if i < per else 1
         ri = i if ci == 0 else i - per
-        x = MARGIN_X + ci * (col_w + 0.6)
+        x = MARGIN_X + ci * (col_w + tc["col_gap"])
         y = y0 + ri * row_h
-        # 序号
-        nb = _ppt_textbox(slide, x, y, 0.85, row_h - 0.12, anchor="m")
-        p = nb.text_frame.paragraphs[0]
-        r = p.add_run()
-        r.text = num
-        _ppt_font_run(r, PPT_FONT, th["size"]["toc"] - 2, th["accent"], bold=True)
+        if not plain:
+            # 序号
+            nb = _ppt_textbox(slide, x, y, tc["num_w"],
+                              row_h - tc["row_inner_pad"], anchor="m")
+            p = nb.text_frame.paragraphs[0]
+            r = p.add_run()
+            r.text = num
+            _ppt_font_run(r, PPT_FONT, _ppt_size(th, "toc", -tsp["num_size_sub"]),
+                          th["accent"], bold=True)
         # 标题
-        tb = _ppt_textbox(slide, x + 0.85, y, col_w - 1.0, row_h - 0.12, anchor="m")
+        tx = x if plain else x + tc["num_w"]
+        tb = _ppt_textbox(slide, tx, y, text_w,
+                          row_h - tc["row_inner_pad"], anchor="m")
         p2 = tb.text_frame.paragraphs[0]
         r2 = p2.add_run()
         r2.text = inline_plain(text)
-        size = _ppt_fit_size(r2.text, col_w - 1.0, th["size"]["toc"], 11)
+        size = _ppt_fit_size(r2.text, text_w, _ppt_size(th, "toc"),
+                             tsp["size_min"])
         _ppt_font_run(r2, PPT_FONT, size, th["text"], bold=False)
-        _ppt_rect(slide, x, y + row_h - 0.13, col_w - 0.15, 0.008, fill=th["line"])
+        _ppt_rect(slide, x, y + row_h - tc["row_bottom_gap"],
+                  col_w - tsp["text_gap"], tsp["rule_h"], fill=th["line"])
     _ppt_footer(slide, th, page_no)
     return slide
 
@@ -2063,6 +2148,8 @@ def _ppt_toc(prs, th, entries, page_no):
 def _ppt_section(prs, th, num, title, page_no, subtitle=""):
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
+    sec = _PPT_SECTION
+    deco = sec["deco"]
     slide = _ppt_new_slide(prs, th, 5)
     # 先删掉标题占位符（章节页要自己排版）
     ph = slide.shapes.title
@@ -2070,67 +2157,84 @@ def _ppt_section(prs, th, num, title, page_no, subtitle=""):
         _ppt_drop_shape(ph)
 
     style = th.get("cover_style")
+    d = deco["panel"]
+    nx, ny, tx = d["num_x"], d["num_y"], d["title_x"]
     if style == "glow":
-        _ppt_rect(slide, 0, 0, SLIDE_W, 0.06, fill=th["primary"])
-        _ppt_rect(slide, 8.9, 1.0, 4.4, 4.4, fill=th["bg_alt"], shape="oval")
-        nx, ny = MARGIN_X + 0.1, 1.25
-        tx = MARGIN_X + 0.15
+        g = deco["glow"]
+        _ppt_rect(slide, 0, 0, SLIDE_W, g["top_h"], fill=th["primary"])
+        _ppt_rect(slide, g["oval_x"], g["oval_y"], g["oval"], g["oval"],
+                  fill=th["bg_alt"], shape="oval")
+        nx, ny = MARGIN_X + g["num_x_add"], g["num_y"]
+        tx = MARGIN_X + g["title_x_add"]
     elif style == "frame":
+        f = deco["frame"]
         _ppt_rect(slide, 0, 0, SLIDE_W, SLIDE_H, fill=th["bg_alt"])
-        _ppt_rect(slide, 0.5, 0.5, SLIDE_W - 1.0, SLIDE_H - 1.0,
+        _ppt_rect(slide, f["border_inset"], f["border_inset"],
+                  SLIDE_W - 2 * f["border_inset"],
+                  SLIDE_H - 2 * f["border_inset"],
                   fill=None, line=th["accent"], line_w=0.9)
-        nx, ny = SLIDE_W / 2 - 1.4, 1.55
+        nx, ny = SLIDE_W / 2 - f["num_x_off"], f["num_y"]
         tx = 0
     else:
-        _ppt_rect(slide, 0, 0, 4.9, SLIDE_H, fill=th["primary"])
-        _ppt_rect(slide, 4.9, 0, 0.07, SLIDE_H, fill=th["accent"])
-        nx, ny = 0.55, 1.7
-        tx = 5.6
+        _ppt_rect(slide, 0, 0, d["panel_w"], SLIDE_H, fill=th["primary"])
+        _ppt_rect(slide, d["panel_w"], 0, d["strip_w"], SLIDE_H,
+                  fill=th["accent"])
 
     if style == "frame":
-        box = _ppt_textbox(slide, nx, ny, 2.8, 1.9, anchor="m")
+        box = _ppt_textbox(slide, nx, ny, 2.8, sec["num_box_h_center"], anchor="m")
         p = box.text_frame.paragraphs[0]
         p.alignment = PP_ALIGN.CENTER
         r = p.add_run()
         r.text = num
-        _ppt_font_run(r, PPT_FONT, th["size"]["section_num"], th["accent"], bold=True)
-        tb = _ppt_textbox(slide, 0.9, 3.55, SLIDE_W - 1.8, 0.9, anchor="m")
+        _ppt_font_run(r, PPT_FONT, _ppt_size(th, "section_num"), th["accent"],
+                      bold=True)
+        tb = _ppt_textbox(slide, sec["frame_title_x"], sec["frame_title_y"],
+                          SLIDE_W - sec["frame_title_inset"],
+                          sec["frame_title_h"], anchor="m")
         p2 = tb.text_frame.paragraphs[0]
         p2.alignment = PP_ALIGN.CENTER
         r2 = p2.add_run()
         r2.text = inline_plain(title)
-        _ppt_font_run(r2, PPT_FONT, th["size"]["section_title"] - 2, th["primary"], bold=True)
-        _ppt_rect(slide, SLIDE_W / 2 - 1.2, 4.75, 2.4, 0.02, fill=th["accent"])
+        _ppt_font_run(r2, PPT_FONT,
+                      _ppt_size(th, "section_title", -sec["frame_title_sub"]),
+                      th["primary"], bold=True)
+        _ppt_rect(slide, SLIDE_W / 2 - sec["frame_rule_off"], sec["frame_rule_y"],
+                  sec["frame_rule_w"], sec["frame_rule_h"], fill=th["accent"])
         if subtitle:
-            sb = _ppt_textbox(slide, 1.4, 5.0, SLIDE_W - 2.8, 0.6, anchor="m")
+            sb = _ppt_textbox(slide, sec["frame_sub_inset"], sec["frame_sub_y"],
+                              SLIDE_W - 2 * sec["frame_sub_inset"],
+                              sec["frame_sub_h"], anchor="m")
             sp = sb.text_frame.paragraphs[0]
             sp.alignment = PP_ALIGN.CENTER
             sr = sp.add_run()
             sr.text = inline_plain(subtitle)
-            _ppt_font_run(sr, PPT_FONT, 14, th["muted"])
+            _ppt_font_run(sr, PPT_FONT, sec["sub_size"], th["muted"])
     else:
-        box = _ppt_textbox(slide, nx, ny, 3.2, 1.85, anchor="m")
+        box = _ppt_textbox(slide, nx, ny, sec["num_box_w"], sec["num_box_h"],
+                           anchor="m")
         p = box.text_frame.paragraphs[0]
         r = p.add_run()
         r.text = num
-        _ppt_font_run(r, PPT_FONT, th["size"]["section_num"],
+        _ppt_font_run(r, PPT_FONT, _ppt_size(th, "section_num"),
                       th["on_primary"] if style != "glow" else th["primary"],
                       bold=True)
-        _ppt_rect(slide, nx, ny + 1.95, 1.5, 0.03,
-                  fill=th["accent"])
+        _ppt_rect(slide, nx, ny + sec["rule_y_offset"], sec["rule_w"],
+                  sec["rule_h"], fill=th["accent"])
         tw = SLIDE_W - tx - MARGIN_X
-        tb = _ppt_textbox(slide, tx, 2.55, tw, 1.5, anchor="m")
+        tb = _ppt_textbox(slide, tx, sec["title_y"], tw, sec["title_h"],
+                          anchor="m")
         p2 = tb.text_frame.paragraphs[0]
         r2 = p2.add_run()
         r2.text = inline_plain(title)
-        size = _ppt_fit_size(r2.text, tw, th["size"]["section_title"], 20)
+        size = _ppt_fit_size(r2.text, tw, _ppt_size(th, "section_title"),
+                             sec["title_min_size"])
         _ppt_font_run(r2, PPT_FONT, size, th["text"], bold=True)
         if subtitle:
-            sb = _ppt_textbox(slide, tx, 4.05, tw, 1.0)
+            sb = _ppt_textbox(slide, tx, sec["sub_y"], tw, sec["sub_h"])
             sp = sb.text_frame.paragraphs[0]
             sr = sp.add_run()
             sr.text = inline_plain(subtitle)
-            _ppt_font_run(sr, PPT_FONT, 14, th["muted"])
+            _ppt_font_run(sr, PPT_FONT, sec["sub_size"], th["muted"])
     _ppt_footer(slide, th, page_no)
     return slide
 
@@ -2142,9 +2246,10 @@ def _ppt_table(slide, th, header, rows, x=MARGIN_X, y=BODY_TOP,
     from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
     nrow = len(rows) + 1
     ncol = max([len(header)] + [len(r) for r in rows] + [1])
+    tg = _PPT_GRID["table"]
     h = h or (BODY_BOTTOM - y)
-    row_h = min(0.46, h / max(nrow, 1))
-    base = max_size or th["size"]["table"]
+    row_h = min(tg["row_h_max"], h / max(nrow, 1))
+    base = max_size or _ppt_size(th, "table")
     # 行太多就压字号
     if row_h < 0.3:
         base = max(8, base - 2)
@@ -2164,7 +2269,7 @@ def _ppt_table(slide, th, header, rows, x=MARGIN_X, y=BODY_TOP,
         for r in rows:
             if j < len(r):
                 widest = max(widest, len(str(r[j])))
-        weights.append(max(widest, 3) ** 0.75)
+        weights.append(max(widest, tg["min_col_weight"]) ** 0.75)
     total = sum(weights) or 1.0
     widths = [max(w * 0.09, w * ww / total) for ww in weights]
     scale = w / sum(widths)
@@ -2174,10 +2279,10 @@ def _ppt_table(slide, th, header, rows, x=MARGIN_X, y=BODY_TOP,
         tbl.rows[i].height = Inches(row_h)
 
     def style_cell(cell, text, is_head, ri):
-        cell.margin_left = Inches(0.10)
-        cell.margin_right = Inches(0.10)
-        cell.margin_top = Inches(0.03)
-        cell.margin_bottom = Inches(0.03)
+        cell.margin_left = Inches(tg["cell_margin_x"])
+        cell.margin_right = Inches(tg["cell_margin_x"])
+        cell.margin_top = Inches(tg["cell_margin_y"])
+        cell.margin_bottom = Inches(tg["cell_margin_y"])
         cell.vertical_anchor = MSO_ANCHOR.MIDDLE
         cell.fill.solid()
         if is_head:
@@ -2230,7 +2335,7 @@ def _ppt_chart(slide, th, labels, values, series, x, y, w, h, ctype="bar"):
     chart.has_title = False
     try:
         chart.font.name = PPT_FONT
-        chart.font.size = Pt(th["size"]["table"])
+        chart.font.size = Pt(_ppt_size(th, "table"))
         chart.font.color.rgb = _c(th["text"])
     except Exception:
         pass
@@ -2242,7 +2347,7 @@ def _ppt_chart(slide, th, labels, values, series, x, y, w, h, ctype="bar"):
     try:
         plot.has_data_labels = True
         dl = plot.data_labels
-        dl.font.size = Pt(th["size"]["table"] - 1)
+        dl.font.size = Pt(_ppt_size(th, "table", -1))
         dl.font.name = PPT_FONT
         dl.font.bold = True
         dl.font.color.rgb = _c(th["text"])
@@ -2264,7 +2369,7 @@ def _ppt_chart(slide, th, labels, values, series, x, y, w, h, ctype="bar"):
     # 坐标轴
     try:
         ca = chart.category_axis
-        ca.tick_labels.font.size = Pt(th["size"]["table"] - 1)
+        ca.tick_labels.font.size = Pt(_ppt_size(th, "table", -1))
         ca.tick_labels.font.name = PPT_FONT
         ca.tick_labels.font.color.rgb = _c(th["muted"])
         ca.format.line.color.rgb = _c(th["line"])
@@ -2272,7 +2377,7 @@ def _ppt_chart(slide, th, labels, values, series, x, y, w, h, ctype="bar"):
         va.has_major_gridlines = True
         va.major_gridlines.format.line.color.rgb = _c(th["line"])
         va.major_gridlines.format.line.width = Pt(0.5)
-        va.tick_labels.font.size = Pt(th["size"]["table"] - 2)
+        va.tick_labels.font.size = Pt(_ppt_size(th, "table", -2))
         va.tick_labels.font.name = PPT_FONT
         va.tick_labels.font.color.rgb = _c(th["muted"])
         va.format.line.fill.background()
@@ -2285,36 +2390,42 @@ def _ppt_visual_card(slide, th, x, y, w, h, caption="图示区"):
     """没有真图时的「图示占位卡片」——看起来是设计过的版式，不是忘了放东西。"""
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
+    vc = _PPT_GRID["visual_card"]
     _ppt_rect(slide, x, y, w, h, fill=th["bg_alt"], line=th["line"],
               shape="round", line_w=1.0, dash=True)
     # 中间画一个简单的柱状示意
-    for i, hh in enumerate((0.35, 0.62, 0.48, 0.8, 0.55)):
-        bh = h * hh * 0.55
-        bw = w * 0.075
-        bx = x + w * (0.22 + i * 0.13)
-        _ppt_rect(slide, bx, y + h * 0.62 - bh, bw, bh,
+    for i, hh in enumerate(vc["bar_heights"]):
+        bh = h * hh * vc["bar_height_ratio"]
+        bw = w * vc["bar_width_ratio"]
+        bx = x + w * (vc["bar_start_ratio"] + i * vc["bar_step_ratio"])
+        _ppt_rect(slide, bx, y + h * vc["baseline_ratio"] - bh, bw, bh,
                   fill=th["primary"] if i % 2 == 0 else th["accent"])
-    _ppt_rect(slide, x + w * 0.14, y + h * 0.62, w * 0.72, 0.012, fill=th["line"])
-    box = _ppt_textbox(slide, x + 0.2, y + h * 0.70, w - 0.4, h * 0.24)
+    _ppt_rect(slide, x + w * vc["rule_x_ratio"], y + h * vc["baseline_ratio"],
+              w * vc["rule_w_ratio"], vc["rule_h"], fill=th["line"])
+    box = _ppt_textbox(slide, x + vc["caption_pad"],
+                       y + h * vc["caption_ratio"], w - 2 * vc["caption_pad"],
+                       h * vc["caption_h_ratio"])
     p = box.text_frame.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     r = p.add_run()
     r.text = caption
-    _ppt_font_run(r, PPT_FONT, 12, th["muted"])
+    _ppt_font_run(r, PPT_FONT, _PTT_TEXT["card_caption_size"], th["muted"])
 
 
 def _ppt_two_col(prs, th, title, items, visual, page_no):
-    """左文右图版式：left 6.15in 文字，right 4.7in 图/图表/占位。"""
+    """左文右图版式：左边 ``grid.two_col.left_w`` 英寸文字，右边余下宽度给图/图表/占位。"""
     from pptx.util import Inches
+    g = _PPT_GRID["two_col"]
     slide = _ppt_new_slide(prs, th, 5)
     _ppt_title(slide, th, title)
-    left_w = 6.15
-    _ppt_bullets_body(slide, th, items, x=MARGIN_X, y=BODY_TOP + 0.1,
-                      w=left_w, h=BODY_BOTTOM - BODY_TOP - 0.1)
-    vx = MARGIN_X + left_w + 0.55
+    left_w = g["left_w"]
+    _ppt_bullets_body(slide, th, items, x=MARGIN_X,
+                      y=BODY_TOP + g["body_offset_y"], w=left_w,
+                      h=BODY_BOTTOM - BODY_TOP - g["body_offset_y"])
+    vx = MARGIN_X + left_w + g["gap"]
     vw = SLIDE_W - vx - MARGIN_X
-    vy = BODY_TOP + 0.15
-    vh = BODY_BOTTOM - vy - 0.1
+    vy = BODY_TOP + g["visual_offset_y"]
+    vh = BODY_BOTTOM - vy - g["visual_bottom_pad"]
     kind = visual.get("kind")
     if kind == "chart":
         _ppt_chart(slide, th, visual.get("labels"), visual.get("values"),
@@ -2340,16 +2451,18 @@ def _ppt_two_col(prs, th, title, items, visual, page_no):
 
 
 def _ppt_table_slide(prs, th, title, header, rows, page_no, sub=""):
+    tg = _PPT_GRID["table"]
     slide = _ppt_new_slide(prs, th, 5)
     _ppt_title(slide, th, title)
-    y = BODY_TOP + 0.15
+    y = BODY_TOP + tg["body_start_offset"]
     if sub:
-        box = _ppt_textbox(slide, MARGIN_X, y - 0.06, CONTENT_W, 0.4)
+        box = _ppt_textbox(slide, MARGIN_X, y + tg["sub_offset_y"], CONTENT_W,
+                           tg["sub_h"])
         p = box.text_frame.paragraphs[0]
         r = p.add_run()
         r.text = inline_plain(sub)
-        _ppt_font_run(r, PPT_FONT, 12, th["muted"])
-        y += 0.34
+        _ppt_font_run(r, PPT_FONT, _PTT_TEXT["note_size"], th["muted"])
+        y += tg["sub_advance_y"]
     _ppt_table(slide, th, header, rows, x=MARGIN_X, y=y, h=BODY_BOTTOM - y)
     _ppt_footer(slide, th, page_no)
     return slide
@@ -2366,30 +2479,33 @@ def _ppt_chart_slide(prs, th, title, labels, values, series, ctype, page_no,
         p = box.text_frame.paragraphs[0]
         r = p.add_run()
         r.text = inline_plain(note)
-        _ppt_font_run(r, PPT_FONT, 11, th["muted"])
+        _ppt_font_run(r, PPT_FONT, _PTT_TEXT["chart_note_size"], th["muted"])
     _ppt_footer(slide, th, page_no)
     return slide
 
 
 def _ppt_code_slide(prs, th, title, code, page_no):
     from pptx.util import Inches
+    cg = _PPT_GRID["code"]
     slide = _ppt_new_slide(prs, th, 5)
     _ppt_title(slide, th, title)
     y = BODY_TOP + 0.12
     h = BODY_BOTTOM - y
     _ppt_rect(slide, MARGIN_X, y, CONTENT_W, h,
               fill=th["bg_alt"], shape="round")
-    box = _ppt_textbox(slide, MARGIN_X + 0.22, y + 0.16,
-                       CONTENT_W - 0.44, h - 0.3,
+    box = _ppt_textbox(slide, MARGIN_X + cg["inner_pad_x"], y + cg["inner_pad_y"],
+                       CONTENT_W - 2 * cg["inner_pad_x"],
+                       h - 2 * cg["inner_pad_y"] + cg["box_h_extra"],
                        margins=(0.05, 0.05, 0.05, 0.05))
     tf = box.text_frame
-    lines = (code or "").split("\n")[:18]
+    lines = (code or "").split("\n")[:cg["max_lines"]]
     # 按最长行估字号
     longest = max([text_em(ln) for ln in lines] + [1])
-    size = min(13.0, max(9.0, (CONTENT_W - 0.5) * 72.0 / max(longest, 1)))
+    size = min(cg["size_max"],
+               max(cg["size_min"], (CONTENT_W - 0.5) * 72.0 / max(longest, 1)))
     for i, ln in enumerate(lines):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.line_spacing = 1.12
+        p.line_spacing = _PPT_SPACING["line_tight"]
         r = p.add_run()
         r.text = ln
         _ppt_font_run(r, PPT_FONT_MONO, size, th["text"])
@@ -2399,10 +2515,11 @@ def _ppt_code_slide(prs, th, title, code, page_no):
 
 def _ppt_image_slide(prs, th, title, path, caption, page_no):
     from pptx.util import Inches
+    ig = _PPT_GRID["image"]
     slide = _ppt_new_slide(prs, th, 5)
     _ppt_title(slide, th, title)
-    y = BODY_TOP + 0.1
-    h = BODY_BOTTOM - y - (0.45 if caption else 0.05)
+    y = BODY_TOP + ig["top_offset"]
+    h = BODY_BOTTOM - y - (ig["caption_h"] if caption else ig["no_caption_pad"])
     try:
         pic = slide.shapes.add_picture(path, Inches(MARGIN_X), Inches(y),
                                        height=Inches(h))
@@ -2415,12 +2532,13 @@ def _ppt_image_slide(prs, th, title, path, caption, page_no):
     except Exception:
         _ppt_visual_card(slide, th, MARGIN_X, y, CONTENT_W, h, "图片加载失败")
     if caption:
-        box = _ppt_textbox(slide, MARGIN_X, y + h + 0.06, CONTENT_W, 0.35)
+        box = _ppt_textbox(slide, MARGIN_X, y + h + ig["caption_gap"], CONTENT_W,
+                           0.35)
         p = box.text_frame.paragraphs[0]
         p.alignment = 2  # CENTER
         r = p.add_run()
         r.text = inline_plain(caption)
-        _ppt_font_run(r, PPT_FONT, 11, th["muted"])
+        _ppt_font_run(r, PPT_FONT, _PTT_TEXT["caption_size"], th["muted"])
     _ppt_footer(slide, th, page_no)
     return slide
 
@@ -2428,37 +2546,47 @@ def _ppt_image_slide(prs, th, title, path, caption, page_no):
 def _ppt_end(prs, th, title, subtitle, page_no):
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
+    ec = _PPT_END
+    d = ec["deco"]
     slide = _ppt_new_slide(prs, th, 5)
     ph = slide.shapes.title
     if ph is not None:
         _ppt_drop_shape(ph)
     style = th.get("cover_style")
     if style == "glow":
-        _ppt_rect(slide, 8.6, 0.4, 5.2, 5.2, fill=th["bg_alt"], shape="oval")
-        _ppt_rect(slide, 0, 0, SLIDE_W, 0.06, fill=th["primary"])
+        _ppt_rect(slide, d["glow"]["oval_x"], d["glow"]["oval_y"],
+                  d["glow"]["oval"], d["glow"]["oval"], fill=th["bg_alt"],
+                  shape="oval")
+        _ppt_rect(slide, 0, 0, SLIDE_W, d["glow"]["top_h"], fill=th["primary"])
     elif style == "frame":
-        _ppt_rect(slide, 0.42, 0.42, SLIDE_W - 0.84, SLIDE_H - 0.84,
-                  fill=None, line=th["accent"], line_w=0.9)
+        _ppt_rect(slide, d["frame"]["inset"], d["frame"]["inset"],
+                  SLIDE_W - 2 * d["frame"]["inset"],
+                  SLIDE_H - 2 * d["frame"]["inset"],
+                  fill=None, line=th["accent"], line_w=d["frame"]["line_w"])
     elif style == "band":
-        _ppt_rect(slide, 0, 5.9, SLIDE_W, 1.6, fill=th["primary_dark"])
+        _ppt_rect(slide, 0, d["band"]["band_y"], SLIDE_W, d["band"]["band_h"],
+                  fill=th["primary_dark"])
     else:
-        _ppt_rect(slide, 0, 0, 0.42, SLIDE_H, fill=th["primary"])
+        _ppt_rect(slide, 0, 0, d["panel"]["rail_w"], SLIDE_H, fill=th["primary"])
 
-    box = _ppt_textbox(slide, MARGIN_X, 2.45, CONTENT_W, 1.35, anchor="m")
+    box = _ppt_textbox(slide, MARGIN_X, ec["title_y"], CONTENT_W, ec["title_h"],
+                       anchor="m")
     p = box.text_frame.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     r = p.add_run()
     r.text = inline_plain(title or "谢 谢")
-    _ppt_font_run(r, PPT_FONT, th["size"]["end_title"], th["text"], bold=True)
-    _ppt_rect(slide, SLIDE_W / 2 - 0.9, 3.95, 1.8, 0.03, fill=th["accent"])
+    _ppt_font_run(r, PPT_FONT, _ppt_size(th, "end_title"), th["text"], bold=True)
+    _ppt_rect(slide, SLIDE_W / 2 - ec["rule_w"] / 2, ec["rule_y"], ec["rule_w"],
+              ec["rule_h"], fill=th["accent"])
     if subtitle:
-        box2 = _ppt_textbox(slide, MARGIN_X + 1.2, 4.2, CONTENT_W - 2.4, 0.7,
+        box2 = _ppt_textbox(slide, MARGIN_X + ec["sub_w_pad"], ec["sub_y"],
+                            CONTENT_W - 2 * ec["sub_w_pad"], ec["sub_h"],
                             anchor="m")
         p2 = box2.text_frame.paragraphs[0]
         p2.alignment = PP_ALIGN.CENTER
         r2 = p2.add_run()
         r2.text = inline_plain(subtitle)
-        _ppt_font_run(r2, PPT_FONT, 16, th["muted"])
+        _ppt_font_run(r2, PPT_FONT, ec["sub_size"], th["muted"])
     _ppt_footer(slide, th, page_no)
     return slide
 
@@ -2649,18 +2777,28 @@ def _is_chartable_table(tb):
 
 
 def write_pptx(path, blocks, title=None, base_dir=None, theme=None,
-               author=None, subtitle=None, date=None, **kw):
+               author=None, subtitle=None, date=None, template=None, **kw):
     """把 blocks 写成主题化的 .pptx 演示文稿。
 
     版式：封面 / 目录 / 章节过渡 / 要点 / 两栏图文 / 表格 / 原生图表 / 代码 / 结尾。
+    几何与字号来自 ``app/officetpl/pptx_spec.py``，配色来自 ``themes.py``。
+
+    参数 ``template`` 是「成品模板」（汇报蓝 / 科技深色 / 国风红 / 极简灰），
+    用来一次性选定主题 + 版式取向；显式传 ``theme`` 时以 ``theme`` 为准。
     """
     from pptx import Presentation
     from pptx.util import Inches
 
-    th = get_theme(theme)
+    # 模板预设：先定主题，再定版式取向（没传 template 时全部走历史默认行为）
+    preset = get_preset(template) if template else None
+    theme_arg = theme if theme else (preset["theme"] if preset else None)
+    th = get_theme(theme_arg)
+    cover_align = (preset or {}).get("cover_align") or "left"
+    toc_style = (preset or {}).get("toc_style") or "numbered"
+
     prs = Presentation()
-    prs.slide_width = Inches(SLIDE_W)
-    prs.slide_height = Inches(SLIDE_H)
+    prs.slide_width = Inches(_PPT_SPEC["slide"]["width_in"])
+    prs.slide_height = Inches(_PPT_SPEC["slide"]["height_in"])
 
     deck = _build_plan(blocks, title=title, base_dir=base_dir)
     deck_title = deck["title"]
@@ -2685,9 +2823,9 @@ def write_pptx(path, blocks, title=None, base_dir=None, theme=None,
         kind = item["kind"]
         try:
             if kind == "cover":
-                _ppt_cover(prs, th, item["title"], sub, meta)
+                _ppt_cover(prs, th, item["title"], sub, meta, align=cover_align)
             elif kind == "toc":
-                _ppt_toc(prs, th, item["entries"], page_no)
+                _ppt_toc(prs, th, item["entries"], page_no, style=toc_style)
             elif kind == "section":
                 _ppt_section(prs, th, item["num"], item["title"], page_no)
             elif kind == "bullets":
@@ -2752,8 +2890,13 @@ def write_pptx(path, blocks, title=None, base_dir=None, theme=None,
     try:
         prs.core_properties.title = deck_title
         prs.core_properties.author = author or "AIWorkbench"
-        prs.core_properties.subject = f"主题：{th['name']}"
-        prs.core_properties.comments = "由 AIWorkbench 生成（officetpl 主题化版式）"
+        subject = f"主题：{th['name']}"
+        if preset:
+            subject += f"；模板：{preset['name']}（{preset['key']}）"
+        prs.core_properties.subject = subject
+        prs.core_properties.comments = (
+            "由 AIWorkbench 生成（app/officetpl/pptx_spec.py 版式规格 + "
+            "themes.py 主题配色）")
     except Exception:
         pass
     prs.save(path)
@@ -2946,10 +3089,12 @@ def format_label(path):
 
 
 def create(path, content, title=None, base_dir=None, theme=None, author=None,
-           subtitle=None, date=None):
+           subtitle=None, date=None, template=None):
     """按扩展名把 Markdown 内容写成目标文档，返回 (描述, 字节数)。
 
     新增参数全部可选，老调用 ``create(path, content, title=, base_dir=)`` 行为不变。
+    ``template``（PPT 成品模板：汇报蓝 / 科技深色 / 国风红 / 极简灰）只对 .pptx 生效，
+    其它格式会忽略（它们的 writer 收 **kw）。
     """
     ext = os.path.splitext(path or "")[1].lower()
     if ext not in FORMATS:
@@ -2959,6 +3104,6 @@ def create(path, content, title=None, base_dir=None, theme=None, author=None,
     label, writer = FORMATS[ext]
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     writer(path, blocks, title=title, base_dir=base_dir, theme=theme,
-           author=author, subtitle=subtitle, date=date)
+           author=author, subtitle=subtitle, date=date, template=template)
     size = os.path.getsize(path) if os.path.exists(path) else 0
     return label, size

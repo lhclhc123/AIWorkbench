@@ -2,8 +2,9 @@
 """IM 助手「要不要回、怎么回」的判定与人设（v9.20.0）。
 
 三件事：
-1. `should_reply()` —— 这条消息该不该接？三种模式规则不同，且必须挡住
-   "自己回自己"（否则群里会自己跟自己聊起来）。
+1. `should_reply()` —— 这条消息该不该接？**群聊只回 @ 我的消息（v9.22.8
+   用户硬性要求，与 mode / 白名单 / scope_* 无关）**，私聊默认都回；同时必须
+   挡住"自己回自己"（否则群里会自己跟自己聊起来）。
 2. `build_system()` —— 拼系统提示。核心是**说人话**：不客服腔、不列表化、
    不做"作为 AI 助手我很乐意"这种腔调。
 3. `build_messages()` —— 把消息流水折成模型能吃的上下文（共享记忆 + 本会话记忆
@@ -17,7 +18,8 @@ from .store import MODES, DEFAULT_MODE
 # 「叫我」的默认称呼（会话档案里没写时用）
 DEFAULT_ALIASES = ("小助手", "助手", "AI", "ai")
 
-# 秘书/群助手模式下，群里即使没 @ 也当成指令的开头词
+# ⚠ v9.22.8 起这组词**只用于 `reply_style_hint()` 判断该用什么口吻回复**，
+#   不再参与「要不要回」的判定（群聊只认 @ 我，见 `is_mentioned()`）。
 _COMMAND_HEADS = (
     "帮我", "帮忙", "给我", "记录一下", "记一下", "记住", "查一下", "查查",
     "提醒", "安排", "统计", "汇总", "整理", "发一下", "发个", "生成", "写个",
@@ -54,6 +56,39 @@ def is_called(text, me_name="", aliases=DEFAULT_ALIASES):
     return False
 
 
+def is_mentioned(text, me_name="", aliases=DEFAULT_ALIASES):
+    """严格判定「@ 我」或「开头点名」。
+
+    ★ v9.22.8（用户硬性要求：群聊只有 @ 我才回，否则一律全都不回）：
+    不能用 `is_called` 的宽松版 —— 它只要正文里**任何位置**出现称呼就算
+    （例如别名里有 "AI"，一句 "这个 ai 挺好用" 就会被当成在叫我，群里
+    就会瞎插话）。群聊只认两种形态：
+      1. 文本里出现 ``@称呼``（钉钉 @ 人就是把 "@名字" 写进正文）；
+      2. 文本**以称呼开头**，且后面紧跟空白 / 标点 / 结束（"小助手，帮我看下"）。
+    句中出现的不算。
+    """
+    t = str(text or "")
+    if not t:
+        return False
+    names = [n for n in ([me_name] + list(aliases)) if n]
+    # 1) 显式 @（长的名字优先，避免 "小助手" 被 "助手" 抢先匹配后残留字）
+    for n in sorted(names, key=len, reverse=True):
+        if ("@" + n) in t:
+            return True
+        # 钉钉有时写成 "@ 小助手"（@ 与名字之间有空白）
+        if ("@ " + n) in t or ("@\u2005" + n) in t or ("@\u00a0" + n) in t:
+            return True
+    # 2) 开头点名
+    head = t.lstrip(" \u2005\u00a0")
+    for n in sorted(names, key=len, reverse=True):
+        if not head.startswith(n):
+            continue
+        rest = head[len(n):]
+        if not rest or rest[0] in " \u2005\u00a0,，:：!！?？、\n\t":
+            return True
+    return False
+
+
 def should_reply(msg, thread, me_name="", aliases=DEFAULT_ALIASES, settings=None):
     """这条消息要不要接。
 
@@ -78,54 +113,50 @@ def should_reply(msg, thread, me_name="", aliases=DEFAULT_ALIASES, settings=None
     mode = thread.get("mode") or DEFAULT_MODE
     kind = (thread.get("kind") or "group").lower()
     called = is_called(text, me_name, aliases)
+    mentioned = is_mentioned(text, me_name, aliases)
     bare = clean_text(text, me_name, aliases)
+    is_group = kind not in ("p2p", "dm", "self")
+    no_at = "群里没@我（v9.22.8 起群聊只回 @ 我的消息）"
 
     # ---- 范围闸门（只有传了 settings 才生效，顺序不能乱）----
     if settings:
         cid = str(msg.get("cid") or msg.get("thread") or "")
         wl = settings.get("whitelist") or []
-        if cid and any(str(x.get("id") or "") == cid
-                       for x in wl if isinstance(x, dict)):
-            return True, "白名单"
-        if kind in ("p2p", "dm", "self"):
-            if not settings.get("scope_p2p", True):
-                return False, "设置里没勾「单聊」"
-        else:
+        wl_hit = bool(cid) and any(str(x.get("id") or "") == cid
+                                   for x in wl if isinstance(x, dict))
+        if is_group:
+            # ★ 铁律先行：群聊必须先 @ 我。白名单 / scope_* 都不能把它放行
+            #   （老版本 `whitelist` 是"命中就 return True"，等于把整个群的
+            #   每条闲聊都放进来，这正是 2026-11-14 误发的同类根因之一）。
+            if not mentioned:
+                return False, no_at
+            if wl_hit:
+                return True, "白名单"
             if not settings.get("scope_group", True):
                 return False, "设置里没勾「群聊」"
-            if settings.get("scope_at_me", True) and not called:
-                return False, "设置里勾了「只在群里@我」"
+        else:
+            if wl_hit:
+                return True, "白名单"
+            if not settings.get("scope_p2p", True):
+                return False, "设置里没勾「单聊」"
+    elif is_group and not mentioned:
+        # 没传设置（老探针 / 老调用方）也照样守这条铁律
+        return False, no_at
 
     # 私聊 / 自聊：默认都回（这就是"秘书"最常用的形态）
-    if kind in ("p2p", "self", "dm"):
+    if not is_group:
         if mode == "group_bot" and not called and not bare:
             return False, "空正文"
         return True, "私聊"
 
-
-    # 群聊
+    # 群聊：能走到这里说明已经 @ 我了（上面闸门挡过），直接放行。
+    # 三种 mode 的区别只在「人设/口吻」，不再影响「接不接」。
     if mode == "secretary":
-        if called:
-            return True, "群里叫我"
-        if any(bare.startswith(h) for h in _COMMAND_HEADS):
-            return True, "群里明确派活"
-        return False, "秘书模式：群里不闲聊"
-
-    if mode == "colleague":
-        if called:
-            return True, "群里叫我"
-        return False, "同事模式：没叫我就不插话"
-
-    # group_bot（默认）：@ / 点名 / 指令开头 都接
-    if called:
         return True, "群里叫我"
-    if any(bare.startswith(h) for h in _COMMAND_HEADS):
-        return True, "指令开头"
-    triggers = [s.strip() for s in str(thread.get("triggers") or "").split(",") if s.strip()]
-    for kw in triggers:
-        if kw and kw in text:
-            return True, f"命中关键词「{kw}」"
-    return False, "群助手：没命中触发条件"
+    if mode == "colleague":
+        return True, "群里叫我"
+    return True, "群里叫我"
+
 
 
 # ---------------------------------------------------------------------------

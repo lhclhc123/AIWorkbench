@@ -1353,6 +1353,7 @@ class MainWindow(QMainWindow):
         self.voice.failed.connect(self._on_voice_error)
         # ★ Web UI：把语音信号额外接一份，只在 web 激活时回推事件（不干扰 Qt 模式）。
         self.voice.transcribed.connect(self._web_on_voice_transcribed)
+        self.voice.partial.connect(self._web_on_voice_partial)
         self.voice.status.connect(self._web_on_voice_status)
         right.addWidget(self.voice)
         self.voice.setVisible(False)
@@ -4895,9 +4896,20 @@ class MainWindow(QMainWindow):
         return {"ok": True, "status": self._web_voice_state()}
 
     def _web_on_voice_transcribed(self, text):
+        """最终结果：前端收到 final=True 就整段替换掉之前的流式预览。"""
         if getattr(self, "_web_engine", False) and self._web_bridge is not None:
             try:
-                self._web_bridge.emit_event("voice_transcript", {"text": text})
+                self._web_bridge.emit_event(
+                    "voice_transcript", {"text": text, "final": True})
+            except Exception:
+                pass
+
+    def _web_on_voice_partial(self, text):
+        """边说边出字：中途结果（voice_partial），前端做整段预览替换。"""
+        if getattr(self, "_web_engine", False) and self._web_bridge is not None:
+            try:
+                self._web_bridge.emit_event(
+                    "voice_partial", {"text": text, "final": False})
             except Exception:
                 pass
 
@@ -5717,7 +5729,8 @@ class MainWindow(QMainWindow):
                     thread_id, text, self._im_settings_now(), source=source)
                 if not allow:
                     g.record(thread_id, text, False, source=source, reason=why)
-                    self._safe_asst_log("⛔ 拦下一条消息（%s）：%s"
+                    self._safe_asst_log(_icons_mod.ic("blocked")
+                                        + " 拦下一条消息（%s）：%s"
                                         % (why, str(text)[:60]))
                     return False
             ok = bool(self.ding.dws_send_to_cid(thread_id, str(text)))
@@ -6016,7 +6029,8 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._safe_asst_log(f"发测试消息失败：{type(exc).__name__}: {exc}")
             self._asst_log_ui("✓ 测试消息已发到钉钉" if ok
-                              else "⛔ 测试消息没有发送（测试一律只演练，不会真发）")
+                              else _icons_mod.ic("blocked")
+                              + " 测试消息没有发送（测试一律只演练，不会真发）")
         threading.Thread(target=w, daemon=True).start()
 
     # ---------- ★ v9.20.0：助理页「消息 / 设置 / 标签」的写操作 ----------
@@ -6699,7 +6713,8 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                         self._safe_asst_log(
-                            "📝 没有发送，已存进草稿箱（%s）：%s"
+                            _icons_mod.ic("write")
+                            + " 没有发送，已存进草稿箱（%s）：%s"
                             % (why, str(text)[:50]))
                         self._im_last_draft = {"cid": str(cid),
                                                "text": str(text),
@@ -6745,7 +6760,8 @@ class MainWindow(QMainWindow):
         if ok:
             self._asst_log_ui("✓ 已代回钉钉：%s" % str(text)[:50])
         elif as_draft:
-            self._asst_log_ui("📝 没发出去，已存草稿箱：%s%s"
+            self._asst_log_ui(_icons_mod.ic("write")
+                              + " 没发出去，已存草稿箱：%s%s"
                               % (str(text)[:40], ("（" + why + "）") if why else ""))
         else:
             self._asst_log_ui("✕ 代回钉钉失败（%d 条，留在左栏）" % len(ids))
@@ -8099,6 +8115,12 @@ class MainWindow(QMainWindow):
         self.worker.wrapup.connect(lambda p, c=cid: self._on_wrapup(p))
         self.worker.phase.connect(lambda k, d, c=cid: self._on_phase(k, d, c))
         run.running = True
+        # ★ v9.22.8：标记这个对话"正在生成" —— 生成期间它的 .live.json 草稿
+        #   不能被 _absorb_live() 并进对话（否则和收尾的 append 重复）。
+        try:
+            self.workspace.mark_live_active(cid)
+        except Exception:
+            pass
         # 生成中：右下角按钮变成红色方形「停止」，点一下就能打断模型
         if self._is_current(cid):
             self._set_stop_mode(True)
@@ -8154,6 +8176,9 @@ class MainWindow(QMainWindow):
         #   worker 真正收尾触发 _on_finished 之前，「◈ 思考中」卡片 / 占位一直挂在
         #   界面上（worker 若还堵在工具/网络里，能挂几十秒）。这里在 UI 线程**立刻**
         #   清空并强制重渲染一次，用户点下去的瞬间就不再是「思考中」。
+        # ★ v9.22.8：清空之前**先把已经生成的部分存下来** —— 用户中途点停止，
+        #   这些字也不该凭空消失。
+        self._live_flush(cid)
         run.aborted = True
         run.live_text = ""
         run.live_card = None
@@ -8207,6 +8232,108 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(text[:160], 12000)
 
+    # ================== 生成中的半截回复：每 1.5s 落盘（v9.22.8） ==================
+    # ★ 用户反馈（最重要的一条）：「如果中途在他回复中途我关闭了软件，那么他之前
+    #   生成的所有的回复内容就会一点都不保留」。
+    #   根因确认：流式正文只存在 `ConvRun.live_text` 这个**内存变量**里，只有
+    #   `_on_finished()`（整轮跑完）才 `save_conversation()` 写进 json。中途退出 =
+    #   全丢。这里补一条"草稿落盘"链路：边生成边写 `<对话>.live.json`，
+    #   正常结束删掉；下次启动 `workspace.load_conversation()` 会把它并成一条
+    #   带 partial 标记的助手消息（见 workspace._absorb_live）。
+    #   ⚠ 不能每个 token 都写盘：节流 1.5s，且只有内容真变了才写。
+    LIVE_FLUSH_MS = 1500
+
+    def _live_timer(self, cid):
+        timers = self.__dict__.setdefault("_live_timers", {})
+        t = timers.get(cid)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(self.LIVE_FLUSH_MS)
+            t.timeout.connect(lambda c=cid: self._live_flush(c))
+            timers[cid] = t
+        return t
+
+    def _live_touch(self, cid=None):
+        """有新增内容了：安排一次（合并的）落盘。"""
+        cid = self._conv_cid() if cid is None else cid
+        if not cid:
+            return
+        try:
+            if not getattr(self._run(cid), "running", False):
+                return
+            t = self._live_timer(cid)
+            if not t.isActive():
+                t.start()
+        except Exception:
+            pass
+
+    def _live_payload(self, cid):
+        run = self._run(cid)
+        # 清掉「作废重来」标记与工具调用 XML —— 这些东西存进去，下次会被当成正文
+        # 显示出来（历史上 DeepSeek 网页通道就抄过这类标记）。
+        text = config.strip_stream_reset(strip_tool_markup(run.live_text or ""))
+        reason = config.strip_stream_reset(run.live_reason or "")
+        tools = [dict(x) for x in (run.pending_tool or []) if isinstance(x, dict)]
+        return {
+            "cid": cid,
+            "ts": time.time(),
+            "text": text,
+            "reason": reason,
+            "tools": tools[-12:],
+            "model": getattr(run, "last_model_label", "") or "",
+        }
+
+    def _live_flush(self, cid=None, force=False):
+        cid = self._conv_cid() if cid is None else cid
+        if not cid:
+            return
+        try:
+            run = self._run(cid)
+            if not force and not getattr(run, "running", False):
+                return
+            d = self._live_payload(cid)
+            if not (d["text"].strip() or d["reason"].strip() or d["tools"]):
+                return
+            self.workspace.save_live(cid, d)
+        except Exception:
+            pass
+
+    def _live_stop_timer(self, cid):
+        """只停节流定时器，**不删**草稿文件（这一轮没正常收尾时用）。"""
+        timers = self.__dict__.get("_live_timers") or {}
+        t = timers.pop(cid, None)
+        if t is not None:
+            try:
+                t.stop()
+                t.deleteLater()
+            except Exception:
+                pass
+
+    def _live_clear(self, cid=None):
+        cid = self._conv_cid() if cid is None else cid
+        if not cid:
+            return
+        self._live_stop_timer(cid)
+        try:
+            self.workspace.clear_live(cid)
+            self.workspace.mark_live_idle(cid)
+        except Exception:
+            pass
+
+    def _live_flush_all(self, force=True):
+        """退出前把所有在跑的对话各写一次（同步、很小的文件）。"""
+        try:
+            runs = self.__dict__.get("_runs") or {}
+        except Exception:
+            runs = {}
+        for cid, run in list(runs.items()):
+            try:
+                if getattr(run, "running", False):
+                    self._live_flush(cid, force=force)
+            except Exception:
+                continue
+
     def _on_token(self, delta, cid=None):
         """流式增量：写进**它自己**那个对话的运行态；只有它是当前显示时才刷界面。"""
         cid = self._conv_cid() if cid is None else cid
@@ -8235,6 +8362,9 @@ class MainWindow(QMainWindow):
             return
 
         run.live_text += delta
+        # ★ v9.22.8：边生成边落盘（节流 1.5s）。放在"是否当前对话"判断之前 ——
+        #   用户切到别的对话后这个 cid 仍在生成，同样要能救回来。
+        self._live_touch(cid)
         if not self._is_current(cid):
             return          # 用户已经切到别的对话了 —— 收着，别去动界面
         # ★ v9.21.0 web 版：流式增量直接推给网页（桥里 50ms 合批），不走 Qt 渲染
@@ -8263,6 +8393,7 @@ class MainWindow(QMainWindow):
         if getattr(run, "aborted", False):
             return
         run.live_reason += delta
+        self._live_touch(cid)      # ★ v9.22.8：思考也要一起落盘
         if not self._is_current(cid):
             return
         # ★ v9.21.0 web 版：思维链增量推给网页
@@ -8361,6 +8492,7 @@ class MainWindow(QMainWindow):
         run.live_text = ""
         run.live_card = None
         run.pending_tool.append({"role": "tool", "content": result})
+        self._live_touch(cid)      # ★ v9.22.8：工具过程也一起落盘
         if not self._is_current(cid):
             return
         # ★ v9.21.0 web 版：工具结果推给网页（工具胶囊收起）
@@ -8422,6 +8554,16 @@ class MainWindow(QMainWindow):
         #   历史里的「深度思考」块（需求 9：过程消息默认折进过程组）。
         run.live_reason = ""
         run.reason_card = None
+        # ★ v9.22.8：这一轮已经写进对话了 → 草稿文件作废。
+        #   如果这一轮什么都没产出（msgs 为空），**保留草稿**，下次启动还能救回来。
+        if msgs:
+            self._live_clear(cid)
+        else:
+            self._live_stop_timer(cid)
+            try:
+                self.workspace.mark_live_idle(cid)
+            except Exception:
+                pass
         self._finish_run(cid)
         if self._is_current(cid):
             self._maybe_rename()
@@ -8437,6 +8579,14 @@ class MainWindow(QMainWindow):
     def _on_error(self, msg, cid=None):
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
+        # ★ v9.22.8：出错时**先把已生成的部分存进草稿**再清屏 ——
+        #   老实现直接清空，等于用户白等一场。
+        self._live_flush(cid)
+        self._live_stop_timer(cid)
+        try:
+            self.workspace.mark_live_idle(cid)
+        except Exception:
+            pass
         # ★ v9.18.0（需求 4）：出错时也要把流式那半截正文清掉 ——
         #   `_render_full` 只要看到 live_text 非空就会把它再画成一张卡片，
         #   不清的话就会和上一轮已经落盘的内容叠成"看起来重复"。
@@ -8454,6 +8604,11 @@ class MainWindow(QMainWindow):
         cid = self._conv_cid() if cid is None else cid
         run = self._run(cid)
         run.running = False
+        # ★ v9.22.8：这一轮结束了 —— 解除"正在生成"标记（草稿删不删由调用方决定）
+        try:
+            self.workspace.mark_live_idle(cid)
+        except Exception:
+            pass
         if not self._is_current(cid):
             # 别的对话跑完了：只更新列表上的标记，别去打扰当前这个界面
             try:
@@ -9003,6 +9158,14 @@ class MainWindow(QMainWindow):
             self._open_workspace(dlg.selected)
 
     def closeEvent(self, event):
+        # ★ v9.22.8：真正退出前，把「正在生成但还没写完」的回复立刻落盘。
+        #   收进托盘不算退出（后台还在继续生成），所以只在真退出时做。
+        try:
+            if (self._quit_requested
+                    or not self.settings.get("tray_on_close", True)):
+                self._live_flush_all(force=True)
+        except Exception:
+            pass
         try:
             self.speaker.stop()
         except Exception:

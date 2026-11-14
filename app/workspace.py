@@ -570,22 +570,146 @@ class Workspace:
     def _conv_path(self, cid):
         return os.path.join(self.conv_dir, cid + ".json")
 
+    # ---------- 生成中的「半截回复」落盘（v9.22.8） ----------
+    # ★ 用户反馈：「如果中途在他回复中途我关闭了软件，那么他之前生成的所有的回复
+    #   内容就会一点都不保留」。确认属实：老实现里流式正文只存在 ConvRun.live_text
+    #   这个**内存变量**里，只有 `_on_finished()`（整轮跑完）才写进对话 json。
+    #   所以中途退出/崩溃 = 全丢。
+    #
+    #   现在每 1.5 秒把「正在生成的正文 + 思考 + 工具过程」写进
+    #   `<对话>.live.json`（原子写，很小）。正常结束就删掉；下次 load_conversation
+    #   发现这个文件，就把它合并成一条带 partial 标记的助手消息并保存 —— 用户重开
+    #   软件还能看见上半截。
+    LIVE_SUFFIX = ".live.json"
+
+    def _live_path(self, cid):
+        return os.path.join(self.conv_dir, str(cid) + self.LIVE_SUFFIX)
+
+    # 哪些对话**此刻正在生成**。生成中的草稿绝不能被 `_absorb_live()` 合并进对话，
+    # 否则一边写草稿一边又被并成一条消息，等这轮跑完再 append 一次 = 内容重复。
+    # 由主窗口在 start / finish 时打标记（同一个进程内有效，重启后天然为空）。
+    def mark_live_active(self, cid):
+        self.__dict__.setdefault("_live_active", set()).add(str(cid or ""))
+
+    def mark_live_idle(self, cid):
+        try:
+            self.__dict__.setdefault("_live_active", set()).discard(str(cid or ""))
+        except Exception:
+            pass
+
+    def is_live_active(self, cid):
+        return str(cid or "") in (self.__dict__.get("_live_active") or set())
+
+    def save_live(self, cid, payload):
+        """把生成中的半截内容落盘（原子写：先写 .tmp 再 replace）。
+
+        调用方在 UI 线程上调，文件只有几十 KB，耗时在 0.2ms 量级，可以同步写；
+        这样进程被强杀时也不会留下写了一半的坏 json。
+        """
+        cid = str(cid or "").strip()
+        if not cid:
+            return False
+        p = self._live_path(cid)
+        try:
+            os.makedirs(self.conv_dir, exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload or {}, f, ensure_ascii=False)
+            os.replace(tmp, p)
+            return True
+        except Exception:
+            try:
+                if os.path.exists(p + ".tmp"):
+                    os.remove(p + ".tmp")
+            except Exception:
+                pass
+            return False
+
+    def load_live(self, cid):
+        try:
+            with open(self._live_path(cid), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def clear_live(self, cid):
+        p = self._live_path(cid)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _absorb_live(self, conv):
+        """把上次没写完的半截回复并入对话（并删掉草稿文件，保证只并一次）。"""
+        cid = str((conv or {}).get("id") or "")
+        if not cid:
+            return conv
+        if self.is_live_active(cid):
+            # 这一轮还在生成 —— 草稿是"活的"，不能并进对话（否则会重复）
+            return conv
+        d = self.load_live(cid)
+        if not isinstance(d, dict):
+            return conv
+        text = str(d.get("text") or "")
+        reason = str(d.get("reason") or "")
+        tools = [t for t in (d.get("tools") or []) if isinstance(t, dict)]
+        if not (text.strip() or reason.strip() or tools):
+            self.clear_live(cid)
+            return conv
+        msgs = conv.setdefault("messages", [])
+        # 最后一条已经是 assistant 且内容一致 → 说明上次其实已经收尾了，别重复插
+        last = msgs[-1] if msgs else None
+        already = (isinstance(last, dict) and last.get("role") == "assistant"
+                   and str(last.get("content") or "").startswith(text[:40])
+                   and text.strip())
+        if not already:
+            if reason.strip():
+                msgs.append({"role": "thinking", "content": reason,
+                             "partial": True, "ts": d.get("ts") or time.time()})
+            for t in tools:
+                role = t.get("role") or "tool"
+                if role not in ("tool", "thinking", "assistant"):
+                    role = "tool"
+                if str(t.get("content") or "").strip():
+                    msgs.append({"role": role, "content": str(t.get("content")),
+                                 "partial": True})
+            body = text.strip()
+            note = ("\n\n> ⏸ 这条回复生成到一半时程序被关闭了，"
+                    "以上是关闭前已经收到的部分。")
+            msgs.append({"role": "assistant", "content": (body + note) if body else note.strip(),
+                         "partial": True,
+                         "ts": d.get("ts") or time.time(),
+                         "_model": d.get("model") or ""})
+            try:
+                self.save_conversation(conv)
+            except Exception:
+                pass
+        self.clear_live(cid)
+        return conv
+
     def list_conversations(self):
         out = []
         if not os.path.isdir(self.conv_dir):
             return out
         for fn in os.listdir(self.conv_dir):
-            if fn.endswith(".json"):
-                try:
-                    with open(os.path.join(self.conv_dir, fn), "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    out.append({
-                        "id": d.get("id", fn[:-5]),
-                        "title": d.get("title", "未命名对话"),
-                        "updated": d.get("updated", 0),
-                    })
-                except Exception:
-                    continue
+            if not fn.endswith(".json"):
+                continue
+            # ★ 别把 `<cid>.live.json`（生成中的半截草稿）当成一个对话列出来
+            if fn.endswith(self.LIVE_SUFFIX):
+                continue
+            try:
+                with open(os.path.join(self.conv_dir, fn), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                out.append({
+                    "id": d.get("id", fn[:-5]),
+                    "title": d.get("title", "未命名对话"),
+                    "updated": d.get("updated", 0),
+                })
+            except Exception:
+                continue
         out.sort(key=lambda x: x["updated"], reverse=True)
         return out
 
@@ -594,7 +718,9 @@ class Workspace:
         if not os.path.exists(p):
             return None
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+            conv = json.load(f)
+        # ★ v9.22.8：把上次生成到一半就退出留下的半截回复并进来
+        return self._absorb_live(conv)
 
     def save_conversation(self, conv: dict):
         conv["updated"] = time.time()
@@ -624,6 +750,9 @@ class Workspace:
         p = self._conv_path(cid)
         if os.path.exists(p):
             os.remove(p)
+        # ★ v9.22.8：生成中的半截草稿也一起删
+        self.clear_live(cid)
+        self.mark_live_idle(cid)
         # ★ v9.22.3：对话的专属文件夹（chats/<NN_标题>/，含 files 产物与 MEMORY.md）
         #   也要一起删掉，否则只删了 json、文件夹和产物会残留在磁盘上。
         try:

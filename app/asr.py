@@ -198,6 +198,39 @@ class Recorder:
     def seconds(self):
         return max(0.0, time.time() - self._started)
 
+    @property
+    def recording(self):
+        """是否正在录音（录音线程还活着且没有被要求停止）。"""
+        t = self._thread
+        return bool(t is not None and t.is_alive() and not self._stop_flag.is_set())
+
+    def snapshot_wav(self, prefix="snap"):
+        """把"当前已经录到的音频"立刻写成一份完整可解码的 WAV，返回路径。
+
+        与 stop() 的区别：不停录音、不关闭设备，只取一个快照，
+        供"边说边出字"的流式识别每轮拿一份完整文件去请求 ASR。
+
+        线程安全：录音线程在 _loop() 里 append 时持 self._lock，
+        这里在锁内只做一次列表浅拷贝（很快），joining/wave 写盘全在锁外，
+        不会长时间卡住录音线程（否则会丢音频）。
+        """
+        with self._lock:
+            frames = list(self._frames)
+            channels = self.channels
+            rate = self.rate
+        if not frames:
+            raise ASRError("还没有录到音频")
+        data = b"".join(frames)
+        if not data:
+            raise ASRError("还没有录到音频")
+        path = new_wav_path(prefix)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(data)
+        return path
+
     def silence_left(self):
         """距离自动停止还有多久（秒）；界面可以倒计时提示。"""
         if not self._started:
@@ -263,6 +296,209 @@ def _rms(data):
         total += v * v
     rms = (total / n) ** 0.5
     return min(1.0, rms / 8000.0)
+
+
+# ------------------------------------------------------------------ 流式识别
+class StreamingSession:
+    """边说边出字：后台线程周期性把"已录到的音频"整段送去识别。
+
+    现有三家后端（智谱 / 硅基流动 / 百炼）都只有同步 HTTP 接口，没有真正的
+    流式 WebSocket，所以这里用「滚动快照 + 全量重识别」逼近流式体验：
+
+      - 每轮调用 recorder.snapshot_wav() 拿一份完整 WAV（不停录音）；
+      - 音频没有明显增长（< 0.4s）就跳过这一轮，避免白发请求；
+      - 识别成功且有文本就 on_text(text)，界面逐次**整段替换**；
+      - 说完由 VoiceInput.finish() 再做一次整段识别作为最终结果。
+
+    线程模型：整个循环（含 HTTP 请求与写盘）都在守护线程里跑，
+    绝不在 UI 线程做网络/磁盘操作；回调由调用方（Qt 信号）自行跨线程投递。
+    同一时刻最多只有一个识别请求在跑——上一轮没回来就等它，
+    不排队、不堆积请求。
+    """
+
+    MIN_GROWTH = 0.4          # 音频至少增长这么多秒才值得再识别一次
+    REQUEST_TIMEOUT = 12      # 单轮识别超时（秒）——慢就慢，不能卡死循环
+
+    def __init__(self, recorder, keys_provider, prefer="auto",
+                 on_text=None, on_error=None, interval=1.6, max_window=0):
+        """recorder：Recorder（或同接口对象，需有 snapshot_wav()/seconds）。
+        keys_provider：无参函数，返回 {"zhipu": "...", ...}（每轮都重新取，改 Key 即时生效）。
+        on_text：识别到文本时的回调（str）。
+        on_error：出错回调（str），整个会话最多回调一次，避免刷屏。
+        interval：音频 <20s 时的识别间隔（秒）。
+        max_window：>0 时，录音超过这么多秒就停止增量识别（超长音频每轮都变慢），
+            交给 finish() 的整段识别定稿；0 表示不限制。
+        """
+        self.recorder = recorder
+        self._keys_provider = keys_provider or (lambda: {})
+        self.prefer = prefer or "auto"
+        self.on_text = on_text
+        self.on_error = on_error
+        self.base_interval = float(interval or 1.6)
+        self.max_window = float(max_window or 0)
+        self._stop_flag = threading.Event()
+        self._thread = None
+        self._busy = False            # 是否有一轮识别请求在跑
+        self._last_duration = 0.0     # 上一轮送去识别的音频时长
+        self._last_text = ""          # 上一次回调的文本（去重）
+        self._error_reported = False
+
+    # ---- 生命周期 ----
+    def start(self):
+        """启动后台循环（幂等：已在跑就直接返回）。"""
+        t = self._thread
+        if t is not None and t.is_alive():
+            return self
+        self._stop_flag.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="asr-streaming", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, timeout=3.0):
+        """请求停止。
+
+        若此刻没有识别请求在跑，会等线程退出（最多 timeout 秒）；
+        若正在等网络返回，立刻返回，让线程在本次请求回来后自行结束
+        （线程是 daemon，且停止位已置，不会再回调 on_text）。
+        这样 UI 线程调用 stop() 永远不会被网络卡住。
+        """
+        self._stop_flag.set()
+        t = self._thread
+        if t is None or not t.is_alive():
+            return self
+        if self._busy:
+            return self
+        try:
+            t.join(timeout=max(0.0, min(3.0, float(timeout or 0.0))))
+        except Exception:
+            pass
+        return self
+
+    @property
+    def running(self):
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
+    @property
+    def busy(self):
+        return self._busy
+
+    @property
+    def last_text(self):
+        return self._last_text
+
+    # ---- 主循环 ----
+    def _loop(self):
+        while not self._stop_flag.is_set():
+            if not self._still_recording():
+                break
+            if self._busy:
+                # 上一轮还没回来：不排队，等一小会儿再看
+                self._sleep(0.2)
+                continue
+            try:
+                attempted = self._recognize_once()
+            except Exception as e:      # 单轮失败绝不能让线程死掉
+                self._report_error(e)
+                attempted = False
+            if self._stop_flag.is_set():
+                break
+            self._sleep(self._interval_for(self._last_duration) if attempted else 0.25)
+
+    def _recognize_once(self):
+        """做一轮：快照 -> 判断增长 -> 识别 -> 回调。返回是否真的发了请求。"""
+        try:
+            path = self.recorder.snapshot_wav()
+        except ASRError:
+            # 刚开始录音、还没攒到音频：正常情况，等下一轮，不算错误
+            return False
+        try:
+            dur = wav_duration(path)
+            if dur <= 0:
+                dur = float(getattr(self.recorder, "seconds", 0.0) or 0.0)
+            if dur - self._last_duration < self.MIN_GROWTH:
+                return False            # 没有新内容，跳过这一轮
+            if self.max_window > 0 and dur > self.max_window:
+                # 太长了：增量识别的性价比已经很低，收工等整段识别
+                self._stop_flag.set()
+                return False
+            self._last_duration = dur
+            self._busy = True
+            try:
+                text, _backend = transcribe(
+                    path, self._keys(), self.prefer, timeout=self.REQUEST_TIMEOUT)
+            finally:
+                self._busy = False
+        finally:
+            self._cleanup(path)
+
+        text = (text or "").strip()
+        if text and text != self._last_text and not self._stop_flag.is_set():
+            self._last_text = text
+            try:
+                if self.on_text is not None:
+                    self.on_text(text)
+            except Exception as e:      # 回调异常也不能打断循环
+                self._report_error(e)
+        return True
+
+    # ---- 小工具 ----
+    def _keys(self):
+        try:
+            return self._keys_provider() or {}
+        except Exception:
+            return {}
+
+    def _still_recording(self):
+        rec = self.recorder
+        if rec is None:
+            return False
+        flag = getattr(rec, "recording", None)
+        if flag is None:
+            # 兼容没有 recording 属性的 recorder（测试桩/旧实现）
+            return not bool(getattr(rec, "auto_stopped", False))
+        return bool(flag)
+
+    def _interval_for(self, duration):
+        """自适应间隔：音频越长，请求越慢，间隔就放大，避免越跑越堵。"""
+        if duration < 20.0:
+            return max(0.5, self.base_interval)
+        if duration < 60.0:
+            return 3.0
+        return 5.0
+
+    def _sleep(self, seconds):
+        """可被 stop() 立刻打断的睡眠（分片等待，最长 0.2s 醒一次）。"""
+        end = time.time() + max(0.0, float(seconds or 0.0))
+        while not self._stop_flag.is_set():
+            left = end - time.time()
+            if left <= 0:
+                return
+            self._stop_flag.wait(min(0.2, left))
+
+    def _report_error(self, err):
+        """只在第一次出错时回调，避免网络抖动把界面刷满。"""
+        if self._error_reported:
+            return
+        self._error_reported = True
+        try:
+            if self.on_error is not None:
+                self.on_error(str(err))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cleanup(path):
+        """删掉本轮快照，以及 to_16k_mono() 在快照旁边生成的 *_16k.wav。"""
+        if not path:
+            return
+        for p in (path, os.path.splitext(path)[0] + "_16k.wav"):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------------ 识别后端

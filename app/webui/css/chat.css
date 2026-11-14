@@ -234,6 +234,48 @@ html[data-theme="dark"] .win-btn .ico-sun{display:block;}
 .think-card{
   overflow:visible;
 }
+
+/* —— ★ v9.22.8 内联思考：思考收在**同一条助手消息内部** ——
+ * 用户：「深度思考现在独立成了一个对话块，WorkBuddy 里不是这样 —— 思考应该收在
+ *       同一条助手消息内部，以一行很轻的灰字（如「已思考 12 秒」）形式出现，
+ *       点开才展开正文」。
+ * 所以 .mode-inline 的卡片：头行 = 12px 浅灰一行（无图标、不加粗），
+ * 正文 = 浅灰底 + 左侧竖线 + 比正文更小的字号；不再有任何外边框 / 独立气泡。
+ */
+.think-slot{
+  display:flex;flex-direction:column;gap:2px;
+  margin-bottom:1px;
+}
+.think-slot[hidden]{display:none;}
+.think-card.mode-inline{overflow:visible;}
+.think-card.mode-inline .think-head{
+  height:20px;
+  gap:3px;
+  padding:0 4px 0 0;
+  color:var(--text-3);
+  font-size:11.5px;
+}
+.think-card.mode-inline .think-head:hover{color:var(--text-2);}
+.think-card.mode-inline .think-title{font-weight:400;color:inherit;}
+.think-card.mode-inline .think-meta{font-size:11px;color:var(--text-3);}
+.think-card.mode-inline .chev{width:12px;height:12px;color:var(--text-3);}
+.think-card.mode-inline .think-stream{
+  margin:1px 0 5px;
+  padding:6px 10px;
+  border-left:2px solid var(--border);
+  border-radius:0 6px 6px 0;
+  background:var(--surface-2);
+  font-size:11.8px;line-height:1.72;color:var(--text-2);
+  white-space:pre-wrap;word-break:break-word;
+}
+.think-card.mode-inline .think-stream p{margin:0 0 8px;}
+.think-card.mode-inline .think-stream p:last-child{margin-bottom:0;}
+.think-card.mode-inline .think-stream ul,
+.think-card.mode-inline .think-stream ol{margin:0 0 8px;padding-left:18px;}
+.think-card.mode-inline .think-stream pre{
+  margin:6px 0;padding:8px 10px;font-size:11px;
+  background:var(--code-bg);border:1px solid var(--border);border-radius:6px;
+}
 /* 头行宽度自适应：chev 紧跟标题文字，和「工具」行对齐在文字尾部。
    fit-content 让按钮收缩到文字宽度（仍是 block 级 flex，不会产生 inline 行高余量），
    padding-right 让点击热区比文字略宽一点。 */
@@ -490,17 +532,38 @@ html[data-theme="dark"] .win-btn .ico-sun{display:block;}
   color:var(--text);
 }
 #input::placeholder{color:var(--text-3);}
-.composer-bar{display:flex;align-items:center;gap:4px;height:30px;margin-top:2px;}
+/* ★ v9.22.8：overflow:hidden 防止窄窗口下模型胶囊把麦克风/发送挤出可视区 */
+.composer-bar{display:flex;align-items:center;gap:4px;height:30px;margin-top:2px;overflow:hidden;}
+/* 输入栏图标默认用 --text-2（原来的 --text-3 太淡，浅色主题下麦克风几乎看不见） */
 .ibtn{
   flex:0 0 28px;
   width:28px;height:28px;border-radius:7px;
-  display:grid;place-items:center;color:var(--text-3);
+  display:grid;place-items:center;color:var(--text-2);
 }
 .ibtn:hover{background:var(--surface-2);color:var(--text);}
 .composer-bar .spacer{flex:1;}
 
+/* —— ★ v9.22.8 麦克风：录音中变红 + 呼吸闪动，一眼能看出「正在听」 —— */
+.ibtn-mic{position:relative;}
+.ibtn-mic:hover{color:var(--accent);}
+.ibtn.is-rec{
+  color:#fff;
+  background:var(--danger);
+  animation:recBreath 1.3s ease-in-out infinite;
+}
+.ibtn.is-rec:hover{background:var(--danger);color:#fff;}
+@keyframes recBreath{
+  0%,100%{box-shadow:0 0 0 0 rgba(209,59,59,.55);}
+  55%{box-shadow:0 0 0 6px rgba(209,59,59,0);}
+}
+@media (prefers-reduced-motion: reduce){
+  .ibtn.is-rec{animation:none;box-shadow:0 0 0 2px rgba(209,59,59,.35);}
+}
+
 /* —— 模型选择 —— */
-.model-wrap{position:relative;}
+/* ★ v9.22.8：min-width:0 + flex:0 1 auto —— 窄窗口下模型胶囊先收缩，
+   麦克风与发送按钮（flex:0 0 auto）永远留在可视区里。 */
+.model-wrap{position:relative;min-width:0;flex:0 1 auto;}
 .model-pill{
   display:inline-flex;align-items:center;gap:4px;
   height:24px;padding:0 7px;border-radius:6px;

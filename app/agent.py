@@ -3955,9 +3955,13 @@ class AgentRunner:
                 if isinstance(content, str):
                     content = normalize_text_content(content, path)
                 try:
-                    label, size = docwrite.create(path, str(content),
-                                                  title=args.get("title"),
-                                                  base_dir=os.path.dirname(path))
+                    # PPT 可选「成品模板」：汇报蓝 / 科技深色 / 国风红 / 极简灰。
+                    # 其它格式忽略 template（它们的 writer 收 **kw）。
+                    label, size = docwrite.create(
+                        path, str(content),
+                        title=args.get("title"),
+                        base_dir=os.path.dirname(path),
+                        template=str(args.get("template") or "").strip() or None)
                 except Exception as e:
                     return f"[错误] 生成 {docwrite.format_label(path)} 失败：{e}"
                 if not os.path.exists(path):
@@ -3965,8 +3969,10 @@ class AgentRunner:
                 self._note_written(path, size)
                 # 同样给出真实行数，让 Word/Excel/PPT/PDF 卡片也能显示 +N 行
                 lines = str(content).count("\n") + 1
+                tpl = str(args.get("template") or "").strip()
+                tpl_note = f"，模板：{tpl}" if tpl else ""
                 return (f"[成功] 已生成{label}：{path}（{_human_size(size)}，共 {lines} 行，"
-                        f"已确认落盘）\n内容格式：Markdown（# 标题 / ## 二级 / - 列表 / "
+                        f"已确认落盘{tpl_note}）\n内容格式：Markdown（# 标题 / ## 二级 / - 列表 / "
                         f"| 表格 | / ```代码块```）")
 
             # ============================ 联网 ============================

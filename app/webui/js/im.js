@@ -30,6 +30,137 @@ function toast(msg) {
   toast._t = setTimeout(() => el.classList.remove('show'), 1900);
 }
 
+/* ---------------- 身份背景的语音输入（v9.22.8） ----------------
+ * 走的是和对话页**同一套链路**：rpc('voice.toggle') 开关录音，
+ * 识别结果由后端的 voice_partial / voice_transcript 事件推回来。
+ *
+ * ★ 整段替换语义（务必别改回 +=）：
+ *   两条事件推的都是「当前这一整段识别结果」，不是增量。录音开始时把 textarea
+ *   原文记进 identityVoiceBase，之后一律
+ *       textarea.value = identityVoiceBase + 最新整段文本
+ *   最终结果到达后清空基准值（下一次录音重新取当时的内容）。
+ *
+ * ★ 事件路由说明：后端 voice_* 事件目前只发到对话页的 bridge（_web_bridge）。
+ *   本页 own 的 _im_bridge 也订阅一遍 —— 后端一旦改成「两个 bridge 都推」，
+ *   这里立刻生效，不用再改前端。当前若事件没到本页，按钮仍然能开/关录音，
+ *   只是不会把文字写进「身份背景」（见最终报告里的说明）。
+ */
+let identityVoiceBase = null;     // 录音开始时 textarea 的原文；null = 不在会话中
+let identityVoiceOn = false;      // 是否处于一次录音会话
+
+function identityField() { return $('#identity'); }
+
+function identityVoiceHint(msg) {
+  const el = $('#identityVoiceHint');
+  if (!el) return;
+  const text = String(msg || '');
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+function identityMicBtn() { return $('#identityMic'); }
+
+function beginIdentityVoice() {
+  if (identityVoiceOn) return;
+  const el = identityField();
+  identityVoiceOn = true;
+  identityVoiceBase = el ? el.value : '';
+  const b = identityMicBtn();
+  if (b) {
+    b.classList.add('is-rec');
+    b.setAttribute('aria-pressed', 'true');
+    b.title = '正在录音：再点一下结束';
+  }
+  identityVoiceHint('正在听…说完再点一下麦克风');
+}
+
+function endIdentityVoice() {
+  identityVoiceOn = false;
+  identityVoiceBase = null;
+  const b = identityMicBtn();
+  if (b) {
+    b.classList.remove('is-rec');
+    b.setAttribute('aria-pressed', 'false');
+    b.title = '语音输入：点一下开始说话，再点一下结束';
+  }
+  identityVoiceHint('');
+}
+
+/**
+ * 把一次「整段识别结果」写进身份背景输入框（整段替换，不是追加）。
+ * @param {string} text 整段识别文本
+ */
+function applyIdentityVoiceText(text) {
+  const el = identityField();
+  if (!el) return;
+  if (!identityVoiceOn) beginIdentityVoice();        // 事件先于 status 到达时的兜底
+  const base = identityVoiceBase == null ? '' : identityVoiceBase;
+  el.value = base + String(text == null ? '' : text);
+  try {
+    const n = el.value.length;
+    el.selectionStart = el.selectionEnd = n;
+  } catch (e) { /* ignore */ }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// 一条 voice_status 文案是否表示「正在录音」（与对话页同一套判断口径）
+function identityVoiceRecording(msg) {
+  const s = String(msg || '');
+  if (!s) return false;
+  if (/(停止|结束|完成|就绪|关闭|失败|出错|超时|stop|idle)/i.test(s)) return false;
+  return /(录音|聆听|说话|recording|识别中|正在听)/i.test(s);
+}
+
+// 订阅语音事件（在本页的 bridge 上）。后端把事件推到本页时即刻生效。
+function wireIdentityVoiceEvents() {
+  on('voice_status', (p) => {
+    if (!p) return;
+    const msg = p.msg || p.status || '';
+    if (identityVoiceRecording(msg)) {
+      if (!identityVoiceOn) beginIdentityVoice();
+      identityVoiceHint(msg);
+    } else if (identityVoiceOn) {
+      // 「识别中…」阶段仍算一次会话（基准值要留着），只有明确的停止才收尾
+      if (!/识别/i.test(msg)) endIdentityVoice();
+    }
+  });
+  on('voice_partial', (p) => {
+    if (!p || p.text == null) return;
+    applyIdentityVoiceText(p.text);
+  });
+  on('voice_transcript', (p) => {
+    if (!p || p.text == null) return;
+    applyIdentityVoiceText(p.text);       // 整段替换
+    endIdentityVoice();
+  });
+}
+
+// 身份背景麦克风按钮：切换录音
+function wireIdentityMic() {
+  const btn = identityMicBtn();
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    try {
+      const d = await rpc('voice.toggle');
+      if (d && d.ok === false) {
+        toast('语音不可用：' + (d.error || '未知原因'));
+        return;
+      }
+      const st = String((d && d.status) || '');
+      if (st === 'recording') beginIdentityVoice();
+      else if (st === 'idle') endIdentityVoice();
+      else if (st === 'recognizing' && identityVoiceOn) {
+        // 录音结束、正在识别：保留会话（结果还没回来），只取消标红
+        const b = identityMicBtn();
+        if (b) b.classList.remove('is-rec');
+        identityVoiceHint('正在识别…');
+      }
+    } catch (e) {
+      toast('语音切换失败：' + e.message);
+    }
+  });
+}
+
 /* ---------------- 状态轮询（v9.22.1 修复「永远检查中」） ----------------
  * 背景：后端查 dws 登录态是异步的（最坏 40s）。旧代码只有 boot 后一次性
  * setTimeout(refreshState, 3000)：3 秒时缓存还是占位串，之后再也没有刷新，
@@ -805,7 +936,14 @@ function renderSettings() {
   const s = state.settings || {};
   $('#scopeGroup').checked = !!s.scope_group;
   $('#scopeP2p').checked = !!s.scope_p2p;
-  $('#scopeAtMe').checked = !!s.scope_at_me;
+  // ★ v9.22.8：「群聊只在有人 @ 你 时才接」是**强制项** —— 永远勾上 + 禁用，
+  //   后端拿到的也永远是 true（见 save 里的 scope_at_me: true）。
+  //   用户要求：群里没叫到我的消息一律不接，也不进草稿箱。
+  const atMe = $('#scopeAtMe');
+  if (atMe) {
+    atMe.checked = true;
+    atMe.disabled = true;
+  }
   $('#delay').value = s.delay_seconds != null ? s.delay_seconds : 60;
   $('#uncertainSw').checked = s.uncertain_reply != null ? !!s.uncertain_reply : true;
   $('#uncertainText').value = s.uncertain_text || '';
@@ -1060,6 +1198,9 @@ function wire() {
   // tab
   wireTabs();
 
+  // ★ v9.22.8：身份背景旁的麦克风
+  wireIdentityMic();
+
   // 消息页操作
   $('#delBtn').addEventListener('click', async () => {
     if (state.selected.size === 0) return;
@@ -1115,7 +1256,8 @@ function wire() {
     const patch = {
       scope_group: $('#scopeGroup').checked,
       scope_p2p: $('#scopeP2p').checked,
-      scope_at_me: $('#scopeAtMe').checked,
+      // ★ v9.22.8：@ 才接是强制项，界面上不可关 → 永远提交 true
+      scope_at_me: true,
       delay_seconds: parseInt($('#delay').value || '0', 10),
       uncertain_reply: $('#uncertainSw').checked,
       uncertain_text: $('#uncertainText').value,
@@ -1260,6 +1402,9 @@ async function boot() {
   on('init', (p) => {
     if (p && p.theme) document.documentElement.dataset.theme = (p.theme === 'dark' ? 'dark' : 'light');
   });
+  // ★ v9.22.8：语音事件（身份背景麦克风）。必须先注册再 start()，
+  //   否则连上瞬间推来的结果会漏 —— 与 im_refresh 的处理保持一致。
+  wireIdentityVoiceEvents();
   on('theme', (p) => {
     if (p && p.theme) document.documentElement.dataset.theme = (p.theme === 'dark' ? 'dark' : 'light');
   });

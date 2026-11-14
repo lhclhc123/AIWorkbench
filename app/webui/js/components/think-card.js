@@ -5,6 +5,14 @@
 //   mode="think"   （默认）一条思维链：头行 + 可展开的正文（markdown 渲染）
 //   mode="process" 一组过程消息（v9.22.1）：头行（人话标题 + 条数）+ 折叠态小结论
 //                  + 展开后的步骤列表（think 段落 / 工具胶囊行，均不再单独折叠）
+//
+// ★ v9.22.8 内联形态（inline=true，具体样式见 chat.css 的 .mode-inline）：
+//   用户要求「思考收在同一条助手消息内部，以一行很轻的灰字（如「已思考 12 秒」）
+//   形式出现，点开才展开正文」。卡片本身不变，只是：
+//     · 加 .mode-inline 类 → 头行变 11.5px 浅灰、去掉加粗；
+//     · 正文改成浅灰底 + 左侧竖线、字号比正文小；
+//     · 不再有任何外边框 / 独立气泡（它被挂进 <msg-bubble> 的 .think-slot）。
+//   mode-process（工具过程分组）的行为完全不变。
 'use strict';
 
 const SVG_THINK = `
@@ -40,6 +48,7 @@ class ThinkCard extends HTMLElement {
     this._textNode = null;
     this._built = false;
     this._mode = 'think';     // 'think' | 'process'
+    this._inline = false;     // 内联形态（挂在助手消息内部，不是独立消息块）
     this._mdFn = null;        // 调用方注入的 markdown 渲染函数（可缺省，缺省退化为纯文本）
     this._steps = [];         // process 模式：步骤列表
     this._summary = '';       // process 模式：折叠态小结论
@@ -53,10 +62,18 @@ class ThinkCard extends HTMLElement {
     if (this._built) return;
     this._built = true;
     this.classList.add('think-card');
+    if (this._inline || this.hasAttribute('inline')) {
+      this._inline = true;
+      this.classList.add('mode-inline');
+    }
 
     const isProcess = this._mode === 'process' || this.getAttribute('mode') === 'process';
     this._mode = isProcess ? 'process' : 'think';
-    if (isProcess) this.classList.add('mode-process');
+    if (isProcess) {
+      this.classList.add('mode-process');
+      this.classList.remove('mode-inline');
+      this._inline = false;
+    }
 
     const head = document.createElement('button');
     head.className = 'think-head';
@@ -200,6 +217,13 @@ class ThinkCard extends HTMLElement {
   set mode(v) {
     this._mode = v === 'process' ? 'process' : 'think';
     if (this._built) this.classList.toggle('mode-process', this._mode === 'process');
+  }
+
+  // 内联形态：挂在助手消息内部的一行浅灰小字（v9.22.8）
+  get inline() { return this._inline; }
+  set inline(v) {
+    this._inline = !!v;
+    if (this._built) this.classList.toggle('mode-inline', this._inline);
   }
 
   get open() { return this._open; }

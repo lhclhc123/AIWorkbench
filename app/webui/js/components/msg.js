@@ -62,6 +62,12 @@ class MsgBubble extends HTMLElement {
     const body = document.createElement('div');
     body.className = 'md';
 
+    // ★ v9.22.8：思考/过程插槽 —— 深度思考与工具过程组都收在**这条消息内部**，
+    //   位置在角色头之下、正文之上。空的插槽会被 [hidden] 藏掉，不占高度。
+    const slot = document.createElement('div');
+    slot.className = 'think-slot';
+    slot.hidden = true;
+
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     actions.hidden = true;
@@ -72,8 +78,9 @@ class MsgBubble extends HTMLElement {
       `<span class="spacer"></span>` +
       `<span class="msg-meta"></span>`;
 
-    this.append(head, body, actions);
+    this.append(head, slot, body, actions);
     this._head = head;
+    this._slot = slot;
     this._body = body;
     this._actions = actions;
     this._timeEl = head.querySelector('.role-time');
@@ -255,6 +262,46 @@ class MsgBubble extends HTMLElement {
     this._ensure();
     if (this._role === 'assistant') this._body.before(el);
     else this.append(el);
+  }
+
+  /* ---------------- ★ v9.22.8 思考 / 过程插槽 ---------------- */
+
+  /** 插槽容器本身（空的会被隐藏，不占高度）。 */
+  get thinkSlot() {
+    this._ensure();
+    return this._slot;
+  }
+
+  /**
+   * 往插槽里追加一个「过程块」（内联 think-card 或工具过程组）。
+   * 按调用顺序排列，因此「思考 → 工具组 → 思考 → 工具组」的顺序与消息顺序一致。
+   * @param {HTMLElement} el 过程块节点
+   * @returns {this}
+   */
+  appendProc(el) {
+    this._ensure();
+    if (this._role !== 'assistant' || !el) return this;
+    this._slot.appendChild(el);
+    this._slot.hidden = this._slot.childNodes.length === 0;
+    return this;
+  }
+
+  /**
+   * 设置思考块（语义化封装，等价于「先清空插槽里已有的 think，再 append 一个」）。
+   * @param {HTMLElement} el 内联 <think-card>
+   * @returns {this}
+   */
+  setThink(el) {
+    this._ensure();
+    if (!el) return this;
+    this.appendProc(el);
+    return this;
+  }
+
+  /** 插槽里是否已经有内容（探针 / 调用方用来判断要不要占位）。 */
+  hasProc() {
+    this._ensure();
+    return !!this._slot && this._slot.childNodes.length > 0;
   }
 }
 

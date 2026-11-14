@@ -60,7 +60,8 @@ class VoiceInput(QWidget):
     用法：把它放进输入区旁边；接 `transcribed` 信号拿到文字。
     """
 
-    transcribed = pyqtSignal(str)      # 识别完成（文本）
+    transcribed = pyqtSignal(str)      # 识别完成（最终结果，整段）
+    partial = pyqtSignal(str)          # 边说边出字：中途的实时结果（整段覆盖）
     status = pyqtSignal(str)           # 状态提示
     failed = pyqtSignal(str)           # 出错
 
@@ -69,8 +70,10 @@ class VoiceInput(QWidget):
         self._keys_provider = keys_provider or (lambda: {})
         self._settings_provider = settings_provider or (lambda: {})
         self.recorder = None
+        self.session = None            # asr.StreamingSession（边说边出字）
         self.busy = False
         self._pending_path = None
+        self._stream_error = None
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -132,11 +135,44 @@ class VoiceInput(QWidget):
         self.mic.setText("■")
         self.hint.setText("正在录音 0.0s")
         self._timer.start()
+        self._start_streaming(s)
         self.status.emit("正在录音…中间停顿约 10 秒才会自动结束，说完了也可以直接再点一下麦克风")
+
+    def _start_streaming(self, settings):
+        """开一路后台增量识别，让文字边说边出（失败不影响正常录音/整段识别）。"""
+        self._stream_error = None
+        try:
+            self.session = asr_mod.StreamingSession(
+                self.recorder,
+                self._keys_provider,
+                (settings or {}).get("asr_prefer", "auto"),
+                on_text=self.partial.emit,
+                on_error=self._on_stream_error)
+            self.session.start()
+        except Exception as e:
+            self.session = None
+            self._on_stream_error(e)
+
+    def _on_stream_error(self, msg):
+        """增量识别出错：不打扰用户（结束时仍会整段识别），只记一次。"""
+        if self._stream_error is not None:
+            return
+        self._stream_error = str(msg)
+
+    def _stop_streaming(self):
+        """停掉增量识别。stop() 在等网络时会立刻返回，绝不卡住 UI 线程。"""
+        s = self.session
+        self.session = None
+        if s is not None:
+            try:
+                s.stop()
+            except Exception:
+                pass
 
     def finish(self):
         rec = self.recorder
         self.recorder = None
+        self._stop_streaming()
         self._timer.stop()
         self.meter.active = False
         self.mic.setChecked(False)
@@ -160,6 +196,7 @@ class VoiceInput(QWidget):
             self._ok, self._err)
 
     def cancel(self):
+        self._stop_streaming()
         if self.recorder is not None:
             try:
                 self.recorder.cancel()

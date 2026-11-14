@@ -191,7 +191,9 @@ class SendGuard:
     def _no(self, reason):
         _set_block(reason)
         try:
-            self._log("⛔ 拦住一条发送：%s" % reason)
+            # 单色符号（icons 表）而不是彩色 emoji —— 后者在日志里是个大色块
+            from app.icons import ic
+            self._log(ic("blocked") + " 拦住一条发送：%s" % reason)
         except Exception:
             pass
         return False, reason

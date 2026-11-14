@@ -35,6 +35,23 @@ let currentUtterance = null;
 let currentReadBtn = null;
 // 语音状态占位符：记录 input 默认占位符，语音状态变化时临时覆盖，状态结束后还原。
 let voicePlaceholderDefault = '';
+/* ★ v9.22.8 语音整段替换语义
+ * 用户反馈（以及后端契约）：voice_partial / voice_transcript 推的都是
+ * **当前整段识别结果**，不是增量。老代码 `input.value += p.text` 会重复叠加。
+ * 所以录音开始时把输入框原文记进 voiceBaseValue，之后一律
+ *   input.value = voiceBaseValue + 最新整段文本
+ * final 到达后清空基准值（下一次录音重新取当时的输入框内容）。
+ */
+let voiceBaseValue = '';     // 录音开始时的输入框原文（null 表示未开始录音）
+let voiceSession = false;    // 是否处于一次录音会话中
+
+/* ---------------- 思考计时（v9.22.8） ----------------
+ * 「已思考 12 秒」里的秒数只能在前端测：后端 reason 事件不带时长。
+ * 流式期间从第一次 reason 开始计时，思考结束时把秒数记进 liveThinkSecs，
+ * 收尾重建时按顺序回填给对应那条 think 消息（历史消息没有计时就用「已思考」）。
+ */
+let thinkStartAt = 0;
+let liveThinkSecs = [];
 
 
 /* ---------------- 工具函数 ---------------- */
@@ -81,6 +98,136 @@ function setVoicePlaceholder(msg) {
   const m = String(msg || '');
   const stopped = !m || /(停止|stop|关闭|off|idle|就绪|完成|停止录音|已停止)/i.test(m);
   input.placeholder = stopped ? voicePlaceholderDefault : m;
+}
+
+/* ---------------- 语音：录音会话 / 整段替换（v9.22.8） ---------------- */
+
+/**
+ * 对话页此刻是否是「用户正看着的那一页」。
+ * 语音是**全局唯一**的一条录音链路（后端只有一个 VoiceInput），所以识别结果
+ * 只会推到对话页的 bridge。如果用户其实是在钉钉页点「身份背景」旁的麦克风，
+ * 这一条就必须拒收，否则文字会跑进对话页输入框、把用户草稿写脏。
+ * @returns {boolean}
+ */
+function chatPageActive() {
+  try {
+    if (document.visibilityState === 'hidden') return false;   // 整个 webview 被切走
+    const sec = document.querySelector('#page-chat');
+    if (sec && sec.hidden) return false;                       // 页内切到了别的 tab
+    return true;
+  } catch (e) {
+    return true;    // 判断不了就按「是本页」处理，绝不因此让语音失效
+  }
+}
+
+/**
+ * 判断一条 voice_status 文案是否表示「正在录音」。
+ * 后端推的是中文自然语言（如「正在录音…」「识别中…」「已停止」），
+ * 这里只在**明确是开始类**词时返回 true，拿不准一律当 idle —— 宁可少标红，
+ * 也不要让麦克风永远红着。
+ * @param {string} msg 状态文案
+ * @returns {boolean}
+ */
+function voiceIsRecording(msg) {
+  const s = String(msg || '');
+  if (!s) return false;
+  // ★ v9.22.8 修：后端的**开始**文案里本身就带「结束」两个字 ——
+  //   「正在录音…中间停顿约 10 秒才会自动结束」。老正则把「结束」列进停止词，
+  //   于是录音一开始就被判定成"已停止"，麦克风的红色录音态当场被撤掉
+  //   （用户看到的就是「麦克风根本没在动，像是坏了」）。
+  //   这里只认**真正的停止语**；「识别中」也算会话进行中 —— 基准值绝不能
+  //   在 final 到达前丢掉，否则最终整段会和已经写进输入框的 partial 叠成两遍。
+  if (/(已停止|停止录音|录音结束|已结束|语音输入已关闭|就绪|空闲|失败|出错|超时|^\s*(stop|idle)\s*$)/i.test(s)) {
+    return false;
+  }
+  return /(录音|聆听|说话|recording|识别|正在听)/i.test(s);
+}
+
+/** 明确的「已经停下来了」文案（只有这种才允许收尾录音会话）。 */
+function voiceIsStopped(msg) {
+  const s = String(msg || '');
+  if (!s) return false;
+  return /(已停止|停止录音|录音结束|语音输入已关闭|就绪|空闲|^\s*(stop|idle)\s*$)/i.test(s);
+}
+
+// 开始一次录音会话：记下输入框原文 + 把麦克风标红。
+function beginVoiceSession() {
+  if (voiceSession) return;
+  voiceSession = true;
+  voiceBaseValue = input.value;
+  if (micBtn) {
+    micBtn.classList.add('is-rec');
+    micBtn.setAttribute('aria-pressed', 'true');
+    micBtn.title = '正在录音：再点一下结束';
+  }
+}
+
+// 结束录音会话：清基准值 + 取消标红（已经写进输入框的文本保留）。
+function endVoiceSession() {
+  voiceSession = false;
+  voiceBaseValue = '';
+  if (micBtn) {
+    micBtn.classList.remove('is-rec');
+    micBtn.setAttribute('aria-pressed', 'false');
+    micBtn.title = '语音输入：点一下开始说话，再点一下结束';
+  }
+}
+
+/**
+ * 把一次「整段识别结果」写进输入框。
+ * ★ 整段替换，不是追加 —— 后端推的 partial/final 都是当前这一整段的结果。
+ * @param {string} text 整段识别文本
+ */
+function applyVoiceText(text) {
+  if (!voiceSession) beginVoiceSession();       // 事件先到（status 后到）时的兜底
+  const base = voiceBaseValue || '';
+  input.value = base + String(text == null ? '' : text);
+  autosize();
+  syncSend();
+  try {
+    const n = input.value.length;
+    input.setSelectionRange(n, n);              // 光标放到末尾
+  } catch (e) { /* textarea 未挂焦点时个别环境会抛，忽略 */ }
+}
+
+/* ---------------- 思考计时（v9.22.8） ---------------- */
+function thinkNow() {
+  try {
+    if (window.performance && typeof window.performance.now === 'function') {
+      return window.performance.now();
+    }
+  } catch (e) { /* 忽略 */ }
+  return Date.now();
+}
+
+// 开始给「当前这一轮思考」计时（重复调用不会重置）。
+function startThinkTimer() {
+  if (!thinkStartAt) thinkStartAt = thinkNow();
+}
+
+/**
+ * 结束当前思考计时，把秒数记进 liveThinkSecs。
+ * @returns {number} 本轮思考秒数（至少 1）；没有在计时返回 0
+ */
+function stopThinkTimer() {
+  if (!thinkStartAt) return 0;
+  const sec = Math.max(1, Math.round((thinkNow() - thinkStartAt) / 1000));
+  thinkStartAt = 0;
+  liveThinkSecs.push(sec);
+  return sec;
+}
+
+/**
+ * 当前流式思考卡收尾：写标题（「已思考 N 秒」）并收起。
+ * 工具开始 / 正文开始 / 本轮结束都会调它。
+ */
+function settleStreamThink() {
+  const card = streamThink;
+  const sec = stopThinkTimer();
+  if (!card) return;
+  if (sec > 0) card.title = '已思考 ' + sec + ' 秒';
+  card.open = false;
+  streamThink = null;
 }
 
 function autosize() {
@@ -209,7 +356,10 @@ for (const [cat, def] of Object.entries(PROC_CATEGORIES)) {
   for (const t of (def.tool || [])) PROC_TOOL_CAT[t] = cat;
 }
 
+// 过程角色（think / tool）：它们都不单独成消息，而是收进紧随其后的助手消息内部。
+// ★ v9.22.8 起 planNodes 用 role 直接判断，这个谓词留给外部/后续复用。
 function isProcRole(m) { return !!m && (m.role === 'think' || m.role === 'tool'); }
+
 
 // JSON 字符串能解析就解析成对象，解析不了原样返回（参数摘要要按 key=value 压一行）
 function normaliseArgs(a) {
@@ -398,33 +548,88 @@ function groupSummary(items) {
 
 /**
  * 把消息列表编排成「渲染节点序列」：
- *   {type:'msg', m}                       单条用户/助手/思考消息
- *   {type:'group', cat, title, items:[]}  一组过程消息（**只含工具**）
+ *   {type:'msg', m}             单条消息（用户 / 助手）
+ *   {type:'msg', m, procs:[]}   助手消息 + 收在这条消息**内部**的过程块
+ *   {type:'group', cat, title, items:[]}  一组过程消息（只在 procs 里出现，不单独成节点）
  * 纯函数、无副作用 —— renderMessages 与 finalizeStream 都走它，两条路径结构必然一致。
  *
- * ★ think 的语义（v9.22.2）：一条 think 一张独立的 <think-card>，它**主动打断**
- *   当前过程组（cur = null），既不会被前面的组吞掉，也不会吞掉后面的工具组。
- *   这样「3 工具 + 1 思考」= 1 个工具组 + 1 张思考卡，而不是被并成 1 组 4 步。
+ * ★ v9.22.8 形态（用户要求，照 WorkBuddy）：
+ *   用户原话：「「深度思考」现在独立成了一个对话块，WorkBuddy 里不是这样 —— 思考
+ *              应该收在同一条助手消息内部，以一行很轻的灰字（如「已思考 12 秒」）
+ *              形式出现，点开才展开正文」。
+ *   所以：自上一次普通消息以来累积的 think / tool 过程块**整体附着到下一条助手消息**
+ *   上，在消息内部按原始顺序排开（think → 工具组 → think → 工具组 …），正文排在最后。
+ *   如果这串过程后面没有助手正文（用户中途停止生成 / 老数据只留了过程），就造一条
+ *   **空正文的助手消息**来承载 —— 视觉上仍然是一条 AI 消息里的一行「已思考」，
+ *   而不是消息流里独立的一块。
+ *
+ * 分组规则不变：相邻且同类工具归一组，切换类别开新组，单组最多 PROC_MAX_STEPS 条。
+ * think 依旧**不进组、也不被组吞**（v9.22.2 用户明确要求「一个是一个」），
+ * 只是位置从「顶层节点」变成「消息内部的插槽块」。
+ *
+ * @param {Array<object>} messages 消息列表
+ * @param {{thinkSeconds?: number[]}=} opts thinkSeconds: 流式期间量到的每轮思考秒数
+ * @returns {Array<object>} 渲染节点序列
  */
-function planNodes(messages) {
+function planNodes(messages, opts) {
+  const secs = (opts && Array.isArray(opts.thinkSeconds)) ? opts.thinkSeconds : null;
+  let secCursor = 0;      // secs 的消费下标（一个 think 消费一个）
   const out = [];
-  let cur = null;
+  let procs = [];         // 待附着的内部过程块（think / group），按出现顺序
+  let group = null;       // 正在累积的工具组
+
+  // 思考秒数：消息自带就用消息的（后端将来补时长即可无缝生效），否则回填流式量到的
+  const resolveSecs = (m) => {
+    const meta = (m && m.meta) || {};
+    const raw = [meta.seconds, meta.duration, meta.elapsed, meta.thinkSec,
+                 (m && m.seconds)].find(
+      (v) => typeof v === 'number' && isFinite(v) && v > 0);
+    let sec = raw ? Math.round(Number(raw)) : 0;
+    if (!sec && secs) {
+      const guess = Number(secs[secCursor]);
+      if (isFinite(guess) && guess > 0) sec = Math.round(guess);
+    }
+    secCursor += 1;
+    return sec;
+  };
+
+  // 把累积的过程块挂到一条消息上；没有可挂的消息就造一条空正文助手消息承载
+  const flush = (m) => {
+    out.push({
+      type: 'msg',
+      m: m || { role: 'assistant', text: '', meta: {}, virtual: true },
+      procs: procs,
+    });
+    procs = [];
+    group = null;
+  };
+
   for (const m of (messages || [])) {
-    if (m && m.role === 'think') {
-      // 思考单独成块：先断组，再原样交给 buildMessage 去造 think-card
-      cur = null;
-      out.push({ type: 'msg', m });
+    if (!m) continue;
+    if (m.role === 'think') {
+      group = null;                                   // think 打断工具组，但不独立成节点
+      procs.push({ type: 'think', m, seconds: resolveSecs(m) });
       continue;
     }
-    if (!isProcRole(m)) { cur = null; out.push({ type: 'msg', m }); continue; }
-    const cat = categoryOf(m);
-    if (cur && cur.cat === cat && cur.items.length < PROC_MAX_STEPS) {
-      cur.items.push(m);
-    } else {
-      cur = { type: 'group', cat, title: groupTitle(cat, m), items: [m] };
-      out.push(cur);
+    if (m.role === 'tool') {
+      const cat = categoryOf(m);
+      if (group && group.cat === cat && group.items.length < PROC_MAX_STEPS) {
+        group.items.push(m);
+      } else {
+        group = { type: 'group', cat, title: groupTitle(cat, m), items: [m] };
+        procs.push(group);
+      }
+      continue;
     }
+    if (m.role === 'assistant' && procs.length) {
+      flush(m);                                       // 整段过程收进这条助手消息
+      continue;
+    }
+    if (procs.length) flush();                        // 过程后跟的是 user：造空助手消息承载
+    group = null;
+    out.push({ type: 'msg', m });
   }
+  if (procs.length) flush();
   return out;
 }
 
@@ -456,38 +661,70 @@ function buildGroup(g) {
 }
 
 function buildNode(node) {
-  if (node && node.type === 'group') return buildGroup(node);
-  return buildMessage(node ? node.m : node);
+  if (!node) return buildMessage(null);
+  if (node.type === 'group') return buildGroup(node);
+  return buildMessage(node.m, node.procs);
+}
+
+/**
+ * 内联思考条的标题文案：「已思考 12 秒」/ 秒数未知时只写「已思考」。
+ * @param {number} seconds 秒数
+ * @returns {string}
+ */
+function thinkTitle(seconds) {
+  const s = Number(seconds);
+  return (isFinite(s) && s > 0) ? ('已思考 ' + Math.round(s) + ' 秒') : '已思考';
+}
+
+/**
+ * 造一张**内联**思考条（v9.22.8）：挂在助手消息内部的 .think-slot 里，
+ * 折叠态只有一行浅灰小字，点开在这条消息内部展开正文（样式见 .mode-inline）。
+ * @param {object} m think 消息
+ * @param {number} seconds 该轮思考秒数（0/未知 → 标题省略秒数）
+ * @returns {HTMLElement} <think-card> 元素
+ */
+function buildThinkCard(m, seconds) {
+  const el = document.createElement('think-card');
+  el.inline = true;
+  el.open = false;
+  el.title = thinkTitle(seconds);
+  el.meta = '';
+  el.setMarkdownFn(renderMarkdown);
+  el.text = (m && m.text) || '';
+  return el;
 }
 
 /* ---------------- 渲染：消息列表 ---------------- */
-function buildMessage(m) {
-  const role = m.role || 'assistant';
-  const meta = m.meta || {};
+/**
+ * 造一条消息节点。
+ * ★ v9.22.8：助手消息会带上 procs（思考 / 工具过程组），按顺序挂进它内部的
+ *   .think-slot —— 思考不再是消息流里独立的一块。
+ * @param {object} m 消息
+ * @param {Array<object>=} procs 内部过程块（think / group）
+ * @returns {HTMLElement} <msg-bubble> / <think-card> / <tool-capsule>
+ */
+function buildMessage(m, procs) {
+  const msg = m || {};
+  const role = msg.role || 'assistant';
+  const meta = msg.meta || {};
   if (role === 'user') {
     const el = document.createElement('msg-bubble');
     el.role = 'user';
-    el.text = m.text || '';
+    el.text = msg.text || '';
     el.time = meta.time || '';
     return el;
   }
   if (role === 'think') {
-    // ★ 每一轮思考都是**独立的一小块**（用户：不要都混到一块儿，一个是一个）。
-    //   折叠、一行标题、点开只看到自己那一段 —— 不显示「N 步」，也不进任何过程组。
-    const el = document.createElement('think-card');
-    el.open = false;
-    el.title = '深度思考';
-    el.meta = '';
-    el.setMarkdownFn(renderMarkdown);
-    el.text = m.text || '';
-    return el;
+    // 兜底：没有可附着的助手消息时（外部直接 buildNode 一条 think），
+    // 仍然渲染成内联思考条，保证它长得和消息内部那一行完全一样。
+    return buildThinkCard(msg, 0);
   }
   if (role === 'tool') {
     // ★ 工具胶囊必须显示**真实工具名 + 参数摘要**，绝不能只剩「工具」两个字
     const el = document.createElement('tool-capsule');
-    el.name = toolNameOf(m) || '工具';
-    el.arg = compressArgs(toolArgsOf(m), 60);
-    el.result = m.text || '';
+    el.name = toolNameOf(msg) || '工具';
+    el.arg = compressArgs(toolArgsOf(msg), 60);
+    el.result = msg.text || '';
     el.setRunning(false);
     return el;
   }
@@ -495,7 +732,13 @@ function buildMessage(m) {
   el.role = 'assistant';
   el.time = meta.time || '';
   el.meta = meta.label || '';
-  el.html = renderMarkdown(m.text || '');
+  el.html = renderMarkdown(msg.text || '');
+  // ★ 过程块挂进同一条消息内部的插槽，顺序 = 消息顺序（think → 工具组 → think …）
+  for (const p of (procs || [])) {
+    if (!p) continue;
+    if (p.type === 'think') el.appendProc(buildThinkCard(p.m, p.seconds));
+    else if (p.type === 'group') el.appendProc(buildGroup(p));
+  }
   el.showActions();
   return el;
 }
@@ -665,16 +908,29 @@ function beginStream() {
   thread.appendChild(streamMsg);
   streamThink = null;
   currentTool = null;
+  // ★ v9.22.8：新一轮 → 思考计时/秒数清零（收尾重建时按顺序回填「已思考 N 秒」）
+  thinkStartAt = 0;
+  liveThinkSecs = [];
   hideWelcome();
   scrollBottom(true);
 }
 
+/**
+ * 取（必要时新建）当前这一轮的流式思考条。
+ * ★ v9.22.8：思考条直接挂在流式助手消息内部（insertBeforeBody），
+ *   所以生成过程中看到的形态 = 收尾后的形态（不再是独立的一块）。
+ * @returns {HTMLElement} <think-card>
+ */
 function ensureThink() {
   if (streamThink) return streamThink;
   streamThink = document.createElement('think-card');
-  streamThink.open = true;
+  streamThink.inline = true;
+  streamThink.title = '正在思考…';
+  streamThink.meta = '';
+  streamThink.open = true;                 // 思考中默认展开，让用户看到在动
   streamThink.setMarkdownFn(renderMarkdown);
   if (streamMsg) streamMsg.insertBeforeBody(streamThink);
+  startThinkTimer();
   return streamThink;
 }
 
@@ -699,6 +955,10 @@ function collapseMs() {
  */
 function finalizeStream(messages) {
   const liveMsg = streamMsg;   // 先留住引用：下面会被置空
+  // ★ v9.22.8：如果整轮结束时思考条还开着（没有正文 / 没有工具），先结算它的秒数，
+  //   否则「已思考 N 秒」会缺最后一轮的时长。
+  settleStreamThink();
+  stopThinkTimer();            // 兜底：没有思考卡但计时还开着（异常路径）时也要归零
   patch({ streaming: false, busy: false });
   setComposerBusy(false);
   streamMsg = null;
@@ -728,8 +988,11 @@ function finalizeStream(messages) {
       if (kids[i].parentNode) kids[i].remove();
     }
     // 只重建本轮新增的消息；历史消息的 DOM 与其 markdown 渲染结果原样保留
+    // ★ v9.22.8：顺便把流式期间量到的每轮思考秒数按顺序回填（「已思考 12 秒」）
     const frag = document.createDocumentFragment();
-    for (const node of planNodes(fresh)) frag.appendChild(buildNode(node));
+    for (const node of planNodes(fresh, { thinkSeconds: liveThinkSecs })) {
+      frag.appendChild(buildNode(node));
+    }
     thread.appendChild(frag);
     if (welcome) welcome.hidden = messages.length > 0;
     scrollBottom(true);
@@ -789,10 +1052,22 @@ function wireEvents() {
 
   fileBtn.addEventListener('click', () => call('pick_file'));
   // 语音输入：切换录音。状态/转写由后端 push 事件驱动（见 bindBridge 的 on(...)）。
+  // ★ v9.22.8：rpc 返回的 status 是 'recording' | 'recognizing' | 'idle'，
+  //   用它立刻切换麦克风的红色呼吸态（事件可能稍后才到，手感不能等）。
   micBtn.addEventListener('click', async () => {
     try {
       const d = await rpc('voice.toggle');
-      if (d && d.status) setVoicePlaceholder(d.status);
+      if (d && d.ok === false) {
+        toast('语音不可用：' + (d.error || '未知原因'));
+        return;
+      }
+      const st = String((d && d.status) || '');
+      if (st === 'recording') beginVoiceSession();
+      else if (st === 'idle' || st === 'recognizing') {
+        // 只结束「录音中」的视觉态；识别中仍然算一次会话（结果还没回来）
+        if (st === 'idle') endVoiceSession();
+        micBtn.classList.remove('is-rec');
+      }
     } catch (e) {
       toast('语音切换失败：' + e.message);
     }
@@ -901,6 +1176,9 @@ function bindBridge() {
 
   on('token', (p) => {
     if (!p || !streamMsg) return;
+    // ★ v9.22.8：正文一开始出字，说明这一轮思考结束了 —— 结算秒数并把思考条收起
+    //   （「已思考 12 秒 ⌄」）。之后再来的 reason 会由 ensureThink() 开新的一条。
+    settleStreamThink();
     streamMsg.appendText(p.delta || '');
     scrollBottom(false);
   });
@@ -923,10 +1201,11 @@ function bindBridge() {
     cap.setRunning(true);
     if (streamMsg) streamMsg.insertBeforeBody(cap);
     currentTool = cap;
-    // ★ v9.22.2：工具是「本轮思考结束」的分界线 —— 丢掉当前的流式思考卡，
+    // ★ v9.22.2：工具是「本轮思考结束」的分界线 —— 收掉当前的流式思考卡，
     //   下一次 send_reason 会开一张新卡。否则好几轮的深度思考在流式期间
-    //   也会被写进同一个块里（收尾重建后不混，但生成过程中混，同样是那个 bug）。
-    streamThink = null;
+    //   也会被写进同一个块里。
+    // ★ v9.22.8：收掉时顺便结算秒数（「已思考 N 秒」），并保持内联在同一消息内。
+    settleStreamThink();
     scrollBottom(false);
   });
 
@@ -976,6 +1255,7 @@ function bindBridge() {
       try { streamThink.remove(); } catch (e) { /* ignore */ }
       streamThink = null;
     }
+    thinkStartAt = 0;
     currentTool = null;
   });
 
@@ -988,18 +1268,36 @@ function bindBridge() {
     if (p && p.theme) patch({ theme: p.theme });
   });
 
-  // 语音状态：后端 push 的录音状态，临时显示在输入框占位符上（见 setVoicePlaceholder）。
+  /* ---------------- 语音（v9.22.8 整段替换语义） ----------------
+   * 后端契约：
+   *   voice_status   {msg}                录音状态文案（"正在录音…" / "已停止"）
+   *   voice_partial  {text, final:false}  录音过程中不断推的**当前整段**识别结果
+   *   voice_transcript {text, final:true} 录音结束后的最终**整段**结果
+   * ★ 三条都是「整段」，所以一律 input.value = voiceBaseValue + text，
+   *   绝不能再 += （老代码就是 +=，partial 一来就重复叠加）。
+   */
   on('voice_status', (p) => {
     if (!p) return;
-    setVoicePlaceholder(p.msg || p.status || '');
+    const msg = p.msg || p.status || '';
+    setVoicePlaceholder(msg);
+    if (voiceIsRecording(msg)) beginVoiceSession();
+    else if (voiceIsStopped(msg)) endVoiceSession();
+    // 其它文案（「没听清，再说一次？」之类）**不动**会话：
+    //   final 还没到，voiceBaseValue 必须留着，否则整段结果会和 partial 叠两遍。
   });
 
-  // 语音转写结果：把识别出的文本追加进输入框。
+  on('voice_partial', (p) => {
+    if (!p || p.text == null) return;
+    if (!chatPageActive()) return;          // 用户在钉钉页说话，别写到聊天输入框
+    applyVoiceText(p.text);
+  });
+
   on('voice_transcript', (p) => {
-    if (!p || !p.text) return;
-    input.value += p.text;
-    autosize();
-    syncSend();
+    if (!p || p.text == null) return;
+    if (!chatPageActive()) return;          // 同上：不是本页发起的录音就不消费
+    applyVoiceText(p.text);          // 整段替换（不是追加）
+    endVoiceSession();               // 最终结果到了：清基准值、麦克风取消标红
+    try { input.focus(); } catch (e) { /* ignore */ }
   });
 }
 

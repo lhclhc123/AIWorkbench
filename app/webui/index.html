@@ -118,9 +118,17 @@
                   </button>
                   <div class="model-menu" id="modelMenu" hidden></div>
                 </div>
-                <button class="ibtn" id="micBtn" title="语音输入">
-                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="6" y="2.4" width="4" height="7" rx="2"/><path d="M3.8 7.4a4.2 4.2 0 0 0 8.4 0M8 11.6v2"/>
+                <!-- ★ v9.22.8：语音按钮。用户反馈「好像没有了」——
+                     实测按钮一直在 DOM 里，但 15px 线框 + var(--text-3) 浅灰 +
+                     紧贴模型胶囊，视觉上等于消失。这里换成更实心的麦克风
+                     （单独包裹 + 底座），并配 .ibtn{color:var(--text-2)}；
+                     录音中由 .is-rec 变红并呼吸闪动（见 chat.css）。 -->
+                <button class="ibtn ibtn-mic" id="micBtn" type="button"
+                        title="语音输入：点一下开始说话，再点一下结束"
+                        aria-label="语音输入" aria-pressed="false">
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="5.9" y="1.9" width="4.2" height="7.4" rx="2.1"/>
+                    <path d="M3.4 7.3a4.6 4.6 0 0 0 9.2 0M8 11.9v2.2M5.9 14.1h4.2"/>
                   </svg>
                 </button>
                 <button class="send" id="sendBtn" title="发送" disabled>
