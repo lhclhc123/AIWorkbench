@@ -117,6 +117,8 @@ def selftest():
         # ★ v9.22.6：增量更新（manifest/diff/patch）。updater 顶层 import，
         #   漏了它冻结版会直接 ModuleNotFoundError。
         "incremental",
+        # ★ v9.22.7：崩溃/卡死取证（main.py 最早期 import）
+        "crashlog",
     ]
     _GUI_MODS = [
         "chat_worker", "main_window", "pages", "panels",
@@ -428,6 +430,25 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+
+    # ★ v9.22.7：崩溃取证要在**任何 Qt 对象创建之前**装好（faulthandler 要求）。
+    #   用户反馈「别的电脑上一点就卡退」，没有日志根本查不了；这里把
+    #   Python 未捕获异常 / 子线程异常 / Qt 警告 / 原生段错误 全部落盘到
+    #   %LOCALAPPDATA%\AIWorkbench\logs\run-YYYYMMDD.log，并在下次启动时
+    #   检测「上次是不是异常退出」，是就提示用安全模式。
+    try:
+        from app import crashlog as _crash
+        from app import version as _ver
+        _crash.install(_ver.VERSION)
+    except Exception:
+        _crash = None
+
+    # 安全模式：--safe 或环境变量 AWB_SAFE=1 → 关掉 Web 渲染 + 跳过联网检查。
+    # 用户机器上一旦出现「网页渲染卡死」，这是唯一能自己救回来的开关。
+    _safe = ("--safe" in sys.argv) or (os.environ.get("AWB_SAFE", "").strip() == "1")
+    if _safe:
+        os.environ["AWB_WEBUI"] = "0"
+
     # 最先把「隐藏控制台」挂上：之后所有子进程（python / cmd / node / dws）都继承它，
     # 执行任务时就不会闪黑窗口。放在启动最开始——真有闪窗也只发生在启动瞬间，
     # 不会在干活过程中反复冒出来。
@@ -471,6 +492,33 @@ def main():
     except Exception:
         pass
 
+    # ★ v9.22.7：上次没走正常退出（崩了/被强杀/卡死）→ 给一次「安全模式」机会。
+    #   安全模式 = 关 Web 渲染（回归 Qt 原生界面）+ 跳过启动联网检查，
+    #   这是用户在坏掉的电脑上唯一能自救的入口。
+    if _crash is not None and not _safe:
+        try:
+            if _crash.last_unclean_exit():
+                from PyQt6.QtWidgets import QMessageBox
+                r = QMessageBox.question(
+                    None, "上次没有正常退出",
+                    "检测到 AI 工作台上次是异常退出（崩溃或卡死）。\n\n"
+                    "要不要用「安全模式」启动？\n"
+                    "· 关闭网页界面渲染（回到原生界面，最不容易卡）\n"
+                    "· 跳过启动时的联网检查\n\n"
+                    "诊断日志：\n%s" % (_crash.log_path() or "（无）"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes)      # 上次都崩了，默认就建议安全模式
+                if r == QMessageBox.StandardButton.Yes:
+                    os.environ["AWB_WEBUI"] = "0"
+                    os.environ["AWB_NO_UPDATE_CHECK"] = "1"
+                    _safe = True
+                    try:
+                        _crash.log("用户选择安全模式启动")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     # 先应用主题（Fusion + 显式调色板），这样连启动对话框在深色模式下文字也清晰
     from app import themes
     try:
@@ -496,8 +544,25 @@ def main():
 
     ws = ws_mod.Workspace(path).ensure()
     settings = ws.load_settings()
+    # 打完「正在运行」标记：正常退出时才删；下次启动发现它还在 = 上次崩了。
+    if _crash is not None:
+        try:
+            _crash.mark_running()
+            app.aboutToQuit.connect(_crash.clear_running)
+            _crash.log("窗口创建中；web_engine=%s safe=%s" % (
+                os.environ.get("AWB_WEBUI", "(默认)"), _safe))
+        except Exception:
+            pass
     win = MainWindow(ws, settings)
     win.show()
+
+    # 界面卡死取证：主线程心跳停了 15 秒就把所有线程的栈写进日志。
+    if _crash is not None:
+        try:
+            _wd = _crash.start_watchdog()
+            app._awb_watchdog = _wd          # 持引用，否则 QTimer 被 GC 掉就停了
+        except Exception:
+            pass
 
     # 已有实例被再次点击 -> 只把窗口叫回前台，不新开窗口、不新建对话。
     if inst is not None:

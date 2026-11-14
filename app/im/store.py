@@ -54,12 +54,17 @@ IM_DEFAULT_SETTINGS = {
     "identity": "",            # 用户自填的身份背景（口吻/关系/最近发生的事）
     "scanned": False,          # 是否做过首次全量扫描打标签
     "interval": 25,            # 轮询间隔（秒）
+    # ★ v9.22.7（2026-11-14 事故后）：自动代回改成 **fail-closed**。
+    #   以前 scope_* 默认 True + whitelist 空 = 全部会话，导致 AI 拿真实账号
+    #   往班级群发了消息。现在必须用户显式打开 `auto_send`，并且白名单非空。
+    "auto_send": False,        # 自动代回总开关（默认关）
+    "auto_send_max": 20,       # 单日自动发送上限（熔断用）
 }
 
 # 布尔 / 整数 / 纯文本 三类 key，set_settings 时分别处理
 _SETTING_BOOLS = ("scope_group", "scope_p2p", "scope_at_me",
-                  "reply_uncertain", "scanned")
-_SETTING_INTS = ("delay_seconds", "interval")
+                  "reply_uncertain", "scanned", "auto_send")
+_SETTING_INTS = ("delay_seconds", "interval", "auto_send_max")
 _SETTING_TEXTS = ("uncertain_text", "identity")
 
 
@@ -476,6 +481,13 @@ class IMStore:
         # 越界的值读出来也纠正，避免手改文件改出个负数
         s["delay_seconds"] = max(0, min(3600, int(s.get("delay_seconds") or 0)))
         s["interval"] = max(10, min(600, int(s.get("interval") or 25)))
+        try:
+            s["auto_send_max"] = max(1, min(200, int(s.get("auto_send_max") or 20)))
+        except Exception:
+            s["auto_send_max"] = 20
+        # ★ v9.22.7：老配置文件里没有 auto_send 字段 → 一律当成 False。
+        #   `settings()` 已经用默认值兜过，这里再兜一次，防止有人手改出 "1"/"true"。
+        s["auto_send"] = bool(s.get("auto_send") is True)
         return s
 
     def set_settings(self, **kw):
@@ -494,6 +506,11 @@ class IMStore:
             elif k == "interval":
                 try:
                     cur[k] = max(10, min(600, int(v)))
+                except Exception:
+                    continue
+            elif k == "auto_send_max":
+                try:
+                    cur[k] = max(1, min(200, int(v)))
                 except Exception:
                     continue
             elif k in _SETTING_BOOLS:

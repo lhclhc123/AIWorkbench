@@ -216,6 +216,14 @@ class MainWindow(QMainWindow):
     _update_progress = pyqtSignal(int, int)
     _update_done = pyqtSignal(str)
     _update_fail = pyqtSignal(str)
+    # ★ v9.22.7：**通用的「把一段代码扔回主线程执行」通道**。
+    #   背景（真实事故）：v9.22.6 为了不让启动卡 3~8 秒，把 updater.check() 挪到
+    #   后台线程，但检查完直接在线程里调 _after_update_check()，那里面摸了
+    #   page_integrations.show_update_result() / statusBar() —— **跨线程碰 Qt 控件**。
+    #   Qt 不是线程安全的，在快机器上偶尔没事，在慢一点的电脑上就是「一启动就未响应、
+    #   点两下就自己卡退」。以后凡是后台线程要动界面，一律 self._ui(回调)，
+    #   不要再各处自己造信号（信号只能带固定类型，闭包塞不进去）。
+    _ui_post = pyqtSignal(object)
     # ★ v9.22.0：安装阶段提示 / 解压进度 / 安装完成
     #   （update 的后台线程 -> UI 线程都要过信号，跨线程不碰控件）
     _update_stage = pyqtSignal(str, str)             # (stage, detail) 阶段提示
@@ -1226,6 +1234,8 @@ class MainWindow(QMainWindow):
         self._update_progress.connect(self._update_on_progress)
         self._update_done.connect(self._update_on_done)
         self._update_fail.connect(self._update_on_fail)
+        # ★ v9.22.7：后台线程 → 主线程的通用投递口（AutoConnection 会自动排队）
+        self._ui_post.connect(self._ui_run_posts)
         # ★ v9.22.0：安装阶段 / 解压进度 / 安装完成（后台线程 -> UI）
         self._update_stage.connect(self._update_on_stage)
         self._update_install_progress.connect(self._update_on_install_progress)
@@ -1854,6 +1864,20 @@ class MainWindow(QMainWindow):
             return self._web_im_set_tag(args)
         if method == "im_delete_msgs":
             return self._web_im_delete(args)
+        # ★ v9.22.7（2026-11-14 误发事故后）：草稿箱 + 发送记录 + 撤回
+        if method == "im_drafts_list":
+            return self._web_im_drafts_list()
+        if method == "im_draft_send":
+            return self._web_im_draft_send(str(args.get("id") or ""))
+        if method == "im_draft_drop":
+            return self._web_im_draft_drop(str(args.get("id") or ""))
+        if method == "im_send_log":
+            return self._web_im_send_log(int(args.get("limit") or 30))
+        if method == "im_recall":
+            return self._web_im_recall(str(args.get("cid") or ""),
+                                       str(args.get("mid") or ""))
+        if method == "im_guard_state":
+            return self._web_im_guard_state()
         if method == "im_process_all":
             self._assistant_process_all()
             return {"ok": True}
@@ -2817,6 +2841,9 @@ class MainWindow(QMainWindow):
             "settings": st,
             "tags": tag_list,
             "whitelist": st.get("whitelist", []),
+            # ★ v9.22.7：闸门状态 + 草稿箱（前端顶栏警示条 / 草稿区读这两个）
+            "guard": self._web_im_guard_state(),
+            "drafts": self._web_im_drafts_list().get("items", []),
         }
 
     def _im_cli_idle_hint(self):
@@ -2874,7 +2901,9 @@ class MainWindow(QMainWindow):
             return {"ok": False, "error": "IM 底座未初始化"}
         allowed = ("scope_group", "scope_p2p", "scope_at_me", "delay_seconds",
                    "uncertain_reply", "uncertain_text", "identity",
-                   "interval", "auto_reply")
+                   "interval", "auto_reply", "whitelist",
+                   # ★ v9.22.7：自动代回总开关 / 熔断上限
+                   "auto_send", "auto_send_max")
         patch = {k: v for k, v in args.items() if k in allowed}
         st = self.im_store.set_settings(**patch)
         # 同步到老轮询服务（间隔/范围）
@@ -2919,6 +2948,99 @@ class MainWindow(QMainWindow):
         if isinstance(mids, str):
             mids = [mids]
         self._im_delete_msgs([str(m) for m in mids])
+        return {"ok": True}
+
+    # ---------- ★ v9.22.7：草稿箱 / 发送记录 / 撤回 ----------
+    def _web_im_guard_state(self):
+        """闸门当前状态，前端顶栏那条警示条读这个。"""
+        g = getattr(self, "im_guard", None)
+        st = self._im_settings_now()
+        out = {"ok": True, "dry_run": False, "auto_send": bool(st.get("auto_send")),
+               "today": 0, "limit": int(st.get("auto_send_max") or 20),
+               "whitelist": len(st.get("whitelist") or [])}
+        try:
+            from ..im import guard as _g
+            out["dry_run"] = _g.dry_run_active()
+            if g is not None:
+                out["today"] = g.count_today("auto")
+        except Exception:
+            pass
+        return out
+
+    def _web_im_drafts_list(self):
+        box = getattr(self, "im_drafts", None)
+        items = []
+        if box is not None:
+            try:
+                items = box.list(80)
+            except Exception:
+                items = []
+        return {"ok": True, "items": items, "count": len(items)}
+
+    def _web_im_draft_send(self, did):
+        """用户点名发这一条 —— 这是**明确的人工授权**，走 source=manual。"""
+        box = getattr(self, "im_drafts", None)
+        if box is None:
+            return {"ok": False, "error": "草稿箱不可用"}
+        row = box.get(did)
+        if not row:
+            return {"ok": False, "error": "草稿不存在（可能已经发过或删了）"}
+        cid = str(row.get("cid") or "")
+        text = str(row.get("text") or "")
+
+        def w():
+            ok = False
+            try:
+                ok = bool(self._im_send(cid, text, source="manual"))
+            except Exception as exc:
+                self._safe_asst_log(f"草稿发送失败：{type(exc).__name__}: {exc}")
+            if ok:
+                try:
+                    box.drop(did)
+                except Exception:
+                    pass
+                self._asst_log_ui("✓ 草稿已发出：%s" % text[:50])
+            else:
+                self._asst_log_ui("✕ 草稿发送失败，仍留在草稿箱")
+            self._im_refresh_views()
+        threading.Thread(target=w, daemon=True).start()
+        return {"ok": True, "async": True}
+
+    def _web_im_draft_drop(self, did):
+        box = getattr(self, "im_drafts", None)
+        if box is None:
+            return {"ok": False, "error": "草稿箱不可用"}
+        ok = False
+        try:
+            ok = bool(box.drop(did))
+        except Exception as exc:
+            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        self._im_refresh_views()
+        return {"ok": ok}
+
+    def _web_im_send_log(self, limit=30):
+        g = getattr(self, "im_guard", None)
+        rows = []
+        if g is not None:
+            try:
+                rows = g.recent(limit)
+            except Exception:
+                rows = []
+        # 带上会话名，前端好认
+        for r in rows:
+            if not r.get("name"):
+                r["name"] = self._im_name_of(r.get("cid"))
+        return {"ok": True, "items": rows, "count": len(rows)}
+
+    def _web_im_recall(self, cid, mid):
+        """撤回一条自己发的消息（补救手段）。"""
+        if not cid or not mid:
+            return {"ok": False, "error": "缺会话 id 或消息 id"}
+        try:
+            self.ding.dws_recall(cid, mid)
+        except Exception as exc:
+            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        self._asst_log_ui("✓ 已撤回一条消息")
         return {"ok": True}
 
     def _web_im_cli_setup(self):
@@ -3328,7 +3450,9 @@ class MainWindow(QMainWindow):
             self.page_assistant.load_cfg(self.assistant.cfg)
             # ★ v9.20.0：进这一页就全量刷一次（消息 / 设置 / 标签），
             #   否则用户改了设置切走再回来看到的还是老值。
-            self._im_refresh_all()
+            # ★ v9.22.7：改后台刷 —— 切页是点击操作，同步读 7 份数据会让
+            #   那一瞬间整窗卡住；用户对"点一下卡半天"极其敏感。
+            self._im_refresh_all_async()
         if key == "skills":
             self.page_skills.bind(self.skills)
         elif key == "tasks":
@@ -4998,11 +5122,38 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, lambda: self._test_dingtalk(cfg))
 
     def _test_dingtalk(self, cfg):
+        """「发测试消息」：HTTP 最坏要等十几秒，必须放后台线程。
+
+        ★ v9.22.7：本方法由 `_save_dingtalk()` 用 QTimer 自动触发 —— 用户只是
+          点了「保存配置」，并没有要求等结果。以前同步跑 `ding.test()`（内部是
+          带超时的 HTTP），网络一慢整个窗口就僵住十几秒，体感就是「点一下就卡住」。
+        """
         self.ding.update(cfg)
-        ok, msg = self.ding.test()
-        self.page_integrations.set_dingtalk_status(
-            ("✓ " if ok else "✕ ") + msg)
-        self.statusBar().showMessage(("钉钉：" + msg)[:120], 8000)
+        try:
+            self.page_integrations.set_dingtalk_status("正在发送测试消息…")
+        except Exception:
+            pass
+
+        def _work():
+            try:
+                ok, msg = self.ding.test()
+            except Exception as exc:
+                ok, msg = False, "%s: %s" % (type(exc).__name__, exc)
+            self._ui(lambda: self._apply_dingtalk_test(bool(ok), str(msg)))
+
+        threading.Thread(target=_work, daemon=True,
+                         name="awb-ding-test").start()
+
+    def _apply_dingtalk_test(self, ok, msg):
+        """（主线程）测试结果落地：集成页状态行 + 状态栏。"""
+        try:
+            self.page_integrations.set_dingtalk_status(("✓ " if ok else "✕ ") + msg)
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage(("钉钉：" + msg)[:120], 8000)
+        except Exception:
+            pass
 
     # ---------- 接口调试台：自检 / 通讯录 / 扫码登录 / 发群 ----------
     def _dingtalk_selftest(self, cfg):
@@ -5148,16 +5299,24 @@ class MainWindow(QMainWindow):
         pi.show_probe_text("\n".join(lines))
 
     def _dingtalk_group_send(self, cfg, text):
+        """「发到群」：同样是带超时的 HTTP，放后台线程，结果回主线程显示。"""
         self.ding.update(cfg)
         pi = self.page_integrations
         if not text:
             pi.set_dingtalk_status("请先填要发到群里的内容。")
             return
-        try:
-            r = self.ding.send_group(text)
-            pi.set_dingtalk_status(f"✓ 已发到群（{r.get('target')}）")
-        except Exception as e:
-            pi.set_dingtalk_status(f"✕ 发群失败：{e}")
+        pi.set_dingtalk_status("正在发到群…")
+
+        def _work():
+            try:
+                r = self.ding.send_group(text)
+                msg = "✓ 已发到群（%s）" % (r.get("target"),)
+            except Exception as exc:
+                msg = "✕ 发群失败：%s: %s" % (type(exc).__name__, exc)
+            self._ui(lambda: pi.set_dingtalk_status(msg))
+
+        threading.Thread(target=_work, daemon=True,
+                         name="awb-ding-group-send").start()
 
     # ---------------- dws 工作台 CLI（个人授权，能读会话列表/消息） ----------------
     def _dingtalk_dws_login(self, device):
@@ -5368,18 +5527,29 @@ class MainWindow(QMainWindow):
         if not fired:
             return
         self.reminders = [r for r in self.reminders if r["ts"] > now]
+        # ★ v9.22.7：`ding.send()` 是带超时的 HTTP（最坏十几秒），以前在
+        #   这个 QTimer 槽里同步跑 —— 一到点就整窗卡住，用户完全不知道为什么。
+        #   推送整体丢后台，界面部分（toast / 卡片 / 输入区）仍在主线程做。
+        ding_items = [r for r in fired if r["dingtalk"] and self.ding.configured()]
         for r in fired:
             msg = f"◷ 提醒：{r['text']}"
             self._notify("AI 工作台提醒", r["text"])
-            if r["dingtalk"] and self.ding.configured():
-                try:
-                    self.ding.send(msg, title="AI 工作台提醒")
-                except Exception:
-                    pass
             if self.conv is not None:
                 self.pending_tool.append({"role": "tool", "content": "[成功] " + msg})
                 self._render()
         self._refresh_chips()
+        if not ding_items:
+            return
+
+        def _push():
+            for r in ding_items:
+                try:
+                    self.ding.send(f"◷ 提醒：{r['text']}", title="AI 工作台提醒")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_push, daemon=True,
+                         name="awb-reminder-push").start()
 
     @staticmethod
     def _notify(title, message):
@@ -5402,7 +5572,23 @@ class MainWindow(QMainWindow):
         try:
             from ..im import IMStore
             from ..im.hub import IMHub
+            from ..im import guard as _imguard
             self.im_store = IMStore(self.workspace.path)
+            # ★ v9.22.7：代发总闸 + 草稿箱（2026-11-14 误发事故后加的）
+            try:
+                self.im_guard = _imguard.SendGuard(
+                    self.im_store.root, log=lambda s: self._safe_asst_log(s))
+                self.im_drafts = _imguard.DraftBox(self.im_store.root)
+                if _imguard.dry_run_active():
+                    self._safe_asst_log(
+                        "⚠ 演练模式已开启（AWB_IM_DRYRUN/--selftest/安全模式）："
+                        "任何消息都不会真的发到钉钉")
+            except Exception as _exc:
+                self.im_guard = None
+                self.im_drafts = None
+                self._safe_asst_log(
+                    f"代发闸门初始化失败（已按「一律不发」处理）："
+                    f"{type(_exc).__name__}: {_exc}")
             self.im_hub = IMHub(self.im_store, self._im_llm, self._im_send,
                                 log=lambda s: self._safe_asst_log(s),
                                 me_name=self._ding_self_name())
@@ -5429,10 +5615,20 @@ class MainWindow(QMainWindow):
                 self._im_timer.setInterval(10000)
                 self._im_timer.timeout.connect(self._im_tick)
             self._im_timer.start()
-            self._safe_asst_log(
-                f"IM 数据目录：{self.im_store.root}"
-                f"（会话 {len(self.im_store.threads())} 个 / "
-                f"定时任务 {len(self.im_store.tasks())} 条）")
+            # ★ v9.22.7 启动提速：会话数 / 定时任务数要遍历两个 JSON 目录，
+            #   以前在启动路径上同步算完才打印这一行日志 —— 数据一多就白屏。
+            #   计数与日志一起丢到后台线程，界面先出来。
+            def _count_im():
+                try:
+                    self._safe_asst_log(
+                        f"IM 数据目录：{self.im_store.root}"
+                        f"（会话 {len(self.im_store.threads())} 个 / "
+                        f"定时任务 {len(self.im_store.tasks())} 条）")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_count_im, daemon=True,
+                             name="awb-im-count").start()
             # ★ v9.20.0：把用户上次在「设置」里填的东西接上老轮询服务
             #   （间隔 / 自动回复开关 / 粗粒度的监听范围）
             try:
@@ -5448,17 +5644,41 @@ class MainWindow(QMainWindow):
                     self.assistant.apply_cfg(patch)
             except Exception:
                 pass
-            self._im_refresh_all()
+            # ★ v9.22.7：最后这一步全量刷新放后台，`_open_workspace()` 是
+            #   启动主路径上的同步调用，不能在这里读 7 份 IM 数据。
+            self._im_refresh_all_async()
         except Exception as exc:
             self.im_store = None
             self.im_hub = None
             self._safe_asst_log(f"IM 底座初始化失败：{type(exc).__name__}: {exc}")
 
-    def _safe_asst_log(self, text):
+    def _asst_log_direct(self, text):
+        """（**仅主线程**）真正往助理页日志区写一行。
+
+        ★ v9.22.7：全项目对 `page_assistant.log()` 的直写只保留这一个入口，
+          调用前必须已经确认在主线程（见 `_safe_asst_log` / `_asst_log_ui`）。
+          收敛成单点后，静态扫描只要盯住本方法就能守住「后台线程不碰控件」。
+        """
         try:
             self.page_assistant.log(str(text))
         except Exception:
             pass
+
+    def _safe_asst_log(self, text):
+        """往助理页日志区写一行（**任意线程可调**）。
+
+        ★ v9.22.7 致命修复：本方法被大量后台线程调用 —— IMHub / ReplyPipeline
+          的 `log=` 回调、看门狗线程、`_im_send_bg`、`_asst_ding_convs` 等。
+          `page_assistant.log()` 最终是 `QTextEdit.append()`，**只能在主线程**做；
+          以前这里直接写，慢机器上的表现就是用户说的「一上来未响应，点两下就卡退」。
+          现在先看线程：不在 UI 线程就投递回主线程，再由主线程调回自己
+          （此时 `_on_ui_thread()` 为真，走下面这条直写分支，不会递归）。
+        """
+        body = str(text)
+        if not self._on_ui_thread():
+            self._ui(lambda: self._safe_asst_log(body))
+            return
+        self._asst_log_direct(body)
 
     def _assistant_on_outgoing(self, msg):
         """我自己本人在钉钉里发出去的消息 —— 只记流水，不进处理队列。
@@ -5479,15 +5699,53 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._safe_asst_log(f"记录我自己的消息失败：{type(exc).__name__}: {exc}")
 
-    def _im_send(self, thread_id, text):
-        """把一句话发回某个钉钉会话（hub 用）。"""
+    def _im_send(self, thread_id, text, source="auto"):
+        """把一句话发回某个钉钉会话（**全项目唯一的代发出口**）。
+
+        ★ v9.22.7（2026-11-14 事故后）：以前这里是裸发 —— hub 一想回就直接
+        调 `dws_send_to_cid`，没有任何闸门，于是前端实测点一下「全部处理」
+        就把 AI 编的内容发进了真实班级群。现在所有代发都必须先过
+        `app/im/guard.SendGuard.allow()`，四条硬闸：演练模式 / 总开关 /
+        白名单 / 熔断，任何一条不过就不发，并把原因记进日志和发送流水。
+        """
         try:
             if not thread_id:
                 return False
-            return bool(self.ding.dws_send_to_cid(thread_id, str(text)))
+            g = getattr(self, "im_guard", None)
+            if g is not None:
+                allow, why = g.allow(
+                    thread_id, text, self._im_settings_now(), source=source)
+                if not allow:
+                    g.record(thread_id, text, False, source=source, reason=why)
+                    self._safe_asst_log("⛔ 拦下一条消息（%s）：%s"
+                                        % (why, str(text)[:60]))
+                    return False
+            ok = bool(self.ding.dws_send_to_cid(thread_id, str(text)))
+            if g is not None:
+                g.record(thread_id, text, ok, source=source,
+                         reason="" if ok else "dws 返回失败")
+            return ok
         except Exception as exc:
             self._safe_asst_log(f"发回钉钉失败：{type(exc).__name__}: {exc}")
+            try:
+                g = getattr(self, "im_guard", None)
+                if g is not None:
+                    g.record(thread_id, text, False, source=source,
+                             reason="%s: %s" % (type(exc).__name__, exc))
+            except Exception:
+                pass
             return False
+
+    def _im_settings_now(self):
+        """安全读设置（拿不到就给"全关"的一份，绝不默认放行）。"""
+        try:
+            st = self.im_store.settings()
+            if isinstance(st, dict):
+                return st
+        except Exception:
+            pass
+        return {"auto_send": False, "whitelist": [],
+                "scope_group": False, "scope_p2p": False}
 
     def _im_llm(self, messages, thread):
         """助理用的模型调用（同步）。
@@ -5524,6 +5782,12 @@ class MainWindow(QMainWindow):
                         + ("已发到钉钉" if item.get("ok") else "发送失败"))
             except Exception as exc:
                 self._safe_asst_log(f"定时消息检查失败：{type(exc).__name__}: {exc}")
+        # ★ v9.22.7：自动代回总开关关着时，**定时器不主动跑代回时序**
+        #   （既省 token，也保证不会"程序自己偷偷生成并送出"）。
+        #   用户点「全部处理 / 单条处理」仍然可以生成草稿。
+        _st_now = self._im_settings_now()
+        if not _st_now.get("auto_send"):
+            return
         # ★ v9.20.0：到点的代回 + 需要预取的批次
         try:
             self._im_pipeline_due()
@@ -5536,6 +5800,10 @@ class MainWindow(QMainWindow):
 
         ★ v9.20.0：设置页 / 标签页**不跟着刷** —— 用户可能正在里面打字改东西，
           每 20 秒把他改到一半的勾选冲掉是灾难。要刷全量走 `_im_refresh_all()`。
+        ★ v9.22.7：拆成「读数据 / 画界面」两段。`im_store.rows()` 是纯文件读
+          （实测 2000 条消息约 25ms，几千条会到几百毫秒），留在当前线程做，
+          免得把 IO 塞回 UI 线程；`page_assistant.set_im_data()` 是控件写操作，
+          一律经 `_ui()` 回主线程。
         """
         if getattr(self, "im_hub", None) is None:
             return
@@ -5544,31 +5812,70 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._safe_asst_log(f"读消息列表失败：{type(exc).__name__}: {exc}")
             return
+        self._ui(lambda: self._apply_im_rows(rows))
+
+    def _apply_im_rows(self, rows):
+        """（主线程）把消息双栏画出来。"""
         try:
             self.page_assistant.set_im_data(rows=rows)
         except Exception:
             pass
 
     def _im_refresh_all(self):
-        """全量刷新：消息双栏 + 设置 + 标签 + 更多管理对话框的数据。"""
+        """全量刷新：消息双栏 + 设置 + 标签 + 更多管理对话框的数据。
+
+        ★ v9.22.7：同 `_im_refresh_views()` —— 读快照留在当前线程（后台线程调
+          就是后台读，主线程调就是主线程读），画界面统一投递回主线程。
+          以前整段在调用线程里跑：后台调 = 跨线程碰控件（崩溃）；主线程调 =
+          启动时把 7 个读盘操作压在 UI 上（「一上来就未响应」）。
+        """
         if getattr(self, "im_hub", None) is None:
             return
         try:
-            st = self.im_store.settings()
-            rows = self.im_store.rows()
-            tags = self.im_store.tags()
-            threads = self.im_store.threads()
-            tasks = self.im_store.tasks()
-            logs = self.im_store.logbook()
-            memory = self.im_store.memory()
+            snap = {
+                "rows": self.im_store.rows(),
+                "settings": self.im_store.settings(),
+                "tags": self.im_store.tags(),
+                "threads": self.im_store.threads(),
+                "tasks": self.im_store.tasks(),
+                "logs": self.im_store.logbook(),
+                "memory": self.im_store.memory(),
+            }
         except Exception as exc:
             self._safe_asst_log(f"读助手数据失败：{type(exc).__name__}: {exc}")
             return
+        self._ui(lambda: self._apply_im_all(snap))
+
+    def _im_refresh_all_async(self):
+        """把整段全量刷新丢到后台线程（启动 / 切页用，绝不让读盘卡住 UI）。
+
+        ★ v9.22.7：`_init_im()` 在启动路径上被同步调用，`_assistant_boot()` 在
+          启动 2.5 秒后触发，`_open_page('assistant')` 在用户点侧栏时触发 ——
+          这三处以前都在 UI 线程里同步读 IM 数据，数据一多就是几秒白屏。
+        """
+        if getattr(self, "im_hub", None) is None:
+            return
         try:
+            threading.Thread(target=self._im_refresh_all, daemon=True,
+                             name="awb-im-refresh-all").start()
+        except Exception:
+            # 线程起不来（极少见）就退回同步，功能不能丢
+            self._im_refresh_all()
+
+    def _apply_im_all(self, snap):
+        """（主线程）把全量快照画到助理页。"""
+        snap = snap or {}
+        try:
+            store = getattr(self, "im_store", None)
             self.page_assistant.set_im_data(
-                rows=rows, settings=st, tags=tags,
-                threads=threads, tasks=tasks, logs=logs,
-                memory=memory, review_fn=self.im_store.review)
+                rows=snap.get("rows") or [],
+                settings=snap.get("settings") or {},
+                tags=snap.get("tags") or {},
+                threads=snap.get("threads") or {},
+                tasks=snap.get("tasks") or {},
+                logs=snap.get("logs") or {},
+                memory=snap.get("memory") or {},
+                review_fn=store.review if store is not None else None)
             self.page_assistant.set_ding_status(self._asst_ding_status_text())
         except Exception as exc:
             self._safe_asst_log(f"刷新助手页失败：{type(exc).__name__}: {exc}")
@@ -5704,10 +6011,12 @@ class MainWindow(QMainWindow):
         def w():
             ok = False
             try:
-                ok = bool(self._im_send(cid, text))
+                # ★ v9.22.7：source="test" 一律被闸门拦下（只演练不真发）
+                ok = bool(self._im_send(cid, text, source="test"))
             except Exception as exc:
                 self._safe_asst_log(f"发测试消息失败：{type(exc).__name__}: {exc}")
-            self._asst_log_ui("✓ 测试消息已发到钉钉" if ok else "✕ 测试消息发送失败")
+            self._asst_log_ui("✓ 测试消息已发到钉钉" if ok
+                              else "⛔ 测试消息没有发送（测试一律只演练，不会真发）")
         threading.Thread(target=w, daemon=True).start()
 
     # ---------- ★ v9.20.0：助理页「消息 / 设置 / 标签」的写操作 ----------
@@ -5994,7 +6303,10 @@ class MainWindow(QMainWindow):
             if self.assistant.cfg.get("enabled"):
                 self.assistant.start()
             self.page_assistant.load_cfg(self.assistant.cfg)
-            self._im_refresh_all()
+            # ★ v9.22.7：全量刷新放后台 —— 这一步要读 rows/tags/threads/logbook
+            #   等 7 份数据，以前在启动 2.5 秒时同步压在 UI 线程上，数据一多
+            #   就是用户看到的「上来先是未响应」。
+            self._im_refresh_all_async()
         except Exception:
             pass
 
@@ -6365,36 +6677,79 @@ class MainWindow(QMainWindow):
             self._im_send_bg(cid, text, ids)
             pipe.finish(cid, True)
 
-    def _im_send_bg(self, cid, text, ids):
-        """后台把代回内容发出去，结果回 UI 线程再写状态（跨线程只走信号）。"""
+    def _im_send_bg(self, cid, text, ids, source="auto"):
+        """后台把代回内容发出去，结果回 UI 线程再写状态（跨线程只走信号）。
+
+        ★ v9.22.7：**发不出去就落草稿箱**，绝不静默丢弃，也绝不绕过闸门。
+        """
         def w():
             ok = False
+            why = ""
             try:
-                ok = bool(self._im_send(cid, text))
+                g = getattr(self, "im_guard", None)
+                if g is not None:
+                    allow, why = g.allow(
+                        cid, text, self._im_settings_now(), source=source)
+                    if not allow:
+                        g.record(cid, text, False, source=source, reason=why)
+                        try:
+                            box = getattr(self, "im_drafts", None)
+                            if box is not None:
+                                box.add(cid, self._im_name_of(cid), text, why)
+                        except Exception:
+                            pass
+                        self._safe_asst_log(
+                            "📝 没有发送，已存进草稿箱（%s）：%s"
+                            % (why, str(text)[:50]))
+                        self._im_last_draft = {"cid": str(cid),
+                                               "text": str(text),
+                                               "reason": why}
+                        self._im_send_evt.emit(str(cid), list(ids or []),
+                                               str(text), False)
+                        return
+                ok = bool(self._im_send(cid, text, source=source))
             except Exception as exc:
                 self._safe_asst_log(f"代回失败：{type(exc).__name__}: {exc}")
             self._im_send_evt.emit(str(cid), list(ids or []), str(text), bool(ok))
         threading.Thread(target=w, daemon=True).start()
 
+    def _im_name_of(self, cid):
+        """会话显示名（草稿箱/发送记录里用）。"""
+        try:
+            t = self.im_store.thread(str(cid)) or {}
+            return str(t.get("name") or "")
+        except Exception:
+            return ""
+
     def _im_sent_back(self, cid, ids, text, ok):
         """（UI 线程）代回结果落地：写状态 + 刷界面。"""
         ids = list(ids or [])
+        # ★ v9.22.7：没发出去时，是"被闸门拦下转草稿"还是"真失败"，要分开显示
+        pending = getattr(self, "_im_last_draft", None) or {}
+        as_draft = (not ok) and str(pending.get("cid") or "") == str(cid) \
+            and str(pending.get("text") or "") == str(text)
+        why = str(pending.get("reason") or "") if as_draft else ""
         for i, mid in enumerate(ids):
             last = (i == len(ids) - 1)
             try:
                 self.im_store.set_status(
                     str(cid), mid,
-                    ("sent" if ok else "failed") if last else "merged",
+                    ("sent" if ok else ("draft" if as_draft else "failed"))
+                    if last else "merged",
                     text if last else "")
             except Exception:
                 pass
             self.page_assistant.update_status(
-                mid, "已回复" if ok else "失败",
+                mid, ("已回复" if ok else ("草稿" if as_draft else "失败")),
                 text if last else "（和另一条一起回了）")
         if ok:
             self._asst_log_ui("✓ 已代回钉钉：%s" % str(text)[:50])
+        elif as_draft:
+            self._asst_log_ui("📝 没发出去，已存草稿箱：%s%s"
+                              % (str(text)[:40], ("（" + why + "）") if why else ""))
         else:
             self._asst_log_ui("✕ 代回钉钉失败（%d 条，留在左栏）" % len(ids))
+        self._im_last_draft = None
         self._im_refresh_views()
 
     def _asst_pump(self):
@@ -6682,10 +7037,21 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _asst_log_ui(self, line):
+        """助理日志 + 状态栏一闪（**任意线程可调**）。
+
+        ★ v9.22.7：`status_flash.emit()` 本身跨线程是安全的，但
+          `page_assistant.log()` 不是 —— 以前这两件事混在一个方法里，导致
+          `_asst_reply` / `_auto_dingtalk_send` / `_asst_ding_test` /
+          `_web_im_draft_send` 这四个后台线程一写日志就跨线程碰控件。
+          现在整段投递回主线程执行，信号也顺带在主线程发（顺序更稳定）。
+        """
+        body = str(line)
+        if not self._on_ui_thread():
+            self._ui(lambda: self._asst_log_ui(body))
+            return
         try:
-            self.page_assistant.log(line)
-            # 本方法常由后台线程调用（发文件、代回等），状态栏走信号（v9.22.4）
-            self.status_flash.emit(str(line), 8000)
+            self._asst_log_direct(body)
+            self.status_flash.emit(body, 8000)
         except Exception:
             pass
 
@@ -6814,7 +7180,50 @@ class MainWindow(QMainWindow):
                     f"更新说明：\n{updater.format_notes(info.get('notes'))}")
         return f"[成功] 已是最新版本（{info.get('current')}）。"
 
+    # ---------- 后台线程 → 主线程（v9.22.7） ----------
+    def _ui_run_posts(self, fn):
+        """主线程侧执行投递过来的闭包。异常只记日志，绝不让界面挂掉。"""
+        try:
+            fn()
+        except Exception:
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+
+    def _on_ui_thread(self):
+        """当前是不是 Qt 主线程（GUI 线程）。
+
+        ★ v9.22.7：全项目的「能不能碰控件」判断只留这一处。以前每个调用点
+          自己写 `QThread.currentThread() is self.thread()`，写漏一处就是一次
+          随机崩溃；收敛成单一判据后，新代码只要走 `_ui()` 就不会再漏。
+        `self.thread()` 在极端情况下（对象正在析构）会抛异常，此时按"不在主
+        线程"处理更保守 —— 宁可多投递一次，也不要在子线程里碰控件。
+        """
+        try:
+            return QThread.currentThread() is self.thread()
+        except Exception:
+            return False
+
+    def _ui(self, fn):
+        """把 fn 丢回主线程执行。
+
+        在后台线程里调 `self._ui(lambda: self.statusBar().showMessage(...))` 是安全的；
+        已经在主线程里则直接执行（避免无谓排队，也让单测里能同步跑）。
+        """
+        if self._on_ui_thread():
+            return self._ui_run_posts(fn)
+        try:
+            self._ui_post.emit(fn)
+        except Exception:
+            pass
+        return None
+
     def _do_update_check(self, silent):
+        # 安全模式 / 手动关闭：不联网检查（用户机器卡死时的自救开关）
+        if os.environ.get("AWB_NO_UPDATE_CHECK", "").strip() == "1":
+            return
         # ★ v9.22.6：启动自动检查放后台线程。
         #   以前 updater.check() 直接在 UI 线程里跑网络请求（GitHub API），
         #   国内经常 3~8 秒甚至更久，期间整个界面是冻的 —— 用户会觉得
@@ -6836,10 +7245,11 @@ class MainWindow(QMainWindow):
                             "error": "%s: %s" % (type(e).__name__, e)}
                 finally:
                     self._upd_checking = False
-                try:
-                    self._after_update_check(info or {}, silent=True)
-                except Exception:
-                    pass
+                # ★ v9.22.7 致命修复：_after_update_check 里会摸 statusBar /
+                #   page_integrations 这些 Qt 控件，**必须在主线程执行**。
+                #   v9.22.6 直接在这个后台线程里调它 —— Qt 非线程安全，慢机器上
+                #   表现为「一启动就未响应 / 点两下就卡退」（用户实测）。
+                self._ui(lambda: self._after_update_check(info or {}, silent=True))
 
             threading.Thread(target=_work, daemon=True,
                              name="awb-update-check").start()
@@ -7067,35 +7477,59 @@ class MainWindow(QMainWindow):
                 raise RuntimeError("增量包不完整")
             return d
 
+        def _download_full(reason=""):
+            """改下整包（增量包下载失败 / 基线校验没过 都走这里）。"""
+            nonlocal dest
+            _log = getattr(updater, "_log", None)
+            if callable(_log) and reason:
+                _log("改用整包：%s" % reason)
+            self._web_push_update_progress(
+                "downloading", None, None,
+                "增量包用不了，正在改为下载完整安装包（会久一点）…")
+            dest = os.path.join(_tf.gettempdir(),
+                                "AIWorkbench_update_" + fallback["name"])
+            _fetch(fallback, dest, False)
+            return dest
+
+        def _install(d):
+            self._web_push_update_progress("extracting", None, None, "正在解压更新包…")
+            cur["stage"] = "installing"
+            updater.install_package(d, progress=_on_progress, on_stage=_on_stage)
+
         try:
             try:
                 _fetch(asset, dest, is_patch)
             except Exception as e:
                 if not fallback:
                     raise
-                _log = getattr(updater, "_log", None)
-                if callable(_log):
-                    _log("增量包不可用，改下整包：%s: %s" % (type(e).__name__, e))
-                self._web_push_update_progress(
-                    "downloading", None, None,
-                    "增量包用不了，正在改为下载完整安装包（会久一点）…")
-                dest = os.path.join(_tf.gettempdir(),
-                                    "AIWorkbench_update_" + fallback["name"])
-                _fetch(fallback, dest, False)
-            self._web_push_update_progress("extracting", None, None, "正在解压更新包…")
-            cur["stage"] = "installing"
-            updater.install_package(dest,
-                                   progress=_on_progress, on_stage=_on_stage)
+                _download_full("%s: %s" % (type(e).__name__, e))
+            try:
+                _install(dest)
+            except Exception as e:
+                # ★ v9.22.7：安装器在覆盖之前会拿增量包里的 base.json 逐文件校验本机，
+                #   对不上就抛这句（upd-safety 定的精确文案）。这是「本机文件不是干净的
+                #   旧版」——**绝不能装**，但还能救：改下整包重试，用户只是多等一会儿。
+                msg = str(e)
+                if is_patch and fallback and "增量包与本地文件对不上" in msg:
+                    _download_full(msg)
+                    _install(dest)
+                else:
+                    raise
             # install_package 已安排好 PowerShell 覆盖+重启；推重启提示后退出本进程
             self._web_push_update_progress("restarting", None, None, "正在重启到新版本…")
         except Exception as e:
             self._web_push_update_progress("failed", None, None, updater.human_error(e))
             return
-        try:
-            from PyQt6.QtWidgets import QApplication
-            QApplication.quit()
-        except Exception:
-            pass
+        # ★ v9.22.7：QApplication.quit() 也要回主线程调（线程里调 qApp 退出
+        #   在部分 Qt 版本会让事件循环以异常状态收尾）。稍等一下让前端把
+        #   「正在重启」那一帧画出来再退。
+        def _quit():
+            try:
+                from PyQt6.QtWidgets import QApplication
+                QTimer.singleShot(600, QApplication.quit)
+            except Exception:
+                pass
+        self._ui(_quit)
 
     def _update_on_progress(self, done, total):
         dlg = getattr(self, "_upd_dlg", None)

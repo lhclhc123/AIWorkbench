@@ -18,6 +18,8 @@ let state = {
   checkTries: 0,   // 「检查中…」连续重试次数（v9.22.1）
   selected: new Set(),   // 选中的 msgid
   selectedTagId: null,
+  guard: {},       // {ok,dry_run,auto_send,today,limit,whitelist} — 发送闸门状态（v9.22.7）
+  drafts: [],      // [{id,ts,cid,name,text,reason}] — 待确认草稿（v9.22.7）
 };
 
 function toast(msg) {
@@ -514,6 +516,290 @@ function updateFoot() {
   $('#selInfo').textContent = n > 0 ? `已选 ${n} 条` : '未选择';
 }
 
+/* ============================================================
+   v9.22.7：草稿箱 / 发送安全提示 / 发送记录
+   背景：2026-11-14 的 fail-open 事故（自动代回默认开启 + 白名单为空 =
+   全部会话）把 AI 编的内容发进了用户真实的班级群。后端已改成「默认关闭 +
+   未授权一律落草稿」，这一层负责让用户在界面上随时看得见会不会真发。
+   ============================================================ */
+
+/** 时间格式化：今天的只给「时:分」，同年给「月-日 时:分」，跨年带年份。
+ * @param {number} ts 秒级时间戳（后端统一用 time.time()）
+ * @return {string} 空串表示没有有效时间
+ */
+function fmtTime(ts) {
+  const n = Number(ts || 0);
+  if (!n || !isFinite(n)) return '';
+  const d = new Date(n * 1000);
+  if (isNaN(d.getTime())) return '';
+  const pad = (x) => (x < 10 ? '0' + x : String(x));
+  const hm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth()
+    && d.getDate() === now.getDate();
+  if (sameDay) return hm;
+  const md = pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  return d.getFullYear() === now.getFullYear()
+    ? md + ' ' + hm
+    : d.getFullYear() + '-' + md + ' ' + hm;
+}
+
+/** 整数夹紧：用户可能在数字框里手打 99999，别把越界值发给后端。
+ * @param {*} v 原始值
+ * @param {number} lo 下限
+ * @param {number} hi 上限
+ * @param {number} dflt 无法解析时的默认值
+ * @return {number} 夹紧后的整数
+ */
+function clampInt(v, lo, hi, dflt) {
+  const n = parseInt(String(v == null ? '' : v), 10);
+  if (!isFinite(n)) return dflt;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/** 顶栏常驻状态条：演练 > 自动代回关闭 > 自动代回开启（橙色警示）。
+ * @param {Object} guard 后端 im_get_state / im_guard_state 的 guard 字段
+ * @return {void}
+ */
+function renderGuard(guard) {
+  const bar = $('#imGuardBar');
+  if (!bar) return;
+  const g = guard || {};
+  // 拿不到 guard 就整条藏起来 —— 安全提示宁可不说，也绝不能瞎说「已关闭」
+  if (!Object.keys(g).length) {
+    bar.hidden = true;
+    return;
+  }
+  const dry = g.dry_run === true;
+  const auto = g.auto_send === true;
+  const today = Number(g.today || 0);
+  const limit = Number(g.limit || 0);
+  const wl = Number(g.whitelist || 0);
+  const text = $('#guardText');
+  const meta = $('#guardMeta');
+  bar.hidden = false;
+
+  if (dry) {
+    bar.dataset.state = 'dry';
+    if (text) text.textContent = '演练模式：所有消息只演练，不会真的发到钉钉';
+    if (meta) meta.textContent = '';
+    return;
+  }
+  if (!auto) {
+    bar.dataset.state = 'safe';
+    if (text) text.textContent = '自动代回：已关闭 · AI 只会生成草稿，不会自己发消息';
+    if (meta) meta.textContent = wl > 0 ? `白名单 ${wl} 个会话（总开关关着，不会发）` : '';
+    return;
+  }
+  bar.dataset.state = 'on';
+  if (text) {
+    text.textContent = `⚠ 自动代回已开启 · AI 会用你的账号直接回消息 · 今日已发 ${today} 条`;
+  }
+  // 白名单是可选收窄：填了才是"只回这几个"，没填就是所有会话
+  if (meta) {
+    meta.textContent = wl > 0
+      ? `只回白名单里的 ${wl} 个会话`
+      : '未设白名单 → 所有会话都会回';
+  }
+}
+
+/** 草稿箱。N=0 时整块隐藏；内容没变就不重建（避免把「发送中…」刷回可点）。
+ * @return {void}
+ */
+let sigDrafts = null;
+
+function renderDrafts() {
+  const box = $('#imDrafts');
+  const list = $('#draftList');
+  if (!box || !list) return;
+  const rows = Array.isArray(state.drafts) ? state.drafts : [];
+  const n = rows.length;
+  const cnt = $('#draftCount');
+  if (cnt) cnt.textContent = String(n);
+  box.hidden = n === 0;
+  if (n === 0) {
+    list.innerHTML = '';
+    sigDrafts = '';
+    return;
+  }
+
+  const sig = JSON.stringify(rows);
+  if (sig === sigDrafts) return;
+  sigDrafts = sig;
+  list.innerHTML = '';
+
+  rows.forEach((d) => {
+    const id = String(d.id || '');
+    const card = document.createElement('div');
+    card.className = 'draft-card';
+    card.innerHTML =
+      `<div class="draft-top"><span class="draft-name"></span><span class="draft-time"></span></div>` +
+      `<p class="draft-text"></p>` +
+      `<div class="draft-foot"><span class="draft-reason"></span><span class="draft-spacer"></span>` +
+      `<button class="btn btn-ghost draft-drop">丢弃</button>` +
+      `<button class="btn btn-primary draft-send">发送</button></div>`;
+    const nm = String(d.name || '').trim();
+    card.querySelector('.draft-name').textContent = nm || '（未命名会话）';
+    card.querySelector('.draft-time').textContent = fmtTime(d.ts);
+    card.querySelector('.draft-text').textContent = String(d.text || '');
+    card.querySelector('.draft-reason').textContent = String(d.reason || '');
+
+    const send = card.querySelector('.draft-send');
+    const drop = card.querySelector('.draft-drop');
+    // 没有 id 就发不出去（后端按 id 找草稿），别给个点了没反应的按钮
+    if (!id) {
+      send.disabled = true;
+      drop.disabled = true;
+      send.title = '这条草稿没有 id，无法发送';
+    }
+
+    send.addEventListener('click', async () => {
+      if (send.disabled) return;      // 连点保护：第一次点完立刻 disabled
+      send.disabled = true;
+      drop.disabled = true;
+      send.textContent = '发送中…';
+      try {
+        const r = await rpc('im_draft_send', { id });
+        if (r && r.ok === false) throw new Error(r.error || '后端拒绝了这次发送');
+      } catch (e) {
+        send.disabled = false;
+        drop.disabled = false;
+        send.textContent = '发送';
+        toast('发送失败：' + ((e && e.message) || '未知错误'));
+        return;
+      }
+      toast('已提交发送，稍后可在「发送记录」确认');
+      // 真发在后端后台线程里跑，发完会推 im_refresh；这里补一次定时刷新兜底。
+      // 4 秒后卡片还在 → 后台没发成功，把按钮恢复，别让用户对着死按钮。
+      setTimeout(async () => {
+        await refreshState();
+        if (send.isConnected) {
+          send.disabled = false;
+          drop.disabled = false;
+          send.textContent = '发送';
+        }
+      }, 4000);
+    });
+
+    drop.addEventListener('click', async () => {
+      if (drop.disabled) return;
+      send.disabled = true;
+      drop.disabled = true;
+      drop.textContent = '丢弃中…';
+      try {
+        const r = await rpc('im_draft_drop', { id });
+        if (r && r.ok === false) throw new Error(r.error || '后端拒绝了这次丢弃');
+      } catch (e) {
+        send.disabled = false;
+        drop.disabled = false;
+        drop.textContent = '丢弃';
+        toast('丢弃失败：' + ((e && e.message) || '未知错误'));
+        return;
+      }
+      await refreshState();
+    });
+
+    list.appendChild(card);
+  });
+}
+
+/** 发送记录列表（每行：时间 / 会话名 / 摘要 / 状态 / 撤回）。
+ * @param {Array<Object>} items 后端 im_send_log 的 items
+ * @return {void}
+ */
+function renderSendLog(items) {
+  const list = $('#sendLogList');
+  if (!list) return;
+  const rows = Array.isArray(items) ? items : [];
+  list.innerHTML = '';
+  if (rows.length === 0) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = '还没有发送记录';
+    list.appendChild(e);
+    return;
+  }
+  rows.forEach((r) => {
+    const ok = r.ok === true;
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    row.innerHTML =
+      `<span class="log-time"></span><span class="log-name"></span>` +
+      `<span class="log-text"></span><span class="log-st"></span>` +
+      `<span class="log-reason"></span><button class="btn btn-ghost log-recall">撤回</button>`;
+    row.querySelector('.log-time').textContent = fmtTime(r.ts);
+    const nm = String(r.name || '').trim();
+    row.querySelector('.log-name').textContent = nm || '（未知会话）';
+    row.querySelector('.log-text').textContent = String(r.text || '');
+    const st = row.querySelector('.log-st');
+    st.textContent = ok ? '✓ 已发' : '✕ 未发';
+    st.className = 'log-st ' + (ok ? 'is-ok' : 'is-no');
+
+    // 被拦下的原因：用户得知道「为什么没发」，否则以为功能坏了
+    const reason = String(r.reason || '');
+    const reasonEl = row.querySelector('.log-reason');
+    reasonEl.textContent = ok ? '' : reason;
+    reasonEl.hidden = ok || !reason;
+
+    // 只有真的发出去、且拿得到 mid 的才可能撤回
+    const recall = row.querySelector('.log-recall');
+    if (!ok || !r.mid || !r.cid) {
+      recall.hidden = true;
+    } else {
+      recall.addEventListener('click', async () => {
+        if (recall.disabled) return;
+        recall.disabled = true;
+        recall.textContent = '撤回中…';
+        try {
+          const d = await rpc('im_recall', { cid: String(r.cid), mid: String(r.mid) });
+          if (!d || d.ok === false) throw new Error((d && d.error) || '撤回失败');
+          recall.textContent = '已撤回';
+          toast('已撤回');
+        } catch (e) {
+          recall.disabled = false;
+          recall.textContent = '撤回';
+          // 失败原因（后端返回的 error）原样吐给用户
+          toast('撤回失败：' + ((e && e.message) || '未知错误'));
+        }
+      });
+    }
+    list.appendChild(row);
+  });
+}
+
+/** 拉发送记录（只在用户展开折叠区时调用，别在轮询里反复打后端）。
+ * @return {Promise<void>}
+ */
+let sendLogBusy = false;
+
+async function loadSendLog() {
+  const list = $('#sendLogList');
+  if (sendLogBusy) return;
+  sendLogBusy = true;
+  if (list) {
+    list.innerHTML = '';
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = '加载中…';
+    list.appendChild(e);
+  }
+  try {
+    const d = await rpc('im_send_log', { limit: 30 });
+    renderSendLog((d && d.items) || []);
+  } catch (e) {
+    if (list) {
+      list.innerHTML = '';
+      const w = document.createElement('div');
+      w.className = 'empty';
+      w.textContent = '加载失败：' + ((e && e.message) || '未知错误');
+      list.appendChild(w);
+    }
+  } finally {
+    sendLogBusy = false;
+  }
+}
+
 /* ---------------- 设置表单 ---------------- */
 function renderSettings() {
   const s = state.settings || {};
@@ -526,6 +812,8 @@ function renderSettings() {
   $('#identity').value = s.identity || '';
   $('#interval').value = s.interval != null ? s.interval : 25;
   $('#autoReply').checked = s.auto_reply != null ? !!s.auto_reply : true;
+  // ★ v9.22.7：自动代回总开关默认未勾选（老配置里没有这个字段 → 一律当关闭）
+  $('#autoSend').checked = s.auto_send === true;
   renderWhitelist();
 }
 
@@ -689,6 +977,9 @@ async function refreshState(forceDing) {
     state.dingStatus = d.ding_status || '';
     state.cli = d.cli || {};
     state.scan = d.scan || {};
+    // ★ v9.22.7：发送闸门状态 + 草稿箱（后端 im_get_state 新增的两个字段）
+    state.guard = d.guard || {};
+    state.drafts = Array.isArray(d.drafts) ? d.drafts : [];
     linkErrToasted = false;
 
     const rowsSig = JSON.stringify([state.rows, state.tags, state.whitelist]);
@@ -705,6 +996,8 @@ async function refreshState(forceDing) {
     renderStatus();
     renderScan();
     renderCli(state.cli);      // ★ v9.22.2：配置进度窗口跟着状态一起刷
+    renderGuard(state.guard);  // ★ v9.22.7：顶栏那条「现在会不会真发」的状态条
+    renderDrafts();            // ★ v9.22.7：草稿箱（N=0 时自己隐藏）
   } catch (e) {
     console.error('[im] refreshState 失败', e);
     // ★ v9.22.5：RPC 超时 / 桥断开时，界面以前会永远停在「正在配置…」的
@@ -714,6 +1007,10 @@ async function refreshState(forceDing) {
     if (state.cli && state.cli.busy) {
       state.cli = { ok: false, message: '与后端通信失败：' + (e && e.message) };
     }
+    // ★ v9.22.7：闸门状态此时是「上次已知」，可能已经变了。不能装作还是安全的
+    //   （这正是事故那类 fail-open 的教训：说错方向比不说更危险）。
+    const gMeta = $('#guardMeta');
+    if (gMeta) gMeta.textContent = '连接后端失败，实际状态可能已变';
     try {
       renderStatus();
       renderCli(state.cli);
@@ -825,6 +1122,8 @@ function wire() {
       identity: $('#identity').value,
       interval: parseInt($('#interval').value || '25', 10),
       auto_reply: $('#autoReply').checked,
+      // ★ v9.22.7：自动代回总开关（唯一的开关；不再有单日上限）
+      auto_send: $('#autoSend').checked === true,
     };
     await withBusy($('#saveBtn'), '保存中…', async () => {
       await rpc('im_set_settings', patch);
@@ -832,6 +1131,27 @@ function wire() {
     });
     toast('设置已保存');
   });
+
+  // ★ v9.22.7：勾上「自动代回」必须二次确认 —— 这是唯一会让 AI 以用户身份
+  //   直接发消息的开关。点取消就把勾去掉（等于没开）。renderSettings 只在
+  //   焦点不在设置区时才重绘，所以这里改 checked 不会被轮询抢回去。
+  const autoSend = $('#autoSend');
+  if (autoSend) {
+    autoSend.addEventListener('change', () => {
+      if (!autoSend.checked) return;
+      const ok = window.confirm(
+        '开启后 AI 会用你的账号直接回消息（白名单没设就是所有会话），发出去就收不回来了。确定开启？');
+      if (!ok) autoSend.checked = false;
+    });
+  }
+
+  // ★ v9.22.7：发送记录折叠区 —— 展开时才拉 im_send_log，别每次轮询都打后端
+  const logBox = $('#sendLogBox');
+  if (logBox) {
+    logBox.addEventListener('toggle', () => {
+      if (logBox.open) loadSendLog();
+    });
+  }
 
   // 标签
   $('#scanBtn').addEventListener('click', async () => {

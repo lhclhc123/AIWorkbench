@@ -89,11 +89,15 @@ class IMHub:
             extra_system=extra_system, identity=ident)
 
     # ------------------------------------------------------------------
-    def handle(self, msg, timeout_note=""):
+    def handle(self, msg, timeout_note="", dry=False):
         """处理一条消息。
 
+        Args:
+            dry: True = **只出草稿，不真发**（v9.22.7 默认）。
+                 事故根子就是"想回就直接发"，现在没拿到授权一律走 dry。
+
         Returns:
-            dict{ok, replied, reason, text, error}
+            dict{ok, replied, reason, text, error, draft}
         """
         tid = str(msg.get("cid") or msg.get("thread") or "")
         if not tid:
@@ -127,19 +131,24 @@ class IMHub:
         if len(answer) > MAX_REPLY_CHARS:
             answer = answer[:MAX_REPLY_CHARS] + "\n…（太长了，剩下的我整理成文件给你）"
 
-        self.store.append_message(tid, direction="out", sender=self.me_name,
-                                  text=answer, ai=True,
-                                  status="failed" if err else "sent")
+        # ★ v9.22.7：**先发、再按真实结果落盘**。
+        #   以前是先写 status="sent" 再调 send_fn，发失败了记录里还写着"已发送"
+        #   （2026-11-14 事故里就有 3 条根本没发出去却显示已发送，害得排查了半天）。
         sent = False
-        try:
-            sent = bool(self.send_fn(tid, answer))
-        except Exception as exc:
-            self.log(f"发送失败：{type(exc).__name__}: {exc}")
-            sent = False
+        if not dry:
+            try:
+                sent = bool(self.send_fn(tid, answer))
+            except Exception as exc:
+                self.log(f"发送失败：{type(exc).__name__}: {exc}")
+                sent = False
+        status = "sent" if sent else ("draft" if dry else "failed")
+        self.store.append_message(tid, direction="out", sender=self.me_name,
+                                  text=answer, ai=True, status=status)
         if sent:
             self.store.touch_thread(tid, answer, 0)
-        return {"ok": bool(sent), "replied": True, "reason": reason if not err else err,
-                "text": answer, "error": "" if sent else "send-failed"}
+        return {"ok": bool(sent), "replied": True, "draft": bool(dry),
+                "reason": reason if not err else err,
+                "text": answer, "error": "" if (sent or dry) else "send-failed"}
 
     # ------------------------------------------------------------------
     def tick(self, now=None):

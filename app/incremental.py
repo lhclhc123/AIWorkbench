@@ -21,6 +21,18 @@
 3. 客户端装完，安装目录里就有了一份新版 ``manifest.json``，
    下一版算增量时直接拿它当基准（见 :func:`local_manifest`）。
 
+## 基线自证（v9.22.6 新增：防"装出半个壳"）
+
+只看 ``manifest.json`` 里的**版本号字符串**是不够的 —— 用户手动改过、杀软删过、
+上一版装到一半的安装目录，版本号照样写着 ``vX``，但磁盘上已经不是被发布的那个
+``vX`` 了。这种目录套上增量包，结果就是用户原话里的「只能下载到一个壳」：
+exe 是新的，``_internal/PyQt6`` 还是旧的甚至不存在。
+
+所以增量包里现在**自带** ``base.json``（旧版完整清单）。安装前用
+:func:`verify_base` 逐文件核对「**不在本包里、但基线里有的**」那些文件
+（大小 + sha256，1MB 分块读，不整文件进内存）：只要有一个对不上就拒绝安装，
+由调用方回退完整安装包 —— 宁可多下 236MB，也绝不装出半个壳。
+
 ## 边界
 
 * 只依赖标准库（发布机与客户端都要能跑），绝不 import PyQt。
@@ -46,6 +58,12 @@ MANIFEST_NAME = "manifest.json"
 #: 内容：UTF-8 纯文本，一行一个相对路径（``/`` 分隔），末尾换行。
 DELETE_LIST_NAME = "__delete__.txt"
 
+#: 基线清单文件名（**旧版**完整文件清单，结构同 ``manifest.json``）。
+#: 只存在于**增量包 zip 根**，安装器用它核对"本机磁盘上的是不是被发布的那个基线"。
+#: 与 ``manifest.json`` / ``__delete__.txt`` 一样属于控制文件：
+#: **绝不进清单的 files、绝不拷进安装目录**。
+BASE_NAME = "base.json"
+
 #: 清单里的应用标识，防止把别的程序的清单当基准。
 APP_ID = "AIWorkbench"
 
@@ -56,7 +74,9 @@ _CHUNK = 1024 * 1024
 _ALWAYS_SKIP_DIRS = ("__pycache__", ".git", ".svn", ".idea", ".vs")
 
 # 永远不进清单的文件（都是控制文件，不是产品内容）。
-_ALWAYS_SKIP_FILES = (MANIFEST_NAME, DELETE_LIST_NAME)
+# ★ base.json 必须在这里：它是"旧版清单"，一旦被当成产品文件扫进新版清单，
+#   就会同时出现在 files 表和安装目录里，下一版再加上它、再下一版…无限膨胀。
+_ALWAYS_SKIP_FILES = (MANIFEST_NAME, DELETE_LIST_NAME, BASE_NAME)
 
 # 永远不进清单的文件后缀（字节码每台机器都不一样，纳进去会让增量包永远"有变化"）。
 _SKIP_SUFFIX = (".pyc", ".pyo")
@@ -276,24 +296,22 @@ def write_manifest(root, version, extra=None):
     return path
 
 
-def read_manifest(path):
-    """读取清单。
+def parse_manifest_text(text):
+    """把清单 JSON 文本解析成清单 dict（``read_manifest`` 与 zip 内清单共用一套校验）。
+
+    唯一出口的好处：从文件读、从 zip 里读 ``base.json``，走的都是同一套字段校验，
+    不会出现"文件里的清单认、包里的清单不认"这种诡异差异。
 
     Args:
-        path: ``manifest.json`` 的路径，或安装目录。
+        text: 清单 JSON 文本（UTF-8 解码后）。
 
     Returns:
-        dict | None: 读不到 / 内容非法一律返回 ``None``（调用方据此走全量更新，
-        绝不因为清单坏了就把更新流程整个打断）。
+        dict | None: 结构合法返回清单（``files`` 已归一成
+        ``{相对路径: {"size": int, "sha": str}}``）；任何非法情况返回 ``None``
+        —— 调用方据此走全量更新，绝不因为清单坏了就把更新流程整个打断。
     """
-    target = str(path or "")
-    if not target:
-        return None
-    if os.path.isdir(target):
-        target = os.path.join(target, MANIFEST_NAME)
     try:
-        with open(target, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(str(text or ""))
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -318,6 +336,29 @@ def read_manifest(path):
     out.setdefault("app", APP_ID)
     out.setdefault("version", "")
     return out
+
+
+def read_manifest(path):
+    """读取清单。
+
+    Args:
+        path: ``manifest.json`` 的路径，或安装目录。
+
+    Returns:
+        dict | None: 读不到 / 内容非法一律返回 ``None``（调用方据此走全量更新，
+        绝不因为清单坏了就把更新流程整个打断）。
+    """
+    target = str(path or "")
+    if not target:
+        return None
+    if os.path.isdir(target):
+        target = os.path.join(target, MANIFEST_NAME)
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return None
+    return parse_manifest_text(text)
 
 
 def parse_delete_list(text):
@@ -402,18 +443,22 @@ def diff(old, new):
 
 
 def make_patch(dist_root, out_zip, old_manifest=None, version="", progress=None):
-    """生成增量包：只装"变化了的文件" + 一份新版完整清单（+ 删除清单）。
+    """生成增量包：只装"变化了的文件" + 一份新版完整清单（+ 基线清单 + 删除清单）。
 
     Args:
         dist_root: 新版安装目录（即 dist 里 ``AIWorkbench/`` 那一层）。
         out_zip: 输出 zip 路径。
         old_manifest: 旧版清单；``None`` 表示"全量"（所有文件都装进去）。
+            非 ``None`` 时，它会被原样写成包内 ``base.json``（见 :data:`BASE_NAME`），
+            安装器据此核对本机是不是干净基线。
         version: 新版版本号，写进包内 ``manifest.json``。
         progress: 可选进度回调 ``progress(done_bytes, total_bytes)``。
 
     Returns:
-        dict: ``{"zip": 路径, "changed": 数量, "removed": 数量, "bytes": 压缩后大小}``。
-        ``removed`` 非空时包根还会多一个 ``__delete__.txt``（见 :data:`DELETE_LIST_NAME`）。
+        dict: ``{"zip": 路径, "changed": 数量, "removed": 数量, "bytes": 压缩后大小,
+        "base": 基线版本号, "has_base": bool}``。
+        ``removed`` 非空时包根还会多一个 ``__delete__.txt``（见 :data:`DELETE_LIST_NAME`）；
+        给了 ``old_manifest`` 时包根还会多一个 ``base.json``（见 :data:`BASE_NAME`）。
 
     Raises:
         RuntimeError: 目录不存在 / 打包过程写失败。
@@ -427,6 +472,16 @@ def make_patch(dist_root, out_zip, old_manifest=None, version="", progress=None)
         changed, removed = diff(old_manifest, new_files)
     else:
         changed, removed = sorted(new_files), []
+
+    # ★ 基线清单：把"旧版完整清单"原样带进包。版本号缺失也照写 —— 那样
+    #   updater.patch_base_manifest() 会读不出来，安装时直接判"不可用"并回退
+    #   整包（失败方向是安全的），而不是静默当成整包去覆盖。
+    base_payload = None
+    base_version = ""
+    if old_manifest:
+        base_version = (str((old_manifest or {}).get("version") or "")
+                        if isinstance(old_manifest, dict) else "")
+        base_payload = _payload(_files_of(old_manifest), base_version)
 
     out_zip = os.path.abspath(str(out_zip or "patch.zip"))
     # 输出 zip 万一落在待打包目录里，别把自己装进自己（不然每次算出来的 sha 都不一样）。
@@ -471,6 +526,10 @@ def make_patch(dist_root, out_zip, old_manifest=None, version="", progress=None)
             if removed:
                 z.writestr(DELETE_LIST_NAME,
                            "".join(rel + "\n" for rel in removed))
+            # 基线清单：安装器用它核对本机是不是干净的旧版本（防"装出半个壳"）。
+            # 同样只在包根、不进 files、不拷进安装目录。
+            if base_payload:
+                z.writestr(BASE_NAME, _dump(base_payload))
             # 清单最后写：中途失败时不会留下"看着完整、其实缺文件"的清单。
             z.writestr(MANIFEST_NAME, _dump(payload))
     except RuntimeError:
@@ -483,7 +542,8 @@ def make_patch(dist_root, out_zip, old_manifest=None, version="", progress=None)
     except OSError as e:
         raise _wrap("读取增量包大小失败", e)
     return {"zip": out_zip, "changed": len(changed), "removed": len(removed),
-            "bytes": int(size)}
+            "bytes": int(size), "base": base_version,
+            "has_base": bool(base_payload)}
 
 
 def verify_tree(root, manifest, only=None, progress=None, strict=False):
@@ -557,4 +617,82 @@ def verify_tree(root, manifest, only=None, progress=None, strict=False):
         for rel, _full, _size in _collect(root):
             if rel not in files:
                 bad.append(rel)
+    return bad
+
+
+def verify_base(root, base_manifest, changed_paths=(), progress=None):
+    """核对「本机安装目录」是不是增量包里声明的那个旧版基线。
+
+    ★ 为什么只校验"不在 patch 里"的文件：patch 会覆盖的那些文件本来就要被换掉，
+    它们现在是什么样都无所谓；真正致命的是**不会被动到的**那几千个文件
+    （``_internal/PyQt6/**``、``_internal/base_library.zip``…）少了一个或改了一个
+    字节 —— 那正是用户看到的"壳"：exe 是新的，_internal 却残缺。
+
+    Args:
+        root: 本机安装目录。
+        base_manifest: 增量包内 ``base.json`` 解析后的清单
+            （``{"version": …, "files": {...}}``，或直接的 files 表）。
+        changed_paths: 增量包里**会覆盖**的相对路径（这些跳过不校验）。
+        progress: 可选进度回调 ``progress(done_bytes, total_bytes)``。
+
+    Returns:
+        list[str]: 不一致（缺失 / 大小不符 / sha256 不符 / 读不了）的相对路径，已排序；
+        空列表 = 基线干净，可以安全地打增量包。
+
+    Raises:
+        RuntimeError: 基线清单为空、或安装目录不存在 —— 这两种情况返回空列表
+            等于"假装校验通过"，比报错危险得多。
+    """
+    files = _files_of(base_manifest)
+    if not files:
+        raise RuntimeError("基线文件清单为空，无法校验本机文件，请改用完整安装包")
+    root = os.path.abspath(str(root or ""))
+    if not os.path.isdir(root):
+        raise RuntimeError("安装目录不存在，无法校验本机文件")
+
+    skip = set()
+    for rel in (changed_paths or ()):
+        norm = _norm_rel(rel).lower()
+        if norm:
+            skip.add(norm)
+
+    targets = [rel for rel in sorted(files) if rel.lower() not in skip]
+    total = 0
+    for rel in targets:
+        meta = files.get(rel)
+        if isinstance(meta, dict):
+            try:
+                total += int(meta.get("size") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    done = 0
+    bad = []
+    for rel in targets:
+        meta = files.get(rel)
+        if not isinstance(meta, dict):
+            bad.append(rel)
+            continue
+        full = os.path.join(root, *rel.split("/"))
+        try:
+            if not os.path.isfile(full):
+                bad.append(rel)
+                continue
+            size = int(os.path.getsize(full))
+            if size != int(meta.get("size") or 0):
+                bad.append(rel)
+                continue
+            # _sha256 内部 1MB 分块读：2271 个文件 612MB 也不会把内存打爆。
+            if _sha256(full) != str(meta.get("sha") or ""):
+                bad.append(rel)
+                continue
+        except OSError:
+            bad.append(rel)
+            continue
+        done += size
+        if progress:
+            try:
+                progress(done, total)
+            except Exception:
+                pass
     return bad

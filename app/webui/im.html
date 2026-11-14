@@ -13,6 +13,124 @@
 <link rel="stylesheet" href="./css/tokens.css">
 <link rel="stylesheet" href="./css/base.css">
 <link rel="stylesheet" href="./css/im.css">
+<style>
+  /* ============================================================
+     v9.22.7：草稿箱 / 发送安全提示 / 发送记录
+     背景：2026-11-14 的 fail-open 事故（默认开启 + 白名单为空 = 全量代回）
+     把 AI 编的内容发进了真实班级群。后端已改成「默认关闭 + 未授权一律落
+     草稿」，这一层只负责让用户在界面上**随时看得见**现在到底会不会真发。
+     颜色全部走 tokens.css 的变量，深浅主题自动跟随，不硬编码刺眼色值。
+     ============================================================ */
+
+  /* —— 顶栏常驻状态条 —— */
+  .guard-bar{
+    flex:0 0 auto;display:flex;align-items:center;gap:8px;
+    padding:7px 16px;font-size:12px;
+    border-bottom:1px solid var(--border);
+    background:var(--accent-weak);color:var(--text-2);
+  }
+  .guard-bar[hidden]{display:none;}
+  .guard-dot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--text-3);}
+  .guard-spacer{flex:1;}
+  .guard-text{min-width:0;word-break:break-word;}
+  .guard-meta{font-weight:400;font-size:11.5px;color:var(--text-3);}
+  /* 演练模式：灰蓝、不抢眼（反正是安全的） */
+  .guard-bar[data-state="dry"]{background:var(--accent-weak);color:var(--text-2);}
+  .guard-bar[data-state="dry"] .guard-dot{background:var(--accent);}
+  /* 自动代回关闭：绿（安全） */
+  .guard-bar[data-state="safe"]{
+    background:rgba(23,134,74,.10);color:var(--ok);
+    border-bottom-color:rgba(23,134,74,.28);
+  }
+  .guard-bar[data-state="safe"] .guard-dot{background:var(--ok);}
+  /* 自动代回开启：橙色警示，必须一眼看到 */
+  .guard-bar[data-state="on"]{
+    background:rgba(180,116,26,.13);color:var(--warn);
+    border-bottom-color:rgba(180,116,26,.38);font-weight:600;
+  }
+  .guard-bar[data-state="on"] .guard-dot{background:var(--warn);animation:pulse 1.4s infinite;}
+  html[data-theme="dark"] .guard-bar[data-state="safe"]{
+    background:rgba(63,185,80,.12);border-bottom-color:rgba(63,185,80,.34);
+  }
+  html[data-theme="dark"] .guard-bar[data-state="on"]{
+    background:rgba(210,153,34,.14);border-bottom-color:rgba(210,153,34,.42);
+  }
+
+  /* —— 草稿箱 —— */
+  .drafts{
+    flex:0 0 auto;max-height:40%;min-height:0;
+    display:flex;flex-direction:column;
+    padding:8px 16px 10px;border-top:1px solid var(--border);
+  }
+  .drafts[hidden]{display:none;}
+  .drafts-head{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    padding-bottom:7px;font-size:12.5px;font-weight:600;
+  }
+  .drafts-head .hint{font-weight:400;}
+  .drafts-list{display:flex;flex-direction:column;gap:8px;min-height:0;overflow-y:auto;padding-right:2px;}
+  .draft-card{
+    background:var(--surface);border:1px solid var(--border);
+    border-left:3px solid var(--warn);border-radius:var(--r-md);
+    padding:8px 10px;
+  }
+  .draft-top{display:flex;align-items:center;gap:8px;font-size:12px;}
+  .draft-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .draft-time{margin-left:auto;flex:0 0 auto;font-size:11px;color:var(--text-3);}
+  .draft-text{
+    margin:5px 0;font-size:12.5px;line-height:1.55;color:var(--text);
+    display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;
+    overflow:hidden;white-space:pre-wrap;word-break:break-word;
+  }
+  .draft-foot{display:flex;align-items:center;gap:6px;}
+  /* 卡片里的按钮比页面上小一号（.draft-send / .draft-drop 只是 JS 钩子，
+     视觉全部继承 .btn / .btn-primary / .btn-ghost，不另起一套） */
+  .draft-foot .btn{padding:4px 10px;font-size:11.5px;}
+  .draft-reason{
+    flex:1;min-width:0;font-size:11px;color:var(--text-3);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .draft-spacer{flex:0 0 auto;}
+
+  /* —— 发送记录（折叠） —— */
+  .log-card{
+    border:1px solid var(--border);border-radius:var(--r-md);
+    background:var(--surface);overflow:hidden;
+  }
+  .log-card>summary{
+    display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+    padding:10px 14px;font-size:13px;font-weight:600;background:var(--surface-2);
+  }
+  .log-card>summary:hover{color:var(--accent);}
+  .log-card>summary .hint{font-weight:400;}
+  .log-list{display:flex;flex-direction:column;max-height:270px;overflow-y:auto;}
+  .log-row{
+    display:flex;align-items:center;gap:8px;padding:8px 14px;
+    border-top:1px solid var(--border);font-size:12px;
+  }
+  .log-time{flex:0 0 auto;font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums;}
+  .log-name{flex:0 0 auto;max-width:130px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .log-text{flex:1;min-width:0;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .log-st{flex:0 0 auto;font-size:11px;padding:1px 7px;border-radius:999px;}
+  .log-st.is-ok{background:var(--ok);color:#fff;}
+  .log-st.is-no{background:var(--danger-weak);color:var(--danger);}
+  .log-reason{
+    flex:0 0 auto;max-width:190px;font-size:11px;color:var(--text-3);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .log-reason[hidden]{display:none;}
+  .log-recall{flex:0 0 auto;padding:3px 9px;font-size:11.5px;}
+  .log-recall[hidden]{display:none;}
+
+  @media (max-width:900px){
+    .guard-bar{padding:6px 10px;font-size:11.5px;flex-wrap:wrap;}
+    .guard-meta{flex:1 1 100%;}
+    .drafts{padding:6px 10px 8px;max-height:46%;}
+    .log-row{gap:6px;padding:7px 10px;}
+    .log-name{max-width:90px;}
+    .log-reason{max-width:110px;}
+  }
+</style>
 </head>
 <body>
 
@@ -31,6 +149,16 @@
     <span class="im-head-extra is-action" id="dingStatus" role="button" tabindex="0"
           aria-live="polite">检查中…</span>
     <button class="btn" id="toggleBtn">启动助理</button>
+  </div>
+
+  <!-- ★ v9.22.7：常驻安全状态条。事故（AI 自动代回把内容发进真实班级群）之后，
+       用户必须一眼看出「此刻会不会真的发到钉钉」。三态由 renderGuard() 决定：
+       演练模式（灰蓝）/ 自动代回已关闭（绿）/ 自动代回已开启（橙警示）。 -->
+  <div class="guard-bar" id="imGuardBar" data-state="dry" hidden>
+    <span class="guard-dot" aria-hidden="true"></span>
+    <span class="guard-text" id="guardText" role="status" aria-live="polite"></span>
+    <span class="guard-spacer"></span>
+    <span class="guard-meta" id="guardMeta"></span>
   </div>
 
   <div class="tabs" role="tablist">
@@ -53,6 +181,15 @@
           <div class="col-scroll" id="colRight"></div>
         </div>
       </div>
+      <!-- ★ v9.22.7 草稿箱：AI 想回、但没被授权真发的内容落在这里，等人点头。
+           没有「发送全部」—— 防的就是批量误发。N=0 时整块隐藏（后端给 drafts）。 -->
+      <section class="drafts" id="imDrafts" hidden>
+        <div class="drafts-head">
+          草稿箱（<span id="draftCount">0</span>）
+          <span class="hint">AI 已经写好但没被授权真发，逐条确认后再点「发送」</span>
+        </div>
+        <div class="drafts-list" id="draftList"></div>
+      </section>
       <div class="im-foot">
         <button class="btn btn-danger" id="delBtn" disabled>
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.6h10M6.2 4.6V3.2h3.6v1.4M4.4 4.6l.6 8.2h6l.6-8.2"/></svg>
@@ -128,6 +265,19 @@
             </div>
           </div>
 
+          <!-- ★ v9.22.7：自动代回总开关。默认关闭；打开时要二次确认（见 im.js wire()） -->
+          <div class="form-card">
+            <div class="form-head">自动代回（安全）<span>默认关闭。关着的时候 AI 只写草稿，绝不会自己发出去。</span></div>
+            <div class="form-body">
+              <label class="check-row">
+                <input class="cb" type="checkbox" id="autoSend">
+                <span class="cbx"><svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m3.2 8.4 3.1 3.1 6.5-6.5"/></svg></span>
+                <span class="check-main"><span class="check-title">自动代回（AI 直接替你回消息）</span><span class="check-desc">打开后 AI 会用你的账号直接回消息。关着的时候只生成草稿，绝不会自己发出去。</span></span>
+              </label>
+              <p class="hint">填了下面的「白名单」就只回名单里的会话；不填就是所有会话都回。</p>
+            </div>
+          </div>
+
           <div class="form-card">
             <div class="form-head">AI 拿不准的时候</div>
             <div class="form-body">
@@ -166,6 +316,13 @@
             <span class="spacer"></span>
             <button class="btn btn-primary" id="saveBtn">保存设置</button>
           </div>
+
+          <!-- ★ v9.22.7 发送记录：折叠着不打扰，展开时才去拉 im_send_log(30)。
+               已发的行带「撤回」，失败的行写清被拦下的原因。 -->
+          <details class="log-card" id="sendLogBox">
+            <summary>发送记录<span class="hint">最近 30 条真实发送 / 被拦下的记录（展开后加载）</span></summary>
+            <div class="log-list" id="sendLogList"><div class="empty">展开后加载…</div></div>
+          </details>
 
         </div>
       </div>

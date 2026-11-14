@@ -1326,6 +1326,25 @@ class DingTalkClient:
             ["chat", "+messages-send", "--as", "user", "--chat-id", cid,
              "--text", text, "--format", "json", "--yes"])
 
+    def dws_recall(self, cid, mid):
+        """撤回一条自己发出去的消息（v9.22.7）。
+
+        2026-11-14 误发事故后加的补偿手段：前端「发送记录」里每条都带撤回按钮。
+        钉钉侧只有发送者本人能撤，且有时间窗，失败时把服务端原话抛出来。
+        """
+        cid = str(cid or "").strip()
+        mid = str(mid or "").strip()
+        if not cid or not mid:
+            raise DingTalkError("撤回需要会话 id 和消息 id")
+        _throttle()
+        data = self._run_dws(
+            ["chat", "message", "recall", "--conversation-id", cid,
+             "--message-id", mid, "--yes", "--format", "json"])
+        if isinstance(data, dict) and data.get("success") is False:
+            err = data.get("error") or {}
+            raise DingTalkError(str(err.get("message") or "撤回失败"))
+        return data
+
     def dws_at_me(self, n=10):
         """查最近「@我」的消息（群聊里点名叫我的）。解析失败时返回 []。"""
         try:
