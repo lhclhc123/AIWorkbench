@@ -24,6 +24,13 @@ let state = {
 
 function toast(msg) {
   const el = $('#toast');
+  // ★ v9.22.9：页面正在被销毁 / 还没挂载完时这里会拿到 null。
+  //   一句提示气泡不该把整个 refreshState 带崩（日志里那条
+  //   「[im] refreshState 失败 TypeError: Cannot set properties of null」就是它）。
+  if (!el) {
+    console.warn('[im] toast 元素不存在，跳过提示：', msg);
+    return;
+  }
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(toast._t);
@@ -577,6 +584,12 @@ function statusCls(status) {
 function renderMessages() {
   const left = $('#colLeft');
   const right = $('#colRight');
+  // v9.22.9：页面销毁中 / DOM 未就绪时容器可能不存在，直接跳过渲染，
+  //   不要让一次 null 把 refreshState 整条链打断（后面的状态条就都不刷了）。
+  if (!left || !right) {
+    console.warn('[im] 消息容器不存在，跳过本次渲染');
+    return;
+  }
   left.innerHTML = '';
   right.innerHTML = '';
   const done = state.rows.filter((r) => r.status === '已回复');
@@ -634,17 +647,26 @@ function renderMessages() {
     right.appendChild(e);
   } else done.forEach((r) => right.appendChild(build(r)));
 
-  $('#leftCount').textContent = pending.length;
-  $('#rightCount').textContent = done.length;
-  $('#tabCount').textContent = state.rows.length;
+  // ★ v9.22.9：统一做空值保护 —— 这些计数只是「锦上添花」，
+  //   任何一个元素缺失都不该让整个列表渲染失败（一次 null 会让两栏都不刷新）。
+  const _set = (sel, val) => {
+    const el = $(sel);
+    if (el) el.textContent = val;
+  };
+  _set('#leftCount', pending.length);
+  _set('#rightCount', done.length);
+  _set('#tabCount', state.rows.length);
   updateFoot();
 }
 
 function updateFoot() {
   const n = state.selected.size;
-  $('#delBtn').disabled = n === 0;
-  $('#delLabel').textContent = n > 0 ? `删除选中 (${n})` : '删除选中';
-  $('#selInfo').textContent = n > 0 ? `已选 ${n} 条` : '未选择';
+  const delBtn = $('#delBtn');
+  if (delBtn) delBtn.disabled = n === 0;
+  const delLabel = $('#delLabel');
+  if (delLabel) delLabel.textContent = n > 0 ? `删除选中 (${n})` : '删除选中';
+  const selInfo = $('#selInfo');
+  if (selInfo) selInfo.textContent = n > 0 ? `已选 ${n} 条` : '未选择';
 }
 
 /* ============================================================
@@ -957,6 +979,7 @@ function renderSettings() {
 
 function renderWhitelist() {
   const list = $('#wlList');
+  if (!list) return;
   list.innerHTML = '';
   const wl = state.whitelist || [];
   if (wl.length === 0) {
@@ -983,6 +1006,7 @@ function renderWhitelist() {
 /* ---------------- 标签渲染 ---------------- */
 function renderTags() {
   const list = $('#tagsList');
+  if (!list) return;
   list.innerHTML = '';
   const tags = state.tags || [];
   if (tags.length === 0) {
@@ -1137,7 +1161,9 @@ async function refreshState(forceDing) {
     renderGuard(state.guard);  // ★ v9.22.7：顶栏那条「现在会不会真发」的状态条
     renderDrafts();            // ★ v9.22.7：草稿箱（N=0 时自己隐藏）
   } catch (e) {
-    console.error('[im] refreshState 失败', e);
+    // ★ v9.22.9：打出完整栈 —— 以前只打 error 对象，拿不到出错行号，
+    //   一个「Cannot set properties of null」查了很久才定位到是 toast()。
+    console.error('[im] refreshState 失败', (e && e.stack) || e);
     // ★ v9.22.5：RPC 超时 / 桥断开时，界面以前会永远停在「正在配置…」的
     //   前端假状态（后端根本没收到），看着像卡死。这里把真实原因写进界面，
     //   并允许用户点状态文字重试。

@@ -27,6 +27,7 @@ MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_DESTROY = 0x0002
 HWND_MESSAGE = -3
+_HOTKEY_ID = 1          # RegisterHotKey 的 id，WM_HOTKEY 的 wParam 就是它
 
 _MODS = {
     "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
@@ -129,11 +130,25 @@ class GlobalHotkey(threading.Thread):
             return
         u32 = ctypes.windll.user32
         k32 = ctypes.windll.kernel32
+
+        # ★ v9.22.9 修「莫名其妙卡退」的真凶（有崩溃日志 30 次 access violation 为证）：
+        #   `GetModuleHandleW` 不声明 restype 时，ctypes 默认把返回值当 **32 位 int**，
+        #   x64 下 HMODULE 被截断 —— 实测真值 0x7ff7000b0000，拿到的却是 0xb0000。
+        #   把这个垃圾句柄塞进 WNDCLASSEXW.hInstance 再交给 RegisterClassExW /
+        #   CreateWindowExW，Windows 会去读那个地址的模块头：
+        #   地址恰好没映射 → access violation。崩不崩取决于进程地址空间布局（ASLR），
+        #   所以现象是「有的电脑经常卡退、同一台有时崩有时不崩」，且崩溃点在后台线程，
+        #   日志里只留一句 Windows fatal exception。
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+
         # 必须显式声明签名：否则 64 位下 LPARAM 会被当成 32 位整数，
         # 回调里转手给 DefWindowProc 时直接 OverflowError。
         u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
                                        wintypes.WPARAM, wintypes.LPARAM]
         u32.DefWindowProcW.restype = LRESULT
+        u32.RegisterClassExW.argtypes = [ctypes.POINTER(WNDCLASSEXW)]
+        u32.RegisterClassExW.restype = ctypes.c_int
         u32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
                                        wintypes.UINT, wintypes.UINT]
         u32.RegisterHotKey.restype = wintypes.BOOL
@@ -145,39 +160,43 @@ class GlobalHotkey(threading.Thread):
         u32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
         u32.DispatchMessageW.restype = LRESULT
         self._tid = k32.GetCurrentThreadId()
-        hinst = k32.GetModuleHandleW(None)
 
-        self._wndproc_ref = WNDPROC(self._wndproc)      # 必须持引用，否则会崩
-        wc = WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc.lpfnWndProc = self._wndproc_ref
-        wc.hInstance = hinst
-        wc.lpszClassName = self._cls_name
-        if not u32.RegisterClassExW(ctypes.byref(wc)):
-            self.error = f"注册窗口类失败（错误 {k32.GetLastError()}）"
+        # ★★ v9.22.9：改用「线程级热键」，不再建隐藏窗口、不再注册窗口类。
+        #
+        #   旧写法是 RegisterHotKey(hwnd) + CreateWindowExW(HWND_MESSAGE) +
+        #   把 Python 函数当 WNDPROC 交给 Windows。运行日志里
+        #   `Windows fatal exception: access violation` 出现 30 次，帧全落在这两步
+        #   （hotkey.py:156 RegisterClassExW / hotkey.py:166 CreateWindowExW），
+        #   用户的感受就是「有时候软件突然就没了」（卡退）。
+        #
+        #   线程级热键把 hWnd 传 NULL：WM_HOTKEY 直接投递到**本线程的消息队列**，
+        #   由下面这个 while 循环自己取，Windows 全程不会回调进 Python。
+        #   崩溃面：3 个原生调用 → 1 个（RegisterHotKey），且没有任何回调指针。
+        #
+        #   顺带修掉一个真缺陷：旧代码 `k32.GetModuleHandleW(None)` 没声明 restype，
+        #   ctypes 按 32 位 int 返回，x64 下 HMODULE 被截断
+        #   （实测 0x7ff7000b0000 → 0xb0000）。现在不再需要 hInstance 了。
+        u32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND,
+                                     wintypes.UINT, wintypes.UINT,
+                                     wintypes.UINT]
+        u32.PeekMessageW.restype = wintypes.BOOL
+        u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                           wintypes.WPARAM, wintypes.LPARAM]
+        u32.PostThreadMessageW.restype = wintypes.BOOL
+
+        try:
+            # 先强制本线程建好消息队列，否则 RegisterHotKey(NULL, ...) 可能失败
+            u32.PeekMessageW(ctypes.byref(MSG()), None, 0, 0, 0)   # PM_NOREMOVE
+            if not u32.RegisterHotKey(None, _HOTKEY_ID, self._mods, self._vk):
+                err = k32.GetLastError()
+                self.error = (f"热键 {self.spec} 被占用或被系统拒绝（错误 {err}）")
+                self._ready.set()
+                return
+        except Exception as e:                      # 原生层异常一律降级，不崩
+            self.error = f"初始化热键失败：{type(e).__name__}: {e}"
             self._ready.set()
             return
 
-        u32.CreateWindowExW.restype = wintypes.HWND
-        u32.CreateWindowExW.argtypes = [
-            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
-        hwnd = u32.CreateWindowExW(0, self._cls_name, "AIWorkbenchHotkey", 0,
-                                   0, 0, 0, 0, wintypes.HWND(HWND_MESSAGE), None,
-                                   hinst, None)
-        if not hwnd:
-            self.error = f"创建隐藏窗口失败（错误 {k32.GetLastError()}）"
-            self._ready.set()
-            return
-        self._hwnd = hwnd
-
-        if not u32.RegisterHotKey(hwnd, 1, self._mods, self._vk):
-            self.error = (f"热键 {self.spec} 被占用或被系统拒绝"
-                          f"（错误 {k32.GetLastError()}）")
-            u32.DestroyWindow(hwnd)
-            self._ready.set()
-            return
         self.registered = True
         self._ready.set()
 
@@ -185,22 +204,29 @@ class GlobalHotkey(threading.Thread):
         try:
             while not self._stop.is_set():
                 r = u32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if r in (0, -1):
+                if r in (0, -1):                    # WM_QUIT / 出错
                     break
-                u32.TranslateMessage(ctypes.byref(msg))
-                u32.DispatchMessageW(ctypes.byref(msg))
+                if msg.message == WM_HOTKEY and int(msg.wParam) == _HOTKEY_ID:
+                    try:
+                        if self.callback:
+                            self.callback()
+                    except Exception:
+                        pass
+                # 没有窗口，不需要 TranslateMessage / DispatchMessage
         finally:
             try:
-                u32.UnregisterHotKey(hwnd, 1)
-            except Exception:
-                pass
-            try:
-                u32.DestroyWindow(hwnd)
+                u32.UnregisterHotKey(None, _HOTKEY_ID)
             except Exception:
                 pass
             self.registered = False
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
+        """⚠️ v9.22.9 起**不再使用**（保留仅为兼容旧引用）。
+
+        以前它是 WNDCLASSEXW.lpfnWndProc，由 Windows 在消息派发时回调进 Python。
+        就是这条路径在崩溃日志里留下了 access violation。现在热键走
+        RegisterHotKey(NULL, ...)，WM_HOTKEY 由 run() 的循环自己收，别改回去。
+        """
         if msg == WM_HOTKEY:
             try:
                 if self.callback:
