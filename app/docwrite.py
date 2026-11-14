@@ -2643,7 +2643,6 @@ def _build_plan(blocks, title=None, base_dir=None):
 
     deck_title = (title or "").strip()
     chapters = []          # [(title, [blocks])]
-    force_sections = False
 
     if len(h1) == 1 and len(h2) >= 2:
         # 一个 H1 当演示标题，H2 当单页
@@ -2657,7 +2656,6 @@ def _build_plan(blocks, title=None, base_dir=None):
         else:
             deck_title = blocks[h1[0]]["text"]
             chapters = _group_by_heading(blocks[h1[0] + 1:], 1)
-        force_sections = True
     elif len(h2) >= 1:
         if not deck_title:
             deck_title = "演示文稿"
@@ -2675,12 +2673,32 @@ def _build_plan(blocks, title=None, base_dir=None):
         bs0 = chapters[0][1]
         if len(bs0) == 1 and bs0[0]["kind"] == "quote":
             chapters = chapters[1:]
+    # ★ v9.22.10：正文第一个一级标题常常就是文档大标题（模型很爱这么写：
+    #   `# 校园节能改造方案` 之后才写 `# 第一章 ...`）。它本身没有一个字的正文，
+    #   却被当成「第 01 章」，于是封面印一遍标题、紧接着 01 过渡页再印一遍。
+    #   这里把这种「空壳的标题章」丢掉（有正文的不动，绝不丢内容）。
+    if chapters and (chapters[0][0] or "").strip() and not chapters[0][1]:
+        if inline_plain(chapters[0][0]) == inline_plain(deck_title or ""):
+            chapters = chapters[1:]
+
     if not chapters:
         chapters = [(None, [])]
 
     # 是否插章节过渡页
+    # ★ v9.22.10：不再「一级标题 ≥2 个就给每个都插一张 01/02/03 过渡页」。
+    #   真实事故：老师一份 22 个一级标题的演讲稿，被撑成 **50 页**
+    #   （22 张内容页 + 22 张过渡页 + 封面/目录/结尾 + 表格分页），
+    #   40 分钟要翻 50 页，用户反馈「PPT 模板用得不太好」。
+    #   现在只在**真的像章节体**时才插过渡页：
+    #     a) 标题本身就是章节写法（第一章 / 一、/ 1.）—— 用户明确要分章；
+    #     b) 章节数不多（≤6）且每章够厚（平均 ≥4 个块）—— 插一张过渡页不浪费。
+    #   其它情况（比如 22 个并列的实际知识点）直接每页一个内容页，不再翻倍。
+    n_ch = sum(1 for t, _ in chapters if (t or "").strip())
+    avg_blocks = (sum(len(bs) for t, bs in chapters
+                      if (t or "").strip()) / n_ch) if n_ch else 0
     chapter_like = sum(1 for t, _ in chapters if t and _CHAPTER_RE.match(t))
-    use_sections = force_sections or chapter_like >= max(2, len(chapters) // 2)
+    use_sections = (chapter_like >= max(2, (n_ch + 1) // 2)
+                    or (n_ch <= 6 and avg_blocks >= 4))
 
     # 目录条目
     toc = []
@@ -2793,6 +2811,12 @@ def write_pptx(path, blocks, title=None, base_dir=None, theme=None,
     preset = get_preset(template) if template else None
     theme_arg = theme if theme else (preset["theme"] if preset else None)
     th = get_theme(theme_arg)
+    # ★ v9.22.10：页脚角标必须是「用户选的那套模板」的名字，不是它底层主题的名字。
+    #   真实事故：用户选 report_blue（汇报蓝），它底层主题是 academic，页脚于是每页
+    #   印着「清爽学术」—— 用户看到的和选的不是一套，最后只能靠 49 次字符串替换补救。
+    if preset:
+        th = dict(th)
+        th["name"] = preset["name"]
     cover_align = (preset or {}).get("cover_align") or "left"
     toc_style = (preset or {}).get("toc_style") or "numbered"
 

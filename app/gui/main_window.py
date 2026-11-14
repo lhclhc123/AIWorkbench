@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton,
     QScrollArea, QFrame, QLabel, QMessageBox, QApplication,
     QStackedWidget, QFileDialog, QTextEdit, QComboBox, QDialog,
-    QSystemTrayIcon, QMenu,
+    QSystemTrayIcon, QMenu, QSplitter,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QTextCursor, QGuiApplication
@@ -398,6 +398,9 @@ class MainWindow(QMainWindow):
         self._web_bridge = None          # WebUIBridge（web 引擎激活时才建）
         self._web_view = None            # QWebEngineView
         self._im_bridge = None           # 钉钉助手页的独立 WebUIBridge（v9.21.1）
+        # ★ v9.22.10：右栏浏览器是"开关"而不是"页面"，所以单独记住
+        #   左侧真正停在哪个页面 —— 收起浏览器后侧栏高亮要回到这里。
+        self._page_key = "chat"
         # GitHub Token 生效（v9.15.0）
         try:
             config.GITHUB_TOKEN = str(settings.get("github_token", "") or "")
@@ -1042,6 +1045,13 @@ class MainWindow(QMainWindow):
             self.voice.refresh_theme()
         if hasattr(self, "welcome"):
             self._stack_welcome()
+        # ★ v9.22.10：右侧浏览器外壳里有一部分颜色是 Python 画的（地址栏小图标、
+        #   标签选中态文字色），换主题时得跟着重刷；QSS 那部分会自动跟随。
+        if hasattr(self, "page_browser"):
+            try:
+                self.page_browser.refresh_theme()
+            except Exception:
+                pass
         self._render()
 
     # ================= 外壳 =================
@@ -1108,8 +1118,47 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self.side)
 
+        # ---------- 主内容区 + 右侧内嵌浏览器（v9.22.10）----------
+        # 用户原话：「将浏览器改为类似参考图右侧那种内嵌形式的样式……不要在左侧按钮
+        # 区域，改为独立合理的布局位置」。所以浏览器从「左侧导航里的一页」变成
+        # **窗口右侧一栏**：分栏可拖拽、默认约占 42%（≥420px）、最小 320px。
+        # 左边仍然是对话页（或 web 版对话页），打开浏览器**不顶掉**对话 ——
+        # 用户要的是「边聊边看网页」。
+        self.main_split = QSplitter(Qt.Orientation.Horizontal)
+        self.main_split.setObjectName("MainSplit")
+        self.main_split.setChildrenCollapsible(False)
+        self.main_split.setHandleWidth(6)
+        self._browser_split_done = False
+        self._browser_user_dragged = False
+        self._splitting = False
+        # ★ v9.22.10：面板展开/收起用**显式状态位**，不要只靠 isVisible()。
+        #   QWidget.isVisible() 是「连祖先一起算」的有效可见性：窗口还没 show、
+        #   或收到托盘里时它恒为 False，于是「再点一下收起」会被算成「还没展开」
+        #   而重新展开 —— 开关失灵。browser_visible() 以这个状态位为准。
+        self._browser_shown = True      # 默认展开（用户要的「边聊边看」）
+
         self.stack = QStackedWidget()
-        root.addWidget(self.stack, 1)
+        # ★ 必须允许左区被压窄：各页面内部（聊天卡片 / 输入区 / 设置表单）的
+        #   minimumSizeHint 加起来有一千多 px，QSplitter 会把右栏死钉在最小宽度
+        #   320px 上（setSizes 直接无效）。显式给一个较小的 minimumWidth 之后，
+        #   42% 的默认比例才真正生效，用户也才能把分隔条往左拖。
+        self.stack.setMinimumWidth(320)
+        self.main_split.addWidget(self.stack)
+
+        # 浏览器面板的宿主：真正的 BrowserPage 在所有页面建完之后才塞进来
+        # （BrowserPage 是懒加载的，见 pages.py；这里只先占好位置）。
+        self.browser_host = QWidget()
+        self.browser_host.setObjectName("BrowserHost")
+        self.browser_host.setMinimumWidth(320)
+        self._browser_host_layout = QVBoxLayout(self.browser_host)
+        self._browser_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._browser_host_layout.setSpacing(0)
+        self.main_split.addWidget(self.browser_host)
+
+        self.main_split.setStretchFactor(0, 1)      # 左边（对话）吃掉多余宽度
+        self.main_split.setStretchFactor(1, 0)      # 右边（浏览器）保持拖出来的宽度
+        self.main_split.splitterMoved.connect(self._on_splitter_moved)
+        root.addWidget(self.main_split, 1)
 
         self.page_chat = self._build_chat_page()
         self.stack.addWidget(self.page_chat)
@@ -1259,19 +1308,17 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.page_about)
         self.page_about.check_update.connect(lambda: self._do_update_check(False))
 
-        # ★ v9.18.0（需求 2）：内嵌浏览器页。
-        #   ⚠ 顺序要求：`PAGES` 末尾也要追加 ("browser", ...) —— `_open_page` 是拿
-        #     PAGES 的下标当 stack 下标的，两边顺序必须严格一一对应。
-        #   BrowserPage 是**懒加载**的：这里只建个空壳，Chromium 内核等这一页第一次
-        #   被打开时才实例化（否则每个用户一启动就白吃一百多 MB 内存）。
+        # ★ v9.18.0（需求 2）：内嵌浏览器。v9.22.10 起它**不再占页面栈**，
+        #   而是挂在主内容区右边的分栏里（`self.browser_host`）。
+        #   BrowserPage 依旧是**懒加载**的：这里只建个空壳，Chromium 内核等这一栏
+        #   第一次真正显示时才实例化（否则每个用户一启动就白吃一百多 MB 内存）。
         #   信号连在 BrowserPage.fetched 上（它转发内部 BrowserPane 的回执），
         #   所以不用担心"连的时候 pane 还没建"。
         self.page_browser = BrowserPage()
-        self.stack.addWidget(self.page_browser)
+        self._browser_host_layout.addWidget(self.page_browser, 1)
         self.page_browser.fetched.connect(self._on_browser_fetched)
-        # ★ v9.21.x（修「点开浏览器后回不到主界面」）：web 模式下 Qt 左栏隐藏，
-        #   浏览器页没有导航，这里接一个返回按钮直接切回对话页。
-        self.page_browser.back_requested.connect(lambda: self._open_page("chat"))
+        # 面板顶部的「✕ 收起」= 折叠这一栏（网页不销毁、登录态保留）
+        self.page_browser.back_requested.connect(self.hide_browser)
 
         self.statusBar().showMessage("就绪")
 
@@ -3437,16 +3484,28 @@ class MainWindow(QMainWindow):
 
     # ================= 页面切换 =================
     def _open_page(self, key):
+        # ★ v9.22.10：浏览器不再是"页面"，而是右侧一栏 —— 点它的格子
+        #   = 展开 / 收起那一栏（网页和登录态都不丢）。所以这里先短路，
+        #   绝不能拿它去 setCurrentIndex（PAGES 里的下标已经不对应页面栈了）。
+        key = str(key or "chat")
+        if key == "browser":
+            self.toggle_browser()
+            return
         # 索引跟着 PAGES 顺序走，避免以后加页面忘记改映射
         keys = [k for k, _i, _n in PAGES]
         idx = keys.index(key) if key in keys else 0
+        if idx >= self.stack.count():          # 防御：下标越界时回对话页，绝不黑屏
+            idx = 0
+            key = keys[0]
         self.stack.setCurrentIndex(idx)
+        self._page_key = key
         # ★ v9.18.0（需求 10）：代码里直接翻页（托盘菜单、向导跳转等）时，
         #   侧栏高亮也要跟着走，否则会出现"页面是设置、高亮还停在对话"的错位。
         try:
             self.nav.set_current(key)
         except Exception:
             pass
+        self._sync_browser_chip()
         if key == "assistant":
             self.page_assistant.load_cfg(self.assistant.cfg)
             # ★ v9.20.0：进这一页就全量刷一次（消息 / 设置 / 标签），
@@ -3480,13 +3539,132 @@ class MainWindow(QMainWindow):
             self.input.setFocus()
             self._scroll_to_bottom(True)
         elif key == "browser":
-            # 打开浏览器页：先把内核拉起来（懒加载），再把光标放进地址栏，省一次点击
+            # 兜底（正常走不到：'browser' 在上面就短路成展开/收起右栏了）。
+            # 万一有人绕过 toggle 直接走到这里，至少把面板亮出来、把内核拉起来。
+            self.show_browser(True)
+
+    # ================= 右侧内嵌浏览器面板（v9.22.10） =================
+    def browser_visible(self):
+        """右侧浏览器这一栏当前是不是展开着。
+
+        以显式状态位为准（见 `_browser_shown` 的注释）：`isVisible()` 在窗口
+        未 show / 收进托盘时恒为 False，拿它当开关状态会让「再点一下收起」失灵。
+        """
+        return bool(getattr(self, "_browser_shown", True))
+
+    def _sync_browser_chip(self):
+        """侧栏「浏览器」格子的勾选态 == 右栏是否展开（它现在是个开关）。"""
+        try:
+            btn = self.nav.buttons.get("browser")
+            if btn is not None:
+                btn.setChecked(self.browser_visible())
+        except Exception:
+            pass
+
+    def _apply_browser_split(self, force=False):
+        """给分栏一个默认比例：浏览器约占 42%，且不小于 420px；最小 320px。
+
+        规则（照用户那句「内嵌、可拖、默认约占窗口宽度 42%」）：
+          · 用户**没拖过**分隔条时：窗口一变宽就重新按 42% 分配 ——
+            否则 QSplitter 会把多出来的宽度全给左边（stretch 不同），
+            右栏会一直停在最小宽度 320px，看着像"没生效"；
+          · 用户**拖过**之后：一律听用户的，只在 `force=True` 时覆盖。
+        """
+        if not hasattr(self, "main_split") or getattr(self, "_splitting", False):
+            return
+        if self._browser_user_dragged and not force:
+            return
+        total = self.main_split.width()
+        if total < 600:
+            # 首次显示时布局还没跑完（宽度还是 0 / 几百），等下一次 resize 再来
+            return
+        want = max(420, int(total * 0.42))
+        # 左边对话区至少留 360px，别让浏览器把主界面挤没
+        want = min(want, max(320, total - 360))
+        left = max(320, total - want)
+        self._splitting = True
+        try:
+            self.main_split.setSizes([left, want])
+        except Exception:
+            pass
+        finally:
+            self._splitting = False
+
+    def _on_splitter_moved(self, _pos, _index):
+        """用户手动拖过分隔条 —— 从此宽度听用户的，不再自动套 42%。"""
+        self._browser_user_dragged = True
+
+    def show_browser(self, on=True):
+        """展开 / 收起右侧浏览器面板。
+
+        ★ 收起只是 `hide()`：`QWebEngineView` 不销毁、不重新加载，
+          回来还是原来那页（登录态也还在）。
+        """
+        on = bool(on)
+        self._browser_shown = on         # 先落状态位，再动控件（顺序别反）
+        if on:
+            self._apply_browser_split()
+        try:
+            self.browser_host.setVisible(on)
+        except Exception:
+            pass
+        if on:
+            # 懒加载：第一次展开才把 Chromium 拉起来；之后是复用的同一个控件
             try:
                 pane = self.page_browser.ensure_pane()
                 if pane is not None:
                     pane.addr.setFocus()
             except Exception:
                 pass
+            try:
+                self.nav.set_current("browser")
+            except Exception:
+                pass
+        else:
+            # 收起后侧栏高亮回到"当前真正在看的页面"，别停在浏览器上
+            try:
+                self.nav.set_current(getattr(self, "_page_key", "chat"))
+            except Exception:
+                pass
+        self._sync_browser_chip()
+        try:
+            self.statusBar().showMessage(
+                "浏览器面板已展开（右边可拖拽宽度）" if on
+                else "浏览器面板已收起，网页还在后台，点一下就能回来", 6000)
+        except Exception:
+            pass
+
+    def hide_browser(self):
+        """收起右侧浏览器面板（面板顶部 ✕ / 再点一次侧栏格子）。"""
+        self.show_browser(False)
+
+    def toggle_browser(self):
+        """展开 ↔ 收起（侧栏「浏览器」格子点一下就走这里）。"""
+        self.show_browser(not self.browser_visible())
+
+    def _ensure_browser_pane(self):
+        """把内核拉起来（懒加载入口：只有真的要显示浏览器时才调）。"""
+        try:
+            return self.page_browser.ensure_pane()
+        except Exception:
+            return None
+
+    def showEvent(self, ev):                     # noqa: N802（Qt 回调）
+        """首次显示时把分栏比例落实（那时候才有真实宽度可用）。"""
+        super().showEvent(ev)
+        QTimer.singleShot(0, self._apply_browser_split)
+        self._sync_browser_chip()
+
+    def resizeEvent(self, ev):                   # noqa: N802（Qt 回调）
+        """窗口尺寸变化时补一次分栏比例。
+
+        为什么要在这里再试一次：`showEvent` 里 `QSplitter` 的宽度可能还是 0
+        （布局尚未完成），`setSizes` 会被最小值夹成 320px。真正可用的大概率是
+        这里。`_apply_browser_split` 自己带"宽度不够就返回"和"只做一次"两道闸，
+        所以重复调用安全 —— 而且只会改**第一次**，之后用户拖成什么样就是什么样。
+        """
+        super().resizeEvent(ev)
+        self._apply_browser_split()
 
     def _on_browser_fetched(self, res):
         """内嵌浏览器「交给 AI 分析当前页」的回执（v9.18.0 需求 2）。
@@ -7686,6 +7864,12 @@ class MainWindow(QMainWindow):
 
     # ================= 设置 =================
     def _on_settings_saved(self, s):
+        # ★ v9.22.10：Web 设置页存的是 `asr_backend`，而语音输入读的是 `asr_prefer`，
+        #   两边字段名对不上 —— 以前在设置里换识别引擎其实**根本没生效**。
+        #   这里补一次别名，两个键都写进去（Qt 设置页写的是 asr_prefer，也兼容）。
+        if s.get("asr_backend"):
+            s = dict(s)
+            s["asr_prefer"] = s["asr_backend"]
         self.settings.update(s)
         self.settings["prompt_version"] = config.PROMPT_VERSION
         self.workspace.save_settings(self.settings)

@@ -269,6 +269,79 @@ QTabBar::tab {{
 }}
 QTabBar::tab:selected {{ background: {t['accent']}; color: #ffffff; font-weight: bold; }}
 QSplitter::handle {{ background: {t['border']}; }}
+
+/* ---------- v9.22.10：内嵌浏览器（右侧面板，像真浏览器） ---------- */
+/* 整块面板：只有左边一条分隔线，没有外框、没有卡片感 —— 它就是窗口的一部分。 */
+QWidget#BrowserHost {{
+    background: {t['nav_bg']};
+    border-left: 1px solid {t['nav_border']};
+}}
+QWidget#BrowserPane {{ background: {t['nav_bg']}; }}
+/* 细标签条 */
+QWidget#BrowserTabStrip {{
+    background: {t['nav_bg']};
+    border-bottom: 1px solid {t['nav_border']};
+}}
+QWidget#BrowserTabsHost {{ background: transparent; }}
+QFrame#BrowserTab {{
+    background: transparent; border: none; border-radius: 8px;
+}}
+QFrame#BrowserTab:hover {{ background: {t['nav_hover_bg']}; }}
+QFrame#BrowserTab[selected="true"] {{ background: {t['nav_active_bg']}; }}
+QLabel#BrowserTabTitle {{
+    color: {t['text_muted']}; font-size: 12px; background: transparent;
+}}
+/* 工具行 */
+QWidget#BrowserToolbar {{
+    background: {t['nav_bg']};
+    border-bottom: 1px solid {t['nav_border']};
+}}
+/* 小圆角图标按钮：无边框、hover 底色、disabled 变淡（不是 QToolButton 那种凸起） */
+QPushButton#BrowserBtn {{
+    background: transparent; color: {t['text']}; border: none;
+    border-radius: 8px; font-size: 15px; padding: 0px; margin: 0px;
+}}
+QPushButton#BrowserBtn:hover {{ background: {t['chip_bg']}; }}
+QPushButton#BrowserBtn:pressed {{ background: {t['btn_hover_bg']}; }}
+QPushButton#BrowserBtn:disabled {{ color: {t['text_muted']}; background: transparent; }}
+QPushButton#BrowserNewTab {{
+    background: transparent; color: {t['text_muted']}; border: none;
+    border-radius: 6px; font-size: 14px; padding: 0px; margin: 0px;
+}}
+QPushButton#BrowserNewTab:hover {{
+    background: {t['chip_bg']}; color: {t['text']};
+}}
+QPushButton#BrowserNewTab:pressed {{ background: {t['btn_hover_bg']}; }}
+QPushButton#BrowserTabClose {{
+    background: transparent; color: {t['text_muted']}; border: none;
+    border-radius: 9px; font-size: 10px; padding: 0px; margin: 0px;
+}}
+QPushButton#BrowserTabClose:hover {{ background: {t['chip_bg']}; color: {t['danger']}; }}
+/* 圆角地址栏：一整条，左侧图标由 QLineEdit 的 leading action 放进去 */
+QLineEdit#BrowserAddr {{
+    background: {t['chip_bg']}; color: {t['text']};
+    border: 1px solid transparent; border-radius: 14px;
+    padding: 0px 10px 0px 4px; margin: 0px;
+    font-size: 12px; min-height: 28px; max-height: 28px;
+    selection-background-color: {t['accent']};
+}}
+QLineEdit#BrowserAddr:hover {{ border: 1px solid {t['input_border']}; }}
+QLineEdit#BrowserAddr:focus {{
+    background: {t['input_bg']}; border: 1px solid {t['accent']};
+}}
+QLabel#BrowserStatus {{
+    color: {t['text_muted']}; font-size: 11px;
+    padding: 3px 10px 5px 10px; background: transparent;
+}}
+QWidget#BrowserViewStack {{ background: {t['panel_bg']}; border: none; }}
+/* ⋯ 菜单（浏览器面板里的那个，顺带把全局弹出菜单统一成同一套观感） */
+QMenu {{
+    background: {t['panel_bg']}; color: {t['text']};
+    border: 1px solid {t['border']}; border-radius: 10px; padding: 6px;
+}}
+QMenu::item {{ padding: 6px 20px 6px 14px; border-radius: 7px; font-size: 12px; }}
+QMenu::item:selected {{ background: {t['list_sel_bg']}; color: {t['list_sel_text']}; }}
+QMenu::separator {{ height: 1px; background: {t['border']}; margin: 5px 10px; }}
 QGroupBox {{
     border: 1px solid {t['border']}; border-radius: 10px;
     margin-top: 14px; padding-top: 10px; font-size: 13px; color: {t['text']};

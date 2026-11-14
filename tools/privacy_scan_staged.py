@@ -34,6 +34,15 @@ PATTERNS = [
     ("密钥密文 blob", re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")),
     ("本机工作区路径", re.compile(r"[A-Za-z]:\\软件\\WorkBuddy工作空间")),
 ]
+
+# ★ v9.22.10：公开的离线语音模型下载地址里有一段很长的仓库名，
+#   连字符也算进上面的字符类，于是被「密钥密文 blob」当成密钥，把推送硬拦下来。
+#   URL 路径不是密钥，故只有这一条规则在扫描前先把整段 URL 抹成空格；
+#   其余规则（钉钉凭据、sk- / api key / 手机号 / 邮箱 / 本机路径）依旧扫原文，
+#   安全性不降低。
+#   ⚠️ 本文件自身的注释也别写那种长串，否则会被同一条规则扫到。
+URL_RX = re.compile(r"https?://[^\s\"'<>)]+")
+
 if _REAL_NAME:
     PATTERNS.insert(0, ("真实姓名", re.compile(re.escape(_REAL_NAME))))
 if _WIN_USER:
@@ -86,7 +95,8 @@ def main():
             continue
         for i, line in enumerate(s.splitlines(), 1):
             for label, rx in PATTERNS:
-                if rx.search(line):
+                target = URL_RX.sub(" ", line) if label == "密钥密文 blob" else line
+                if rx.search(target):
                     hits.append((label, rel, i, line.strip()[:90]))
                     break
     if not hits:

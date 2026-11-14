@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen
 
 from .. import themes, asr as asr_mod
+from .. import asr_local
 
 
 class LevelMeter(QWidget):
@@ -64,6 +65,7 @@ class VoiceInput(QWidget):
     partial = pyqtSignal(str)          # 边说边出字：中途的实时结果（整段覆盖）
     status = pyqtSignal(str)           # 状态提示
     failed = pyqtSignal(str)           # 出错
+    model_progress = pyqtSignal(int, str)   # 离线模型下载进度（百分比, 一句话）
 
     def __init__(self, keys_provider=None, settings_provider=None, parent=None):
         super().__init__(parent)
@@ -74,6 +76,9 @@ class VoiceInput(QWidget):
         self.busy = False
         self._pending_path = None
         self._stream_error = None
+        self._last_model_text = ""
+        # 下载线程 → 界面：信号是跨线程排队的，安全
+        self.model_progress.connect(self._on_model_progress)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -135,8 +140,41 @@ class VoiceInput(QWidget):
         self.mic.setText("■")
         self.hint.setText("正在录音 0.0s")
         self._timer.start()
+        self._ensure_local_model()
         self._start_streaming(s)
         self.status.emit("正在录音…中间停顿约 10 秒才会自动结束，说完了也可以直接再点一下麦克风")
+
+    # ------------------------------------------------------------------
+    # 离线语音模型（★ v9.22.10）
+    # ------------------------------------------------------------------
+    def _ensure_local_model(self):
+        """首次使用：后台把离线模型下完（约 78 MB，只下一次）。
+
+        为什么要在这里做：云端三家识别（智谱/硅基流动/百炼）全部要看账户余额，
+        2026-11-14 实测已全部不可用；离线模型是本机跑、永久免费的唯一可靠路子。
+        下载在守护线程里跑，进度通过 model_progress 信号回到 UI，不卡界面。
+        """
+        try:
+            if asr_local.ready():
+                asr_local.warm_async()      # 模型已在盘上：后台预热，首次识别不等 3 秒
+                return
+            if not asr_local.installed():
+                return
+            asr_local.ensure_async(
+                lambda pct, text: self.model_progress.emit(int(pct), str(text)))
+            self.status.emit(asr_local.status_text())
+        except Exception:
+            pass
+
+    def _on_model_progress(self, pct, text):
+        """下载线程的进度回到 UI 线程（同一条提示不重复刷）。"""
+        if not text or text == self._last_model_text:
+            return
+        self._last_model_text = text
+        # 录音中 _tick 每 90ms 会重写 hint，别跟它抢；只走状态栏
+        if self.recorder is None:
+            self.hint.setText(text)
+        self.status.emit(text)
 
     def _start_streaming(self, settings):
         """开一路后台增量识别，让文字边说边出（失败不影响正常录音/整段识别）。"""
@@ -186,11 +224,17 @@ class VoiceInput(QWidget):
             self.failed.emit(str(e))
             self.hint.setText("语音输入")
             return
-        self.hint.setText("识别中…")
         self.busy = True
-        self.status.emit("正在识别语音…")
         self._pending_path = path
         s = self._settings_provider() or {}
+        if asr_local.installed() and not asr_local.ready():
+            # 模型还在下载：如实说明，别假装「识别中」转圈（后台线程会等它下完）
+            self._ensure_local_model()
+            self.hint.setText("准备离线语音…")
+            self.status.emit(asr_local.status_text())
+        else:
+            self.hint.setText("识别中…")
+            self.status.emit("正在识别语音…")
         asr_mod.recognize_file_async(
             path, self._keys_provider(), s.get("asr_prefer", "auto"),
             self._ok, self._err)

@@ -232,16 +232,23 @@ VISION_PRIORITY = ["zhipu", "dashscope"]
 SEARCH_PRIORITY = ["zhipu", "dashscope", "scnet"]
 
 # ---------------------------------------------------------------------------
-# 语音（全免费）
+# 语音
 # ---------------------------------------------------------------------------
 # 语音识别后端尝试顺序。
-#   zhipu       智谱 glm-asr-2512（用现有 Key，实测 0.8 秒出结果）—— 默认首选
+#   local       离线识别（本机 sherpa-onnx + 中文 Paraformer）—— 默认首选
+#               不要 Key、不联网、不花钱；模型首次使用时下载 78MB 后常驻
+#   zhipu       智谱 glm-asr-2512 —— **付费产品**，账户余额为 0 会 429 code=1113
 #   dashscope   阿里百炼 paraformer-v2（需账号已开通 ASR）
-#   siliconflow 硅基流动 SenseVoiceSmall（2026-10 起该平台余额为 0 会 402，排最后）
-ASR_PRIORITY = ["zhipu", "dashscope", "siliconflow"]
+#   siliconflow 硅基流动 SenseVoiceSmall（该平台余额为 0 会 402）
+#
+# ★ v9.22.10：2026-11-14 实测同一把智谱 Key，glm-4-flash 返回 200（免费），
+#   glm-asr-2512 返回 429「余额不足」——「智谱免费」只覆盖文本模型，
+#   语音转写是单独计费的。所以把离线提到第一位，云端只作为兜底。
+ASR_PRIORITY = ["local", "zhipu", "dashscope", "siliconflow"]
 ASR_MODEL_ZHIPU = "glm-asr-2512"
 ASR_MODEL_SILICONFLOW = "FunAudioLLM/SenseVoiceSmall"
 ASR_MODEL_DASHSCOPE = "paraformer-v2"
+ASR_LOCAL_MODEL = "paraformer-zh-small"     # app/asr_local.py 里也有一份同名字符串
 
 # 语音合成引擎
 TTS_ENGINES = [

@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
-"""语音输入：麦克风录音 + 多后端语音识别（全免费）。
+"""语音输入：麦克风录音 + 多后端语音识别。
 
 后端（按优先级自动尝试）：
-  1. zhipu       智谱 glm-asr-2512 —— 同步 multipart，用已有的智谱 Key（实测可用）
+  0. local       离线识别（本机 sherpa-onnx + 中文 Paraformer）—— **默认首选**
+                 不联网、不要 Key、没有「余额不足」。见 `app/asr_local.py`。
+  1. zhipu       智谱 glm-asr-2512 —— 同步 multipart，用已有的智谱 Key（**付费**）
   2. siliconflow 硅基流动 SenseVoiceSmall —— 注册即送额度，中文准确率高
   3. dashscope   阿里百炼 paraformer-v2 —— 先传 OSS 再异步转写（需账号已开通 ASR）
+
+★ v9.22.10 为什么把「离线」提到第一位（2026-11-14 实测，不是猜的）：
+  用户问「智谱不是免费的吗？」——同一把智谱 Key：
+    · glm-4-flash 文本模型 → HTTP 200（免费，正常）
+    · glm-asr-2512 语音转写 → HTTP 429 code=1113「余额不足或无可用资源包」
+  也就是说「智谱免费」只覆盖文本/视觉模型，**语音转写是单独计费的付费产品**；
+  硅基流动 HTTP 402 余额不足、百炼 FILE_DOWNLOAD_FAILED/SERVER_ERROR，同样不能用。
+  于是默认改成在本机跑模型：永久免费、断网也能用、换台电脑也不用重新配。
 
 录音用 pyaudio，统一转成 16kHz / 单声道 / 16bit PCM（各家的 ASR 都吃这个格式）。
 """
@@ -521,6 +531,21 @@ def _pick(resp_json):
     return ""
 
 
+def _asr_local(path, keys, timeout):
+    """离线识别：模型在本机跑，不需要任何 Key、不联网。
+
+    模型可能还没下载完（首次使用），这里**等**它 —— 这个函数只会在后台线程里
+    被调用（recognize_file_async / StreamingSession），等多久都不会卡界面。
+    """
+    from . import asr_local
+    if not asr_local.installed():
+        raise ASRError("本机没有离线语音引擎组件")
+    if not asr_local.ready():
+        if not asr_local.ensure(timeout=min(300, max(30, timeout * 3))):
+            raise ASRError(asr_local.status_text())
+    return asr_local.recognize(path)
+
+
 def _asr_zhipu(path, keys, timeout):
     key = (keys or {}).get("zhipu", "")
     if not key:
@@ -610,6 +635,8 @@ def _asr_dashscope(path, keys, timeout):
 
 
 BACKENDS = [
+    # ★ 离线排第一：不依赖任何账户余额，断网 / 换机器都能用
+    ("local", "离线识别（本机）", _asr_local),
     ("zhipu", "智谱 GLM-ASR", _asr_zhipu),
     ("siliconflow", "硅基流动 SenseVoice", _asr_siliconflow),
     ("dashscope", "百炼 Paraformer", _asr_dashscope),
@@ -617,17 +644,26 @@ BACKENDS = [
 
 # 后端显示名（设置页用）
 BACKEND_LABELS = {
-    "auto": "自动（推荐）",
-    "zhipu": "智谱 GLM-ASR-2512（用现有智谱 Key）",
-    "siliconflow": "硅基流动 SenseVoiceSmall（免费注册）",
+    "auto": "自动（推荐：先用本机离线，再试云端）",
+    "local": "离线识别（本机跑模型，不联网、不要 Key、永久免费）",
+    "zhipu": "智谱 GLM-ASR-2512（付费产品，需账户余额）",
+    "siliconflow": "硅基流动 SenseVoiceSmall（需账户余额）",
     "dashscope": "阿里百炼 Paraformer-v2（需开通 ASR）",
 }
 
 
 def available_backends(keys):
-    """哪些后端当前真的能用（有 Key）。"""
+    """哪些后端当前真的能用。
+
+    local 不需要 Key —— 只要引擎和模型都在就算「能用」。
+    """
     out = []
+    from . import asr_local
+    if asr_local.ready():
+        out.append("local")
     for name, label, _ in BACKENDS:
+        if name == "local":
+            continue
         if (keys or {}).get(name):
             out.append(name)
     return out
@@ -651,7 +687,8 @@ def transcribe(path, keys, prefer="auto", timeout=90):
 
     errors = []
     for name, label, fn in order:
-        if not (keys or {}).get(name):
+        # ★ local 不需要 Key；其余三家必须有 Key 才试
+        if name != "local" and not (keys or {}).get(name):
             continue
         try:
             text = fn(wav16, keys, timeout)
@@ -663,7 +700,23 @@ def transcribe(path, keys, prefer="auto", timeout=90):
     if not errors:
         raise ASRError("没有可用的语音识别后端——请在「设置 → 语音」里填一个 API Key"
                        "（智谱 Key 即可直接语音输入）。")
-    raise ASRError("语音识别失败：\n" + "\n".join(errors))
+    joined = "\n".join(errors)
+    low = joined.lower()
+    # ★ v9.22.10：把「账户欠费」翻译成用户看得懂、能自己解决的话。
+    #   实测本机三个后端同时挂：智谱 429「余额不足或无可用资源包」、
+    #   硅基流动 402「balance is insufficient」、百炼 SERVER_ERROR。
+    #   以前只把原始 HTTP 报文甩出来，用户以为是「语音模型坏了」。
+    if ("余额" in joined or "insufficient" in low
+            or " 429" in joined or " 402" in joined):
+        raise ASRError(
+            "语音识别用不了：云端的几个识别服务账户额度都用完了。\n"
+            "（智谱免费的是文本模型；语音转写是另外按量计费的付费产品，"
+            "余额为 0 就会返回「余额不足」。）\n"
+            "本程序已经内置「离线识别」，不花钱也不用 Key —— 只是模型还没下好。\n"
+            "怎么恢复：点一下麦克风，让它把离线模型下完（约 78 MB，只下一次），"
+            "之后断网也能用。\n\n"
+            "原始信息：\n" + joined)
+    raise ASRError("语音识别失败：\n" + joined)
 
 
 def recognize_file_async(path, keys, prefer, on_done, on_error):

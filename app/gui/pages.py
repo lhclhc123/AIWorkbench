@@ -41,13 +41,19 @@ PAGES = [
     ("integrations", icons_mod.ic("integrations"), "集成"),
     ("settings", icons_mod.ic("settings"), "设置"),
     ("about", icons_mod.ic("info"), "关于"),
-    # ★ v9.18.0（需求 2）：内嵌浏览器页。
+    # ★ v9.18.0（需求 2）：内嵌浏览器。
     #   ⚠ 只能**追加在最后**：`main_window._open_page` 是拿本表的下标当
     #     `QStackedWidget` 的下标用的，插在中间会把后面所有页面全部错位。
-    #     对应地，main_window 里 `self.stack.addWidget(self.page_browser)`
-    #     也必须排在所有页面之后。
+    #   ★ v9.22.10：它已经从"页面"变成"右侧一栏"，**不再进页面栈**（见 NAV_TOGGLES），
+    #     留着这一项是为了侧栏仍然有「浏览器」格子（点一下展开 / 再点一下收起）。
     ("browser", icons_mod.ic("web"), "浏览器"),
 ]
+
+# ★ v9.22.10：这几个键**不是页面**，而是"开关"（点一下展开、再点一下收起）。
+#   它们仍然留在 PAGES 里（侧栏要照 PAGES 画格子），但**不再占 QStackedWidget 的位**，
+#   所以 `PAGES 下标 == stack 下标` 这条老约束从 v9.22.10 起只对前 11 项成立；
+#   `main_window._open_page` 会在 setCurrentIndex 之前把这类键短路掉。
+NAV_TOGGLES = ("browser",)
 
 # 侧栏「常显」的主项（v9.13 引入）。v9.18.0 起导航改成"几行小格子"，
 # 这个常量不再参与布局，但保留导出以免老代码 / 回归用例引用时炸掉。
@@ -141,8 +147,10 @@ class NavRail(QWidget):
         if key not in self.buttons:
             self.changed.emit(key)
             return
-        if key == self._current:
+        if key == self._current and key not in NAV_TOGGLES:
             return
+        # ★ v9.22.10：`NAV_TOGGLES`（浏览器）即使已经是当前项也要**再派发一次**，
+        #   否则"再点一下收起"根本发不出信号 —— 它是个开关，不是页面。
         self.set_current(key)
         self.changed.emit(key)
 
@@ -3377,21 +3385,26 @@ class TeamPage(QWidget):
 # 内嵌浏览器页（v9.18.0 需求 2）
 # ---------------------------------------------------------------------------
 class BrowserPage(QWidget):
-    """内嵌浏览器：像浏览器一样访问网页、自由抓包，再一键交给 AI。
+    """右侧内嵌浏览器**面板**（v9.22.10 从"一整页"改成"右边一栏"）。
 
-    用户原话：
+    用户原话（v9.18.0）：
         「增强网址解析的功能，不仅仅让模型只能通过工具查看网页返回的 json，
           模型还可以想浏览器一样访问网页、自由抓取包，参考 workbuddy，
           可以内嵌浏览器内核」
+    用户原话（v9.22.10）：
+        「将浏览器改为类似参考图右侧那种内嵌形式的样式……改为独立合理的布局位置」
 
-    真正的实现在 :class:`app.gui.browser_page.BrowserPane`（地址栏 + Chromium 内核 +
-    请求嗅探），这里只负责"把它装成一个页面"并写清楚怎么用。
-    模型侧对应的是 `web_visit` 工具 —— 走的是同一个
-    :func:`app.webengine.fetch_rendered`，所以人工看到的和模型拿到的是一致的。
+    所以它现在只是**容器**：真正的实现在
+    :class:`app.gui.browser_page.BrowserPane`（标签条 + ← → ↻ ⌂ + 圆角地址栏 +
+    ⋯ 菜单 + Chromium 内核）。主窗口把它塞进主内容区右边的 `QSplitter`（可拖拽、
+    默认约 42% 宽），左边照旧是对话页 —— 用户要的是「边聊边看网页」。
 
-    **懒加载**（v9.18.0）：Chromium 内核第一次实例化要几百毫秒 + 一百多 MB 内存，
-    绝大部分用户从头到尾都不会打开这一页 —— 所以真正的 `BrowserPane` 等到
-    **这一页第一次被显示**时才建（`showEvent`）。启动速度和内存占用不受影响。
+    **懒加载**（v9.18.0 的既有优化，保留）：Chromium 内核第一次实例化要几百毫秒
+    + 一百多 MB 内存，所以真正的 `BrowserPane` 等到**这一栏第一次真正显示**时才建
+    （`showEvent` / 主窗口的 `show_browser()` 会显式调 `ensure_pane()`）。
+
+    **收起不销毁**（v9.22.10）：收起面板只 `hide()`，`QWebEngineView` 一直活着 ——
+    再展开还是原来那一页，登录态也不会丢（销毁了就是白屏 + 重新登录）。
 
     ⚠ 本模块顶部就 import 了 `browser_page`：QtWebEngine 必须在 `QApplication`
       之前导入，晚了不崩但会**自动关掉抓包**（见 webengine.py 的踩坑记录）。
@@ -3399,79 +3412,68 @@ class BrowserPage(QWidget):
     """
 
     fetched = pyqtSignal(dict)      # 转发 BrowserPane.fetched（主窗口直接连这个）
-    # ★ v9.21.x（修「点开浏览器后回不到主界面」）：web 模式下 Qt 左栏被隐藏，
-    #   BrowserPage 是 Qt 页、没有 Web SPA 的导航栏 —— 必须自带一个返回入口，
-    #   否则用户进了这页就再也切不回对话页。
+    # ★ v9.21.x 起叫 back_requested；v9.22.10 起它的语义变成「请把右侧这一栏收起来」
+    #   （面板顶部的 ✕）。主窗口连的是 hide_browser，只 hide 不销毁。
     back_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         t = themes.tokens()
 
+        self.setObjectName("BrowserPanel")
         self.pane = None
         v = QVBoxLayout(self)
-        v.setContentsMargins(12, 12, 12, 12)
-        v.setSpacing(8)
+        # ★ v9.22.10：它现在是"窗口右边的一栏"，不是一页 —— 所以不留页边距，
+        #   顶部就是浏览器自己的标签条，避免出现"灰卡片套卡片"的双层边框。
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
-        head_row = QHBoxLayout()
-        head_row.setSpacing(8)
-        self.back_btn = QPushButton("← 返回对话")
-        self.back_btn.setObjectName("cardBtn")
-        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.back_btn.setToolTip("切回对话页")
-        self.back_btn.setStyleSheet(
-            f"QPushButton{{background:{t['chip_bg']};color:{t['accent_text']};"
-            "border:none;border-radius:8px;padding:5px 12px;font-size:12px;"
-            f"font-weight:bold;}}QPushButton:hover{{color:{t['text']};}}")
-        self.back_btn.clicked.connect(self.back_requested.emit)
-        head_row.addWidget(self.back_btn)
-
-        head = QLabel(f"{icons_mod.ic('web')} 内嵌浏览器")
-        head.setStyleSheet(f"font-size:15px;font-weight:bold;color:{t['accent_text']};")
-        head_row.addWidget(head)
-        head_row.addStretch(1)
-        v.addLayout(head_row)
-
-        # 占位（第一次显示时被真的 BrowserPane 顶掉）
-        self._placeholder = QLabel("浏览器内核尚未启动，切换到本页时会自动就绪。")
+        # 占位（第一次真正显示时被真的 BrowserPane 顶掉）
+        self._placeholder = QLabel("浏览器内核尚未启动，展开这一栏时会自动就绪。")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setSizePolicy(QSizePolicy.Policy.Expanding,
                                         QSizePolicy.Policy.Expanding)
-        self._placeholder.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
+        self._placeholder.setStyleSheet(
+            f"color:{t['text_muted']};font-size:12px;padding:24px;")
+        # ⚠ 先 addWidget 拿到父窗口，再谈其它（本仓库「弹小窗」事故的根因）
         v.addWidget(self._placeholder, 1)
-
-        self.tip = QLabel(
-            "· 这里是**真实的浏览器内核**（Chromium）：JS 跑完的页面才拿得到正文，"
-            "各种后台 / 单页应用在这儿能正常显示，纯抓 HTML 只会得到一具空壳。\n"
-            "· 点「交给 AI 分析当前页」会把渲染后的正文 + 页面发出的数据接口整理好"
-            "填进输入框，你看一眼按回车就交给 AI。\n"
-            "· AI 自己也能调 web_visit 工具做同样的事（可选等多久、要不要抓包）。")
-        self.tip.setWordWrap(True)
-        self.tip.setStyleSheet(f"color:{t['text_muted']};font-size:12px;")
-        v.addWidget(self.tip)
 
     # ------------------------------------------------------------------
     def ensure_pane(self):
         """建（并返回）真正的浏览器控件；已经建过就直接返回。
 
-        用 `insertWidget(1, ...)` 插到标题下面 —— 这样"先 addWidget 后显示"的
-        铁律天然满足（绝不会出现"控件还没父窗口就被 setVisible(True)"那种弹小窗）。
+        用 `insertWidget` 插进布局 —— 这样"先 addWidget 后显示"的铁律天然满足
+        （绝不会出现"控件还没父窗口就被 setVisible(True)"那种弹小窗）。
         """
         if self.pane is not None:
             return self.pane
         try:
             self.pane = browser_page.BrowserPane()
             self.pane.fetched.connect(self.fetched.emit)
+            # 面板顶部的 ✕ = 收起右栏（不销毁内核）
+            self.pane.hide_requested.connect(self.back_requested.emit)
         except Exception as e:                       # noqa: BLE001
             self._placeholder.setText(f"浏览器内核启动失败：{type(e).__name__}: {e}")
             return None
         lay = self.layout()
-        lay.insertWidget(1, self.pane, 1)
+        lay.insertWidget(0, self.pane, 1)
         lay.removeWidget(self._placeholder)
         self._placeholder.hide()
         self._placeholder.deleteLater()
         self._placeholder = None
         return self.pane
+
+    def refresh_theme(self):
+        """换主题：把面板里 Python 侧画的颜色重刷一遍（QSS 部分自动跟随）。"""
+        t = themes.tokens()
+        if self._placeholder is not None:
+            self._placeholder.setStyleSheet(
+                f"color:{t['text_muted']};font-size:12px;padding:24px;")
+        if self.pane is not None:
+            try:
+                self.pane.refresh_theme()
+            except Exception:
+                pass
 
     def showEvent(self, ev):                          # noqa: N802 （Qt 回调命名）
         super().showEvent(ev)

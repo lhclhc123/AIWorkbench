@@ -518,15 +518,38 @@ function groupTitle(cat, firstItem) {
 }
 
 // 工具结果的第一行：折叠态「小结论」的素材（只在本组内部取，绝不跨轮）
+//
+// ★ v9.22.10：这里以前直接取 `lines[0]`，于是 `run_command` 的结果
+//   「命令：`dir /b`」变成折叠态那一行 —— 用户看到的原文是
+//   「调用的命令怎么就跑到对话中的小结论中了？」。
+//   命令回显 / 退出码 / 输出标题都是**过程元数据**，不是结论，必须跳过，
+//   往后找第一句真正有信息量的话；一句都没有就留空（只显示组标题）。
+const META_HEAD_RE = /^(命令|退出码|超时上限|输出|执行命令|已执行命令|解释器|脚本路径|工作目录)[\s:：]/;
+const CMD_LIKE_RE = /^(?:\$|>|PS>|cmd(?:\.exe)?\b|powershell\b|python(?:\.exe)?\b|pip\b|npm\b|npx\b|git\b|node\b|dir\b|cd\b|copy\b|move\b|del\b|taskkill\b)/i;
+
 function resultFirstLine(m) {
   const t = (m && m.text) || '';
   if (!t) return '';
+  const head = String(t).slice(0, 400);
+  // run_command 的结果：首行固定是「命令：`xxx`」，中间是「退出码：0」。
+  // ★ 成功的命令**没有「结论」可言** —— 后面第一行输出往往只是文件列表的第一项
+  //   （dir /b → A.txt），显示出来同样是噪音。失败时才有价值（那里是报错那行）。
+  if (/(^|\n)\s*(?:\[(?:成功|失败|跳过)\])?命令[：:]\s*`/.test(head)
+      && /退出码[：:]\s*0\b/.test(head)) {
+    return '';
+  }
   const lines = String(t).replace(/\r\n/g, '\n').split('\n')
     .map((s) => s.trim()).filter(Boolean);
   if (!lines.length) return '';
-  let s = lines[0].replace(/^\[(?:成功|失败|跳过)\]\s*/, '').replace(/\s+/g, ' ').trim();
-  if (!s) s = lines[0].replace(/\s+/g, ' ').trim();
-  return s.length > 60 ? s.slice(0, 59) + '…' : s;
+  for (const raw of lines.slice(0, 8)) {
+    let s = raw.replace(/^\[(?:成功|失败|跳过)\]\s*/, '').replace(/\s+/g, ' ').trim();
+    if (!s) continue;
+    if (s.startsWith('```')) continue;          // 代码块围栏
+    if (META_HEAD_RE.test(s)) continue;         // 命令 / 退出码 / 输出标题
+    if (CMD_LIKE_RE.test(s)) continue;          // 裸命令行
+    return s.length > 60 ? s.slice(0, 59) + '…' : s;
+  }
+  return '';
 }
 
 /**

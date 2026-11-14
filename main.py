@@ -119,6 +119,9 @@ def selftest():
         "incremental",
         # ★ v9.22.7：崩溃/卡死取证（main.py 最早期 import）
         "crashlog",
+        # ★ v9.22.10：离线语音识别（本机跑 sherpa-onnx，不依赖账户余额）。
+        #   asr.py 里是函数内 import，但打包时必须真的被带上，所以列进自检。
+        "asr_local",
     ]
     _GUI_MODS = [
         "chat_worker", "main_window", "pages", "panels",
