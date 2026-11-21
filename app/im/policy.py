@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """IM 助手「要不要回、怎么回」的判定与人设（v9.20.0）。
 
-三件事：
+五件事：
 1. `should_reply()` —— 这条消息该不该接？**群聊只回 @ 我的消息（v9.22.8
    用户硬性要求，与 mode / 白名单 / scope_* 无关）**，私聊默认都回；同时必须
    挡住"自己回自己"（否则群里会自己跟自己聊起来）。
-2. `build_system()` —— 拼系统提示。核心是**说人话**：不客服腔、不列表化、
+2. `confidence_of()` —— ★ v9.22.12：模型这段回复**敢不敢外发**（明确知道 vs
+   拿不准）。拿不准的一律不许发到钉钉，这是主任场景的安全闸门。
+3. `decide()` —— ★ v9.22.12：把「回复模式 / 通知类回执 / 置信度 / 兜底话术」
+   合成唯一一个决策：`reply` / `fallback` / `ack` / `silent`。
+4. `build_system()` —— 拼系统提示。核心是**说人话**：不客服腔、不列表化、
    不做"作为 AI 助手我很乐意"这种腔调。
-3. `build_messages()` —— 把消息流水折成模型能吃的上下文（共享记忆 + 本会话记忆
+5. `build_messages()` —— 把消息流水折成模型能吃的上下文（共享记忆 + 本会话记忆
    + 最近 N 轮），并保证角色交替合法。
 """
 import re
 import time
 
-from .store import MODES, DEFAULT_MODE
+from .store import (MODES, DEFAULT_MODE, IM_REPLY_MODES, DEFAULT_REPLY_MODE,
+                    IM_DEFAULT_SETTINGS, DEFAULT_FALLBACK_TEXT, DEFAULT_ACK_TEXT)
+
 
 # 「叫我」的默认称呼（会话档案里没写时用）
 DEFAULT_ALIASES = ("小助手", "助手", "AI", "ai")
@@ -283,3 +289,304 @@ def reply_style_hint(text):
     if t.endswith("?") or t.endswith("？") or "吗" in t:
         return "对方在问问题，先给答案，再补一句必要的说明。"
     return ""
+
+
+# ===========================================================================
+# ★ v9.22.12（主任场景）：明确知道才回 —— 置信闸门 + 三档决策
+# ===========================================================================
+# 用户原话：
+#   「自动回复需遵循规则：AI 明确知道答案才回复，不确定的内容不回复或回复统一
+#     兜底消息；在设置中提供针对通知类消息（如家长请假、告知主任事项等）的
+#     可选自动回复"好的"选项。」
+#
+# 这一节的三个函数都是**纯函数**（不读盘、不联网、不依赖 Qt），方便审计和单测：
+#   confidence_of(reply, question) -> (level, reason)
+#   match_notify(text, keywords)   -> 命中的关键词（没命中返回 ""）
+#   decide(msg, cfg, model_reply)  -> {"action", "text", "reason"}
+#
+# 所有判定用的正则都提升成**模块级常量**：主任/审计想确认"到底哪些话会被拦"，
+# 直接看下面这几张表即可，不用读函数体。
+# ---------------------------------------------------------------------------
+
+# ---- 表 1：命中任一即「不可外发」（模型在自我否认 / 回避 / 猜） ----
+# 每项：(代号, 编译后的正则, 给日志看的中文原因)
+LOW_CONFIDENCE_PATTERNS = (
+    ("uncertain", re.compile(r"不确定"),
+     "回复含『不确定』，判定不可外发"),
+    ("unclear", re.compile(r"不清楚"),
+     "回复含『不清楚』，判定不可外发"),
+    ("dont_know", re.compile(r"不知道"),
+     "回复含『不知道』，判定不可外发"),
+    ("cannot_determine", re.compile(r"无法确定|无法判断|无法确认|无法回答"),
+     "回复含『无法确定』，判定不可外发"),
+    ("not_familiar", re.compile(r"不太了解|不了解|不熟悉"),
+     "回复含『不太了解』，判定不可外发"),
+    ("no_info", re.compile(r"没有相关信息|没有找到相关|查不到|找不到相关|暂无相关"),
+     "回复含『没有相关信息』，判定不可外发"),
+    ("guess", re.compile(r"我猜|猜测|估计是|估计会"),
+     "回复含『我猜』，判定不可外发"),
+    ("maybe", re.compile(r"可能是|大概是|应该是|也许是|应该是吧"),
+     "回复含『可能是』，判定不可外发"),
+    ("suggest_ask", re.compile(r"建议你(自己)?(去)?(问|查|确认)|建议咨询|建议联系"),
+     "回复让对方向别人确认，判定不可外发"),
+    ("contact", re.compile(r"请联系|请问一下|请咨询"),
+     "回复让对方向别人联系，判定不可外发"),
+    ("details_please", re.compile(r"具体(情况|细节)?请"),
+     "回复让对方补信息，判定不可外发"),
+    ("cant", re.compile(r"我无法|我不能|没法回答|帮不上"),
+     "回复自称无法处理，判定不可外发"),
+    ("apology", re.compile(r"抱歉|对不起"),
+     "回复在道歉，判定不可外发"),
+    ("as_ai", re.compile(r"作为(一个)?(AI|ai|助手|人工智能)|我只是(一个)?(AI|ai|助手)"),
+     "回复自称是 AI，判定不可外发"),
+)
+
+# ---- 表 2：可核查锚点（high 至少要命中一个） ----
+# 每项：(类别名, 编译后的正则)
+ANCHOR_PATTERNS = (
+    ("数字", re.compile(r"\d|[一二三四五六七八九十百]+(个|人|天|点|号|次|份|条)")),
+    ("日期", re.compile(r"\d{1,4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}"
+                        r"|\d{1,2}\s*月\s*\d{1,2}\s*[日号]")),
+    ("时间", re.compile(r"\d{1,2}\s*[:：]\s*\d{2}"
+                        r"|上午|下午|中午|晚上|早上|今晚|明早"
+                        r"|周[一二三四五六日天]|星期[一二三四五六日天]"
+                        r"|明天|后天|今天|昨天|下周|本周|这周")),
+    ("地点", re.compile(r"会议室|办公室|教室|操场|食堂|图书馆|报告厅|礼堂"
+                        r"|校区|门口|门卫|楼上|楼下"
+                        r"|\d+\s*楼|[一二三四五六七八九十]楼"
+                        r"|[一二三四五六七八九十\d]+(年级|班|组|号楼|栋|室)")),
+    ("人名", re.compile(r"[\u4e00-\u9fa5]{1,3}(老师|主任|校长|书记|科长|处长|同学|家长)"
+                        r"|@[\w\u4e00-\u9fa5]{2,12}")),
+    ("文件", re.compile(r"[A-Za-z]:\\|\.(docx?|xlsx?|pptx?|pdf|txt|csv|zip)\b"
+                        r"|/[\w\-.]+/")),
+)
+
+# ---- 表 3：一句话里出现这些，说明是**在提问**（通知类不许用「好的」敷衍） ----
+QUESTION_MARKS = ("吗", "?", "？", "是否", "能不能", "可不可以",
+                  "什么", "怎么", "如何", "哪", "谁", "几", "多少")
+
+# ---- 表 4：内置「通知类」关键词（家长请假 / 告知主任事项 / 学校日常事务） ----
+# 注意：这里**自己维护一份轻量表**，不 import 别的模块，避免耦合与循环依赖。
+NOTIFY_KEYWORDS = (
+    "请假", "销假", "调课", "代课", "补课", "开会", "会议", "通知",
+    "检查", "报名", "交表", "材料", "家长会", "值班", "排班", "监考",
+    "考试", "培训", "教研", "体检", "缴费", "打卡", "签到", "布置",
+    "统计", "汇总", "上报", "审批", "签字", "领取",
+    "停课", "停电", "检修", "维修", "演练", "放假", "搬迁", "消毒",
+)
+
+# 「整段以问号结尾且不足这么多字」= 它在反问，不是在回答
+_PURE_QUESTION_MAX_LEN = 40
+# 极短敷衍的门槛（不含任何可核查锚点）
+_TOO_SHORT_LEN = 6
+# 纯标点 / 纯表情 / 纯空白（中文属于 \w，所以这条不会误伤正常句子）
+_RE_PURE_NOISE = re.compile(r"^[\W_]+$", re.UNICODE)
+# 关键词分隔符：中英文逗号 / 顿号 / 分号 / 换行 / 竖线
+_RE_KEYWORD_SPLIT = re.compile(r"[,，、;；\n\r\t|]+")
+
+
+def normalize_reply_mode(value):
+    """把任意值归一成 `off` / `confident_only` / `always`（认不出就保守取中）。"""
+    mode = str(value or "").strip().lower()
+    return mode if mode in IM_REPLY_MODES else DEFAULT_REPLY_MODE
+
+
+def reply_mode_label(mode):
+    """给界面/日志看的中文名。"""
+    return {
+        "off": "关闭（不自动回复）",
+        "confident_only": "只回确定的",
+        "always": "全部都回",
+    }.get(normalize_reply_mode(mode), "只回确定的")
+
+
+def parse_notify_keywords(raw=""):
+    """把界面里那串自定义关键词解析成元组（内置表在前，自定义在后，去重保序）。
+
+    支持逗号 / 顿号 / 分号 / 换行分隔（直接粘一整列也行）。
+    """
+    out, seen = [], set()
+    for word in NOTIFY_KEYWORDS:
+        w = str(word or "").strip()
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    for word in _RE_KEYWORD_SPLIT.split(str(raw or "")):
+        w = word.strip()
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    return tuple(out)
+
+
+def match_notify(text, extra_keywords=""):
+    """这句话像不像「通知类」（家长请假 / 调课 / 检查…）。
+
+    Returns:
+        命中的关键词（字符串）；没命中返回 ""。
+    """
+    t = str(text or "")
+    if not t:
+        return ""
+    for word in parse_notify_keywords(extra_keywords):
+        if word and word in t:
+            return word
+    return ""
+
+
+def is_question(text):
+    """这句话是不是在**提问**（通知类回执必须先过这一关）。"""
+    t = str(text or "")
+    if not t:
+        return False
+    return any(mark in t for mark in QUESTION_MARKS)
+
+
+def _cfg_value(cfg, key):
+    """从设置里取一个键；**老配置文件没有这个键时退回默认值**（绝不 KeyError）。"""
+    if isinstance(cfg, dict) and cfg.get(key) is not None:
+        return cfg[key]
+    return IM_DEFAULT_SETTINGS.get(key)
+
+
+def _norm_for_compare(text):
+    """去掉空白与标点，只留字，用来判断"是不是在复述对方的话"。"""
+    return re.sub(r"[\s\W_]+", "", str(text or ""), flags=re.UNICODE)
+
+
+def confidence_of(reply_text, question_text="", force_level=""):
+    """这段回复**敢不敢直接发出去**。
+
+    Args:
+        reply_text: 模型生成的回复正文（调用方应已剥掉 DSML / 工具调用残片）。
+        question_text: 对方原话（用来识别"只是复述问题"这种假回答）。
+        force_level: 调用方强制指定 `"high"` / `"low"`（覆盖开关，传了就以它为准）。
+
+    Returns:
+        (level, reason)：
+            level  ∈ {"high", "low"}
+            reason 是**人能看懂的中文短语**，会写进日志给主任查。
+    """
+    forced = str(force_level or "").strip().lower()
+    if forced in ("high", "low"):
+        return forced, "由调用方指定（force_level=%s）" % forced
+
+    text = str(reply_text or "").strip()
+    if not text:
+        return "low", "回复为空，判定不可外发"
+    if _RE_PURE_NOISE.match(text):
+        return "low", "回复只有标点或表情，判定不可外发"
+
+    # ① 自我否认 / 回避 / 猜 —— 命中任一即不可外发
+    for _code, pattern, reason in LOW_CONFIDENCE_PATTERNS:
+        if pattern.search(text):
+            return "low", reason
+
+    # ② 整段以问号结尾且很短 = 它在反问对方，不是在回答
+    if text[-1] in "?？" and len(text) < _PURE_QUESTION_MAX_LEN:
+        return "low", "回复是在反问对方（不足%d字），判定不可外发" % _PURE_QUESTION_MAX_LEN
+
+    # ③ 只是把对方的问题复述一遍（常见于模型偷懒）
+    q = _norm_for_compare(question_text)
+    if q and len(q) >= 4 and _norm_for_compare(text) == q:
+        return "low", "回复只是复述对方的问题，判定不可外发"
+
+    # ④ 至少要有 1 个「可核查锚点」才算 high
+    hits = [name for name, pattern in ANCHOR_PATTERNS if pattern.search(text)]
+    if hits:
+        return "high", "回复含可核查信息（%s），判定可外发" % "、".join(hits[:3])
+
+    # ⑤ 没有锚点：短回复算敷衍，长回复算"说了等于没说"，都是 low
+    if len(text) < _TOO_SHORT_LEN:
+        return "low", "回复过短（不足%d字）且没有可核查信息，判定不可外发" % _TOO_SHORT_LEN
+    return "low", "回复没有可核查信息（数字/时间/地点/人名/文件），判定不可外发"
+
+
+def _sanitize_body(text):
+    """外发正文的兜底清洗（只在疑似有标记时才动手，干净文本零开销）。
+
+    正常链路里 `app.im.replyproc` 返回前已经洗过；这里再兜一次是为了保证
+    **不管调用方怎么接，`decide()` 都是「先清洗、再判置信度」** —— 顺序反了
+    会把「<tool_call>…」这种脏文本判成 high，那就白设闸门了。
+    """
+    s = str(text or "")
+    if not s:
+        return ""
+    if "<" not in s and "[[uncertain]]" not in s.lower() and "｜" not in s:
+        return s
+    try:
+        from .replyproc import sanitize_reply
+        return sanitize_reply(s)
+    except Exception:
+        return s
+
+
+def decide(msg, cfg=None, model_reply=None, force_level=""):
+    """★ 主任场景的唯一决策入口：这条消息**到底发不发、发什么**。
+
+    优先级（顺序不能改）：
+        1. `im_reply_mode == "off"`                  → silent
+        2. 命中通知类 + `im_notify_ack_enabled`      → ack（默认「好的」）
+           例外：通知里含明确提问 → 走正常回复流程，别用「好的」敷衍
+        3. 模型回复置信度 high                       → reply
+        4. 置信度 low + `im_fallback_enabled`        → fallback
+           置信度 low + 兜底关闭                     → silent
+
+    Args:
+        msg: 收到的消息（dict，取 `text`；也允许直接传字符串）。
+        cfg: `IMStore.settings()` 那一份设置；缺键自动用默认值。
+        model_reply: 模型生成的回复正文（还没生成就传 None）。
+        force_level: 透传给 `confidence_of` 的覆盖开关。
+
+    Returns:
+        {"action": "reply"|"fallback"|"ack"|"silent", "text": str, "reason": str}
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if isinstance(msg, dict):
+        incoming = str(msg.get("text") or "")
+    else:
+        incoming = str(msg or "")
+    incoming = incoming.strip()
+
+    mode = normalize_reply_mode(_cfg_value(cfg, "im_reply_mode"))
+
+    # ---- 1. 关闭：一个字都不发 ----
+    if mode == "off":
+        return {"action": "silent", "text": "",
+                "reason": "回复模式为「关闭」，不自动回复"}
+
+    # ---- 2. 通知类回执 ----
+    ack_on = bool(_cfg_value(cfg, "im_notify_ack_enabled"))
+    if ack_on and incoming:
+        hit = match_notify(incoming, _cfg_value(cfg, "im_notify_keywords") or "")
+        if hit:
+            if is_question(incoming):
+                # 通知里夹着问题时，「好的」等于没答 —— 交给下面的正常流程
+                pass
+            else:
+                ack_text = str(_cfg_value(cfg, "im_notify_ack_text")
+                               or DEFAULT_ACK_TEXT).strip() or DEFAULT_ACK_TEXT
+                return {"action": "ack", "text": ack_text,
+                        "reason": "命中通知关键词「%s」，自动回执" % hit}
+
+    # ★ 先清洗、再判置信度（顺序不能反）：脏文本里的标签会把 low 判成 high。
+    body = _sanitize_body(model_reply).strip()
+
+    # ---- 3. 「全部都回」：模型说什么发什么（没有正文就按兜底处理） ----
+    if mode == "always" and body:
+        return {"action": "reply", "text": body,
+                "reason": "回复模式为「全部都回」，直接发送"}
+
+    # ---- 4. 置信闸门 ----
+    level, why = confidence_of(body, incoming, force_level=force_level)
+    if level == "high":
+        return {"action": "reply", "text": body, "reason": why}
+
+    fallback_on = bool(_cfg_value(cfg, "im_fallback_enabled"))
+    if fallback_on:
+        ftext = str(_cfg_value(cfg, "im_fallback_text")
+                    or DEFAULT_FALLBACK_TEXT).strip() or DEFAULT_FALLBACK_TEXT
+        return {"action": "fallback", "text": ftext,
+                "reason": why + "；按设置发送兜底消息"}
+    return {"action": "silent", "text": "",
+            "reason": why + "；兜底已关闭，按设置不发送"}

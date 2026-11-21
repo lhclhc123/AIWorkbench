@@ -47,6 +47,25 @@ class DingTalkError(Exception):
     pass
 
 
+def _strip_dsml_text(text):
+    """把 DeepSeek DSML 工具标签从**要发出去的文本**里去掉。
+
+    用户报障：`<｜｜DSML｜｜ calls>` / `<｜｜DSML｜｜ invoke name="dingtalk_push">`
+    这些标签直接出现在钉钉消息里。发消息前必须过一遍统一实现
+    （app.agent.strip_dsml），别在这里再抄一份正则。
+
+    ⚠ 延迟 import：dingtalk 属于底层模块，模块级 import agent 有可能成环；
+      老代码 / 单测里如果 agent 不可用，就原样返回（绝不因为清洗失败丢消息）。
+    """
+    if not text:
+        return text
+    try:
+        from .agent import strip_dsml
+        return strip_dsml(text)
+    except Exception:                       # noqa: BLE001
+        return text
+
+
 def _throttle():
     """简单限流，避免触发钉钉「每分钟 20 条」被禁 10 分钟。"""
     with _rate_lock:
@@ -464,6 +483,9 @@ class DingTalkClient:
 
     def _decorate(self, content):
         """关键词安全设置：消息里必须含关键词，否则会被拒。"""
+        # ★ v9.22.x：所有发送通道（webhook / 应用机器人 / 工作通知 / 群会话）
+        #   最后都会走这里，统一把 DSML 工具标签清掉，绝不发到用户手机上。
+        content = _strip_dsml_text(content)
         kw = (self.cfg.get("keyword") or "").strip()
         tag = (self.cfg.get("push_tag") or "").strip()
         prefix = tag
@@ -499,6 +521,8 @@ class DingTalkClient:
     def send(self, content, title=None, at_all=None):
         """统一发送入口。content 为正文，title 非空则发 markdown。"""
         content = (content or "").strip()
+        # 先清 DSML 再判空：整条消息都是标签时，宁可报「内容为空」也不发一堆标签
+        content = _strip_dsml_text(content).strip() if content else content
         if not content:
             raise DingTalkError("消息内容为空")
         at_all = self.cfg.get("at_all") if at_all is None else at_all
@@ -1023,7 +1047,9 @@ class DingTalkClient:
     def _reply_long(text, msg):
         """钉钉单条消息有长度限制，过长自动切段回复。"""
         limit = 4000
-        text = text or ""
+        # ★ v9.22.x：IM 自动代回走的就是这里 —— 发之前必须清掉 DSML 工具标签
+        #   （用户明确反馈"钉钉消息里也有这些标签"）。
+        text = _strip_dsml_text(text or "")
         chunks = [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
         for c in chunks[:5]:
             try:

@@ -292,7 +292,10 @@ MODEL_TIMEOUT_RETRY = 1      # 纯超时（不是限流）最多重试几次
 # v9.22.1：新增两条硬规范 ——「读代码必须先定位，不许整文件通读，一次读超过 400 行
 #   等于没读」与「能写脚本就别堆命令，先写 .py/.bat/.ps1 到工作区再跑」；
 #   同期 find_lines 的 context 上限 5 -> 10，read_file 超 400 行会在结果末尾追加提醒。
-PROMPT_VERSION = 36
+# ★ v9.22.12：提示词正文有改动（run_python 默认 120s / 上限 600s 的说明，
+#   config.py 里【系统与交互】那节），必须升版本，否则老工作区的
+#   system_prompt 不会刷新，模型看到的还是「默认 60 秒」的旧说明。
+PROMPT_VERSION = 37
 
 # ★ v9.18.0（需求 4「有的时候会出现生成内容有点重复」）——
 #   流式输出里"**把前面已经发出去的内容作废、从头重来**"的标记。
@@ -687,7 +690,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "    后台任务真实结果以 bg_status / team_status 里的日志与产物为准。\n"
     "\n"
     "【系统与交互】\n"
-    "- run_python：执行一段 Python 代码并返回真实输出，参数 code、可选 timeout（秒）。\n"
+    "- run_python：执行一段 Python 代码并返回真实输出，参数 code、可选 timeout（秒，\n"
+    "  默认 120，可给到 600；超时了就加 timeout 再试，或改用 run_bg 后台跑）。\n"
     "  适合批量数据处理、数学计算、调用本机 Python 库（numpy / PIL / openpyxl 等）。\n"
     "  工作目录是工作区 files/；涉及删除等破坏性操作时会请用户确认。\n"
     "- build_exe：**把写好的 .py 打包成真正的 .exe**（内部自动挑装了 PyInstaller 的解释器，\n"

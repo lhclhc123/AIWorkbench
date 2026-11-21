@@ -2080,7 +2080,15 @@ class SettingsPage(QWidget):
         tabs.addTab(self._tab_model(), "模型")
         tabs.addTab(self._tab_voice(), "语音")
         tabs.addTab(self._tab_keys(), "密钥")
+        # ★ v9.22.12（主任场景）：自动回复的「敢不敢发」在这里配。
+        #   插在「密钥」之后、「提示词」之前（第 5 个标签，下标 4）。
+        tabs.addTab(self._tab_im_reply(), "钉钉自动回复")
+        # ★ v9.22.12（主任场景）：定时自动登录希沃 → 定位共享 → 播放 → 结束共享。
+        #   放在「钉钉自动回复」之后、「提示词」之前（第 6 个标签，下标 5）——
+        #   下标 4 必须留给 im_reply，探针按这个下标取它。
+        tabs.addTab(self._tab_seewo(), "希沃共享屏幕")
         tabs.addTab(self._tab_prompt(), "提示词")
+        self.tabs = tabs
         outer.addWidget(tabs, 1)
 
     # ---------------- 通用 ----------------
@@ -2445,6 +2453,279 @@ class SettingsPage(QWidget):
         v.addStretch(1)
         return page
 
+    # ---------------- ★ v9.22.12 钉钉自动回复（主任场景） ----------------
+    def _tab_im_reply(self):
+        """「明确知道才回」的配置页。
+
+        三档回复模式 + 兜底话术 + 通知类回执 + 「试一下」规则试算。
+        所有键名与 `app/im/store.py::IM_DEFAULT_SETTINGS` 完全一致，
+        保存时**双写**：一份进本页设置（settings.json），一份进
+        `<工作区>/.awb/im/im_settings.json`（真正跑自动回复时读的那份）。
+        """
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        v = QVBoxLayout(inner)
+        v.setSpacing(12)
+
+        box = QGroupBox("回复模式（AI 明确知道答案才回复）")
+        f = QFormLayout(box)
+        self.im_mode_cb = QComboBox()
+        self.im_mode_cb.addItem("关闭：不自动回复", "off")
+        self.im_mode_cb.addItem("只回确定的：没把握就发兜底消息（推荐）",
+                                "confident_only")
+        self.im_mode_cb.addItem("全部都回：模型说什么就发什么", "always")
+        f.addRow("回复模式：", self.im_mode_cb)
+        mode_hint = QLabel("推荐「只回确定的」：回复里必须能查到数字 / 时间 / 地点 / "
+                           "人名 / 文件，否则不算明确知道，改发下面的兜底消息。"
+                           "模型说「不确定」「不知道」「建议你问…」这类话时一律不外发。")
+        mode_hint.setWordWrap(True)
+        mode_hint.setObjectName("PageSub")
+        f.addRow("", mode_hint)
+        v.addWidget(box)
+
+        box_fb = QGroupBox("拿不准的时候")
+        ff = QFormLayout(box_fb)
+        self.im_fallback_cb = QCheckBox("不确定时发送兜底消息"
+                                        "（取消勾选＝完全不发，只留在收件箱里）")
+        ff.addRow(self.im_fallback_cb)
+        self.im_fallback_edit = QLineEdit()
+        self.im_fallback_edit.setPlaceholderText("收到，我稍后回复您。")
+        ff.addRow("兜底话术：", self.im_fallback_edit)
+        v.addWidget(box_fb)
+
+        box_ack = QGroupBox("通知类消息自动回执")
+        fa = QFormLayout(box_ack)
+        self.im_ack_cb = QCheckBox("通知类消息自动回一句"
+                                   "（家长请假、调课、检查、告知主任事项等）")
+        fa.addRow(self.im_ack_cb)
+        self.im_ack_edit = QLineEdit()
+        self.im_ack_edit.setPlaceholderText("好的")
+        fa.addRow("回执文案：", self.im_ack_edit)
+        self.im_notify_edit = QPlainTextEdit()
+        self.im_notify_edit.setPlaceholderText("请假, 调课, 开会, 检查")
+        self.im_notify_edit.setFixedHeight(72)
+        fa.addRow("这些也可以当通知：", self.im_notify_edit)
+        ack_hint = QLabel("每行一个、或用逗号分隔；会追加到内置关键词后面。"
+                          "如果通知里本身带着提问（比如「明天能来开会吗？」），"
+                          "不会用「好的」敷衍，会走正常回复流程。")
+        ack_hint.setWordWrap(True)
+        ack_hint.setObjectName("PageSub")
+        fa.addRow("", ack_hint)
+        v.addWidget(box_ack)
+
+        box_try = QGroupBox("试一下（只在本机试算，不会真的发出去）")
+        ft = QFormLayout(box_try)
+        self.im_try_msg = QLineEdit()
+        self.im_try_msg.setPlaceholderText("粘贴一条别人发来的消息，"
+                                           "例如：孩子发烧请假一天")
+        ft.addRow("对方说的话：", self.im_try_msg)
+        self.im_try_reply = QLineEdit()
+        self.im_try_reply.setPlaceholderText("可留空；填上可模拟 AI 的回复")
+        ft.addRow("AI 打算回的话：", self.im_try_reply)
+        self.im_try_btn = QPushButton("试一下")
+        self.im_try_btn.clicked.connect(self._im_try)
+        ft.addRow("", self.im_try_btn)
+        self.im_try_result = QLabel("")
+        self.im_try_result.setWordWrap(True)
+        self.im_try_result.setObjectName("PageSub")
+        self.im_try_result.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        ft.addRow("判定结果：", self.im_try_result)
+        v.addWidget(box_try)
+
+        v.addStretch(1)
+        scroll.setWidget(inner)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.addWidget(scroll)
+        return page
+
+    # 本页负责的 IM 设置键（与 app/im/store.py::IM_DEFAULT_SETTINGS 同名同义）
+    IM_REPLY_KEYS = ("im_reply_mode", "im_fallback_text", "im_fallback_enabled",
+                     "im_notify_ack_enabled", "im_notify_ack_text",
+                     "im_notify_keywords")
+
+    def _im_store_or_none(self):
+        """找到「上次打开的工作区」的 IM 仓库；拿不到就返回 None（不影响本页可用）。"""
+        try:
+            path = ws_mod.get_last_workspace()
+            if not path:
+                return None
+            from ..im.store import IMStore
+            return IMStore(path)
+        except Exception:
+            return None
+
+    def _im_cfg(self):
+        """把界面上的当前值收集成 `IMStore.settings()` 同构的 dict（不落盘）。"""
+        mode = self.im_mode_cb.currentData()
+        return {
+            "im_reply_mode": str(mode or "confident_only"),
+            "im_fallback_text": self.im_fallback_edit.text().strip(),
+            "im_fallback_enabled": self.im_fallback_cb.isChecked(),
+            "im_notify_ack_enabled": self.im_ack_cb.isChecked(),
+            "im_notify_ack_text": self.im_ack_edit.text().strip(),
+            "im_notify_keywords": self.im_notify_edit.toPlainText().strip(),
+        }
+
+    def _load_im_reply(self, s):
+        """装载本页设置。
+
+        ★ 向后兼容：老 settings / 老 `im_settings.json` 没有这些键时，
+        一律用 `IM_DEFAULT_SETTINGS` 的默认值补齐（绝不 KeyError）。
+        """
+        try:
+            from ..im.store import (IM_DEFAULT_SETTINGS, DEFAULT_REPLY_MODE,
+                                    DEFAULT_FALLBACK_TEXT, DEFAULT_ACK_TEXT)
+        except Exception:
+            return
+        cfg = dict(IM_DEFAULT_SETTINGS)
+        # ① 先吃「设置页」保存过的值（老用户可能只有这一份）
+        if isinstance(s, dict):
+            for k in self.IM_REPLY_KEYS:
+                if s.get(k) is not None:
+                    cfg[k] = s[k]
+        # ② 工作区里真的存在 im_settings.json 时，以它为准（自动回复实际读它）
+        store = self._im_store_or_none()
+        if store is not None:
+            try:
+                if os.path.isfile(store.settings_file):
+                    live = store.settings()
+                    if isinstance(live, dict):
+                        for k in self.IM_REPLY_KEYS:
+                            if live.get(k) is not None:
+                                cfg[k] = live[k]
+            except Exception:
+                pass
+        mode = str(cfg.get("im_reply_mode") or DEFAULT_REPLY_MODE).strip().lower()
+        if mode not in ("off", "confident_only", "always"):
+            mode = DEFAULT_REPLY_MODE
+        idx = self.im_mode_cb.findData(mode)
+        self.im_mode_cb.setCurrentIndex(max(0, idx))
+        self.im_fallback_cb.setChecked(bool(cfg.get("im_fallback_enabled", True)))
+        self.im_fallback_edit.setText(
+            str(cfg.get("im_fallback_text") or DEFAULT_FALLBACK_TEXT))
+        self.im_ack_cb.setChecked(bool(cfg.get("im_notify_ack_enabled", True)))
+        self.im_ack_edit.setText(
+            str(cfg.get("im_notify_ack_text") or DEFAULT_ACK_TEXT))
+        self.im_notify_edit.setPlainText(str(cfg.get("im_notify_keywords") or ""))
+        self.im_try_result.setText("")
+
+    def _save_im_reply(self):
+        """把本页的 6 个键写进 IM 仓库（失败也不影响主流程，绝不抛给界面）。"""
+        store = self._im_store_or_none()
+        if store is None:
+            return False
+        try:
+            store.set_settings(**self._im_cfg())
+            return True
+        except Exception:
+            return False
+
+    def _im_try(self):
+        """「试一下」：用当前界面上的规则试算一条消息，**不落盘、不发送**。"""
+        try:
+            from ..im import policy as im_policy
+            text = self.im_try_msg.text().strip()
+            draft = self.im_try_reply.text().strip()
+            if not text and not draft:
+                self.im_try_result.setText("先在「对方说的话」里填一句，再点「试一下」。")
+                return
+            r = im_policy.decide(text, self._im_cfg(),
+                                 model_reply=(draft or None)) or {}
+            action = str(r.get("action") or "silent")
+            label = {"reply": "直接回复", "fallback": "发兜底消息",
+                     "ack": "自动回执", "silent": "不发送"}.get(action, action)
+            body = str(r.get("text") or "") or "（不发任何内容）"
+            msg = ("判定：%s（%s）\n原因：%s\n将要发送：%s"
+                   % (action, label, str(r.get("reason") or "（无）"), body))
+            self.im_try_result.setText(msg)
+            # 测试/无头环境不开模态框（会把探针卡死）；正常使用给主任一个弹窗。
+            if not os.environ.get("AIWORKBENCH_TEST") and self.isVisible():
+                QMessageBox.information(self, "规则试算（不会真的发出去）", msg)
+        except Exception as exc:                      # 规则试算不该把界面带崩
+            try:
+                self.im_try_result.setText("试算失败：%s: %s"
+                                           % (type(exc).__name__, exc))
+            except Exception:
+                pass
+
+    # ---------------- 希沃共享屏幕 ----------------
+    def _tab_seewo(self):
+        """希沃共享屏幕面板（v9.22.12）。
+
+        面板本身是**自包含**的（自己读写 ``<工作区>/.awb/seewo.json``、自己起
+        线程干活），这里只做两件事：把它挂上标签页；把「当前浏览器页」和
+        「当前工作区」两个**懒取值函数**接给它。真正的取值函数由主窗口在
+        ``__init__`` 末尾用 :meth:`bind_seewo` 注入 —— 设置页不该反过来
+        依赖主窗口的内部结构。
+        """
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+        self.seewo_panel = None
+        try:
+            from .seewo_settings import SeewoSettingsWidget
+            self.seewo_panel = SeewoSettingsWidget(
+                settings_getter=lambda: dict(self._settings or {}),
+                page_getter=self._seewo_page,
+                workspace_getter=self._seewo_ws,
+            )
+            v.addWidget(self.seewo_panel, 1)
+        except Exception as exc:          # noqa: BLE001
+            # 面板坏了也不能把整个设置页带崩 —— 至少告诉用户为什么。
+            lb = QLabel("希沃面板加载失败：%s: %s\n（其它设置不受影响）"
+                        % (type(exc).__name__, exc))
+            lb.setWordWrap(True)
+            v.addWidget(lb)
+        return page
+
+    def _seewo_page(self):
+        """当前内置浏览器页（由主窗口注入；没注入/取不到就返回 None）。"""
+        fn = getattr(self, "_seewo_page_getter", None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                return None
+        return None
+
+    def _seewo_ws(self):
+        """当前工作区路径（由主窗口注入）。"""
+        fn = getattr(self, "_seewo_ws_getter", None)
+        if callable(fn):
+            try:
+                return fn() or ""
+            except Exception:
+                return ""
+        return ""
+
+    def bind_seewo(self, page_getter=None, ws_getter=None):
+        """主窗口起来后注入依赖（幂等，可重复调用 —— 换工作区要再调一次）。"""
+        if page_getter is not None:
+            self._seewo_page_getter = page_getter
+        if ws_getter is not None:
+            self._seewo_ws_getter = ws_getter
+        p = getattr(self, "seewo_panel", None)
+        if p is not None:
+            try:
+                p.reload()
+            except Exception:
+                pass
+        return p
+
+    def reload_seewo(self):
+        """外部改了配置（或换了工作区）→ 让面板重读一遍。"""
+        p = getattr(self, "seewo_panel", None)
+        if p is not None:
+            try:
+                p.reload()
+            except Exception:
+                pass
+
     # ---------------- 提示词 ----------------
     def _tab_prompt(self):
         page = QWidget()
@@ -2504,6 +2785,8 @@ class SettingsPage(QWidget):
             self.gh_token_edit.setText(str(s.get("github_token", "") or ""))
         except Exception:
             pass
+        # ★ v9.22.12：钉钉自动回复（老设置里没有这些键 → 用 IM 默认值补齐）
+        self._load_im_reply(s)
 
     def _save(self):
         s = dict(self._settings)
@@ -2529,6 +2812,11 @@ class SettingsPage(QWidget):
         s["deepseek_web_auto"] = self.web_auto_cb.isChecked()
         s["deepseek_web_silent"] = self.web_silent_cb.isChecked()
         s["github_token"] = self.gh_token_edit.text().strip()
+        # ★ v9.22.12：钉钉自动回复的 6 个键
+        #   ① 进本页设置（settings.json，跟着「保存全部设置」链路走）
+        #   ② 同步写进工作区的 im_settings.json（自动回复真正读的那份）
+        s.update(self._im_cfg())
+        self._save_im_reply()
         keys = dict(s.get("api_keys") or {})
         for name, e in self.key_edits.items():
             keys[name] = e.text().strip()

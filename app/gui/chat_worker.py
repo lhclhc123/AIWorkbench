@@ -7,7 +7,8 @@ import threading
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from .. import llm_client, agent as agent_mod
+from .. import llm_client, agent as agent_mod, config
+from ..stream_filter import StreamDsmlFilter
 
 
 # 最终答复里「算得上真实验证证据」的标志。
@@ -248,6 +249,10 @@ class ChatWorker(QThread):
         self.plan = dict(plan) if plan else {"steps": []}
         self._abort = False
         self._answering = False          # 本轮是否已经开始吐字（给状态行用）
+        # ★ v9.22.x：流式 DSML 状态机 —— 跨 token 的半截标签
+        #   （`<｜｜DSM`、`<｜｜DSML｜｜ para`）不能上屏；确认不是标签的字符
+        #   会立刻补发，正文一个字都不丢。desktop 与 Web 共用（都吃 token 信号）。
+        self._stream_filter = StreamDsmlFilter()
         self._confirm_event = threading.Event()
         self._confirm_res = False
         # ★ v9.17.0 向用户提问：工具跑在 worker 线程里，要靠"信号 + 事件"把问题
@@ -307,6 +312,12 @@ class ChatWorker(QThread):
             3) 把"等用户确认 / 等用户回答"的事件放行，别让后台还傻等着超时。
         """
         self._abort = True
+        # ★ v9.22.x：停止后不再往外吐字，状态机里扣着的半截也一并丢弃，
+        #   免得下一轮/下一段流把它当成正文补发。
+        try:
+            self._stream_filter.reset()
+        except Exception:                       # noqa: BLE001
+            pass
         try:
             cb = getattr(self.client, "cancel", None)
             if callable(cb):
@@ -487,11 +498,37 @@ class ChatWorker(QThread):
     def _on_token(self, delta: str):
         if self._abort:
             return
+        text = "" if delta is None else str(delta)
+        # ★ v9.22.x：流式增量先过 DSML 状态机。
+        #   以前这里直接 emit 原始 delta，半截标签（<｜｜DSM / <｜｜DSML｜｜ para）
+        #   会先上屏 —— 用户看到的就是"生成过程中大批量滚出这种代码"。
+        #   ⚠ STREAM_RESET（换端点/模型重试的"作废重来"标记）必须原样透传，
+        #     同时把过滤器里扣着的半截内容一起作废。
+        if config.is_stream_reset(text):
+            self._stream_filter.reset()
+            self.token.emit(text)
+            return
+        safe = self._stream_filter.feed(text)
+        if not safe:
+            return               # 全被暂扣（可能正在等一个标签头），先不吐字
         # 第一个字到了：状态行从「正在调用模型」切到「正在生成回复」
         if not self._answering:
             self._answering = True
             self.phase.emit("answer", "")
-        self.token.emit(delta)
+        self.token.emit(safe)
+
+    def _flush_stream(self):
+        """流式结束：把状态机扣住的最后一点正文放出来（冲之前过一遍 strip_dsml）。"""
+        try:
+            tail = self._stream_filter.flush()
+        except Exception:                       # noqa: BLE001
+            tail = ""
+        if not tail:
+            return
+        if not self._answering:
+            self._answering = True
+            self.phase.emit("answer", "")
+        self.token.emit(tail)
 
     def _after_chat(self):
         """把 LLM 客户端攒下的提示（模型被切换等）转给界面，然后清掉。"""
@@ -538,7 +575,10 @@ class ChatWorker(QThread):
 
     def _clean(self, text):
         """去掉工具调用标记，只留下要给用户看的正文。"""
-        s = re.sub(r"<tool_call>.*?</tool_call>", "", text or "", flags=re.DOTALL)
+        # ★ v9.22.x：DSML（<｜｜DSML｜｜ invoke …>）也必须在最终答复里剥掉，
+        #   否则整段标记会进聊天窗口 / 对话落库 / 钉钉。
+        s = agent_mod.strip_dsml(text or "")
+        s = re.sub(r"<tool_call>.*?</tool_call>", "", s, flags=re.DOTALL)
         s = re.sub(r"<tool_call>.*", "", s, flags=re.DOTALL)
         s = re.sub(r"<tool_?c?a?l?l?\s*$", "", s)
         return s.strip()
@@ -728,6 +768,7 @@ class ChatWorker(QThread):
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
                     on_token=self._on_token, on_reasoning=self._collect_reason)
+                self._flush_stream()        # ★ 流结束：吐出状态机扣住的尾巴
                 self._after_chat()
                 clean = self._clean(text)
                 # 有真思维链就先留一块「深度思考」（单轮问答也能有 CoT）
@@ -791,6 +832,7 @@ class ChatWorker(QThread):
                 text = self.client.chat(
                     self.api_messages, self.model_sel, self.enable_search,
                     on_token=self._on_token, on_reasoning=self._collect_reason)
+                self._flush_stream()        # ★ 流结束：吐出状态机扣住的尾巴
                 self._after_chat()
                 _reason = self._take_reason()   # 本轮的思维链（无则空串）
                 if not text:
@@ -982,7 +1024,13 @@ class ChatWorker(QThread):
                             continue
                     # 所有检查通过 -> 这才是最终答复。若它仍在"对着系统说明表态"，
                     # 换成基于真实工具结果的收尾，绝不把废话交给用户。
-                    final = self._clean(text) or text
+                    final = self._clean(text)
+                    if not final:
+                        # ★ v9.22.x：整段都是 DSML / tool_call 标记时，老写法
+                        #   `self._clean(text) or text` 会把**原始标签**当成最终答复
+                        #   交给用户（正是用户看到的"正文里全是 DSML"）。这里改成
+                        #   用真实工具产出的摘要兜底，绝不回退到原文。
+                        final = self._fallback_summary()
                     # ★★ 程序级「跑 -> 失败 -> 回灌真实报错 -> 让它修 -> 再跑」闭环 ★★
                     #   不依赖模型自觉：只要这轮是「开发一个成品」且真的写过代码，
                     #   系统就自己把程序跑起来。跑不过 -> 把**真实报错**塞回上下文，
@@ -1256,6 +1304,7 @@ class ChatWorker(QThread):
                     text = self.client.chat(self.api_messages, self.model_sel,
                                             self.enable_search, on_token=self._on_token,
                                             on_reasoning=self._collect_reason)
+                    self._flush_stream()    # ★ 流结束：吐出状态机扣住的尾巴
                     self._after_chat()
                     _reason = self._take_reason()
                     if _reason and text:

@@ -554,9 +554,20 @@ def strip_team_noise(text):
     if not text:
         return ""
     s = str(text)
-    s = _RE_DSML_CALLS.sub("", s)
-    s = _RE_DSML_INVOKE.sub("", s)
-    s = _RE_DSML_PARAM.sub("", s)
+    # ★ v9.22.x：DSML 标记统一复用 app.agent.strip_dsml（全项目唯一的实现）。
+    #   本文件按设计**不在模块级 import agent**（可能成环），所以这里延迟 import；
+    #   万一 import 失败就退回下面本文件自带的正则兜底（老行为不变）。
+    #   注意：strip_dsml 只处理 DSML 标记 —— 团队专属文案仍由本函数后面的逻辑剥离。
+    try:
+        from .agent import strip_dsml as _strip_dsml
+    except Exception:                       # noqa: BLE001
+        _strip_dsml = None
+    if _strip_dsml is not None:
+        s = _strip_dsml(s)
+    else:
+        s = _RE_DSML_CALLS.sub("", s)
+        s = _RE_DSML_INVOKE.sub("", s)
+        s = _RE_DSML_PARAM.sub("", s)
     s = _RE_TOOL_BLOCK.sub("", s)
     s = _RE_TOOL_BODY.sub("", s)
     s = _RE_TOOL_JSON.sub("", s)

@@ -45,6 +45,13 @@ DEFAULT_MODE = "group_bot"
 
 # 界面上「自动回复设置」那一页的东西，全部落在 `<root>/im_settings.json`
 IM_SETTINGS_FILE = "im_settings.json"
+
+# ★ v9.22.12（主任场景）：三档回复模式。**别改名**，界面与日志都按这几个值存。
+IM_REPLY_MODES = ("off", "confident_only", "always")
+DEFAULT_REPLY_MODE = "confident_only"
+DEFAULT_FALLBACK_TEXT = "收到，我稍后回复您。"
+DEFAULT_ACK_TEXT = "好的"
+
 IM_DEFAULT_SETTINGS = {
     "scope_group": True,       # 自动回复范围：群聊
     "scope_p2p": True,         # 自动回复范围：单聊
@@ -61,13 +68,29 @@ IM_DEFAULT_SETTINGS = {
     #   往班级群发了消息。现在必须用户显式打开 `auto_send`，并且白名单非空。
     "auto_send": False,        # 自动代回总开关（默认关）
     "auto_send_max": 20,       # 单日自动发送上限（熔断用）
+    # ---- ★ v9.22.12 主任场景：自动回复的「敢不敢发」三档 + 兜底话术 ----
+    # off             = 不自动回复
+    # confident_only  = 只有 AI 明确知道答案才回（拿不准就兜底 / 不发）
+    # always          = 模型说什么就发什么
+    "im_reply_mode": DEFAULT_REPLY_MODE,
+    "im_fallback_text": DEFAULT_FALLBACK_TEXT,     # 不确定时的统一兜底话术
+    "im_fallback_enabled": True,   # 不确定时发兜底（False=完全不发）
+    "im_notify_ack_enabled": True,  # 通知类消息是否自动回一句
+    "im_notify_ack_text": DEFAULT_ACK_TEXT,        # 通知类回执文案（用户要求默认「好的」）
+    "im_notify_keywords": "",      # 自定义通知关键词（逗号/换行分隔，追加到内置表）
 }
 
 # 布尔 / 整数 / 纯文本 三类 key，set_settings 时分别处理
 _SETTING_BOOLS = ("scope_group", "scope_p2p", "scope_at_me",
-                  "reply_uncertain", "scanned", "auto_send")
+                  "reply_uncertain", "scanned", "auto_send",
+                  "im_fallback_enabled", "im_notify_ack_enabled")
 _SETTING_INTS = ("delay_seconds", "interval", "auto_send_max")
-_SETTING_TEXTS = ("uncertain_text", "identity")
+_SETTING_TEXTS = ("uncertain_text", "identity",
+                  "im_fallback_text", "im_notify_ack_text", "im_notify_keywords")
+# 回复模式是**枚举**，不能走上面三类，单独归一
+_SETTING_ENUMS = {"im_reply_mode": IM_REPLY_MODES}
+
+_MAX_NOTIFY_KEYWORDS_LEN = 2000      # 手滑粘一篇文章进来也别把设置文件撑爆
 
 
 def _now():
@@ -457,8 +480,26 @@ class IMStore:
                         "kind": kind})
         return out
 
+    @staticmethod
+    def _clean_reply_mode(raw):
+        """回复模式归一：认不出来的值一律退回 `confident_only`（保守优先）。"""
+        mode = str(raw or "").strip().lower()
+        return mode if mode in IM_REPLY_MODES else DEFAULT_REPLY_MODE
+
+    @staticmethod
+    def _clean_short_text(raw, default=""):
+        """单行话术：去首尾空白、压掉换行；空值退回默认（避免发出空消息）。"""
+        text = str(raw if raw is not None else "").replace("\r", " ").replace("\n", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or str(default or "")
+
     def settings(self):
-        """默认值 + 文件里的值（只认 IM_DEFAULT_SETTINGS 里有的 key）。"""
+        """默认值 + 文件里的值（只认 IM_DEFAULT_SETTINGS 里有的 key）。
+
+        ★ v9.22.12：**向后兼容是硬要求** —— 老 `im_settings.json` 里没有
+        `im_reply_mode` / `im_fallback_*` / `im_notify_*` 这些键时，这里直接
+        用 `IM_DEFAULT_SETTINGS` 的默认值补齐，绝不 KeyError、绝不返回 None。
+        """
         raw = self._read_json(self.settings_file, {})
         s = {}
         for k, v in IM_DEFAULT_SETTINGS.items():
@@ -480,6 +521,8 @@ class IMStore:
                     s[k] = bool(v)
                 elif k in _SETTING_TEXTS:
                     s[k] = "" if v is None else str(v)
+                elif k in _SETTING_ENUMS:
+                    s[k] = self._clean_reply_mode(v)
         # 越界的值读出来也纠正，避免手改文件改出个负数
         s["delay_seconds"] = max(0, min(3600, int(s.get("delay_seconds") or 0)))
         s["interval"] = max(10, min(600, int(s.get("interval") or 25)))
@@ -496,6 +539,16 @@ class IMStore:
         #   当成可回复（用户反馈的「群里什么话都回」）。现在**群聊只回 @ 我**是铁律，
         #   这个开关只用于兼容老配置，读出来一律纠正成 True。
         s["scope_at_me"] = True
+        # ★ v9.22.12：新键的类型/取值也在这里统一纠正（老文件没有 → 拿到默认值）
+        s["im_reply_mode"] = self._clean_reply_mode(s.get("im_reply_mode"))
+        s["im_fallback_enabled"] = bool(s.get("im_fallback_enabled", True))
+        s["im_notify_ack_enabled"] = bool(s.get("im_notify_ack_enabled", True))
+        s["im_fallback_text"] = self._clean_short_text(
+            s.get("im_fallback_text"), DEFAULT_FALLBACK_TEXT)
+        s["im_notify_ack_text"] = self._clean_short_text(
+            s.get("im_notify_ack_text"), DEFAULT_ACK_TEXT)
+        s["im_notify_keywords"] = str(s.get("im_notify_keywords") or "").strip()
+        s["im_notify_keywords"] = s["im_notify_keywords"][:_MAX_NOTIFY_KEYWORDS_LEN]
         return s
 
     def set_settings(self, **kw):
@@ -521,10 +574,20 @@ class IMStore:
                     cur[k] = max(1, min(200, int(v)))
                 except Exception:
                     continue
+            elif k in _SETTING_ENUMS:
+                cur[k] = self._clean_reply_mode(v)
             elif k in _SETTING_BOOLS:
                 cur[k] = bool(v)
             elif k in _SETTING_TEXTS:
-                cur[k] = "" if v is None else str(v)
+                if k == "im_fallback_text":
+                    cur[k] = self._clean_short_text(v, DEFAULT_FALLBACK_TEXT)
+                elif k == "im_notify_ack_text":
+                    cur[k] = self._clean_short_text(v, DEFAULT_ACK_TEXT)
+                elif k == "im_notify_keywords":
+                    cur[k] = str(v if v is not None else "").strip()[
+                        :_MAX_NOTIFY_KEYWORDS_LEN]
+                else:
+                    cur[k] = "" if v is None else str(v)
         self._write_json(self.settings_file, cur)
         return cur
 

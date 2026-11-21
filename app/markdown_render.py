@@ -44,6 +44,9 @@ _LANG_CHARS_RE = re.compile(r"[A-Za-z0-9+#._-]*")
 #    这里保留同名别名，纯粹是为了不破坏既有引用。
 from .agent import TOOL_BLOCK_RE as _TOOL_RE              # noqa: E402
 from .agent import TOOL_BODY_RE as _TOOL_XMLARG_RE        # noqa: E402
+# ★ v9.22.x：DSML 标记（<｜｜DSML｜｜ invoke …>）也必须在这里兜一层 ——
+#   气泡正文 / 流式渲染最终都汇到本模块，这是"标签绝不上屏"的最后一道闸。
+from .agent import strip_dsml as _strip_dsml_text         # noqa: E402
 
 # 缓存容量：代码高亮条数 / 整段渲染条数
 # ★ v9.20.0：整段渲染原来是 8 条、而且**拿正文当 key** —— 切走再切回一个长
@@ -94,7 +97,9 @@ def _strip_tool_call(text: str) -> str:
     """
     if not text:
         return text
-    return _TOOL_XMLARG_RE.sub("", _TOOL_RE.sub("", text))
+    # 先清 DSML（它自带"整块吃到闭合标签"的逻辑，不会误吃正文），
+    # 再走老的两条 tool_call 正则。
+    return _TOOL_XMLARG_RE.sub("", _TOOL_RE.sub("", _strip_dsml_text(text)))
 
 # 预解析 Pygments 默认风格的 类->样式 映射（内联用）
 _FMT = HtmlFormatter(nowrap=True, style="default")

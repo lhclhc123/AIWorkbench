@@ -35,6 +35,25 @@ GRACE_NO_DRAFT = 90    # 预取失败/超时后，再多等这么久就发兜底
 MAX_STATES = 200       # 同时在等的会话上限（防御性，正常远小于这个）
 
 
+def _strip_dsml_text(text):
+    """清掉模型回复里的 DSML 工具标签（统一走 app.agent.strip_dsml）。
+
+    ★ v9.22.x：用户反馈钉钉消息正文里直接出现了
+      `<｜｜DSML｜｜ calls>` / `<｜｜DSML｜｜ invoke …>`。预取的草稿是模型的
+      原始输出，入库前必须清一遍；这里清了，发送侧（dingtalk）还有第二道。
+
+    ⚠ 本模块设计上不 import 任何重模块，所以延迟 import；失败就原样返回
+      （清洗失败不能把回复弄丢）。
+    """
+    if not text:
+        return text
+    try:
+        from ..agent import strip_dsml
+        return strip_dsml(text)
+    except Exception:                       # noqa: BLE001
+        return text
+
+
 class ReplyPipeline:
     """按时序编排"预取 → 等待 → 判定 → 发送"。"""
 
@@ -155,7 +174,56 @@ class ReplyPipeline:
         if st["tries"] < self.max_merge:
             st["draft"] = ""
         st["dirty"] = True
+        # ★ v9.22.12：通知类消息（请假/会议/检查/调课…）额外走「置顶 + 必须
+        #   点确认」链路：识别 → 落盘 → 投屏。**不影响上面任何回复时序**：
+        #   note_message 内部整段 try/except，通知链路出问题也不会让回复挂掉。
+        self.note_message(msg, text=text, cid=cid, ts=ts)
         return st
+
+    # ------------------------------------------------------------------
+    # 通知类消息（v9.22.12）
+    # ------------------------------------------------------------------
+    def note_message(self, msg, text="", cid="", ts=None):
+        """把一条消息交给通知中心（识别 → 落盘 → 投递到屏幕）。
+
+        用户需求：「将通知类消息置顶并投送到电脑屏幕直接显示，需点击确认后才能
+        关闭」。这一段**只管通知**，不参与代回判定，也不改任何状态。
+
+        Args:
+            msg: 原始消息 dict（`cid/conv/sender/msgid/text/recv_ts`）。
+            text: 正文（不传就从 msg 里取）。
+            cid: 会话 id（不传就从 msg 里取）。
+            ts: 收到时刻（不传就用 msg.recv_ts，再不行用当前时间）。
+
+        Returns:
+            dict|None —— 落盘后的通知记录；不是通知 / 失败都返回 None。
+
+        Note:
+            主窗口在「自动回复关着」的路径上也可以直接调
+            `self.im_pipe.note_message(msg)` —— 通知与是否代回是两件独立的事。
+        """
+        msg = msg if isinstance(msg, dict) else {}
+        try:
+            body = str(text or msg.get("text") or "").strip()
+            if not body:
+                return None
+            rec = {
+                "conv_id": str(cid or msg.get("cid") or msg.get("conv_id") or ""),
+                "conv_title": str(msg.get("conv_title") or msg.get("conv") or ""),
+                "sender": str(msg.get("sender") or ""),
+                "msgid": str(msg.get("msgid") or ""),
+                "text": body,
+                "ts": float(ts or msg.get("recv_ts") or 0) or time.time(),
+            }
+            from . import notify_center      # 延迟导入：不拖慢模块加载
+            return notify_center.deliver(rec)
+        except Exception as exc:
+            try:
+                self.log("通知投递失败（不影响回复）：%s: %s"
+                         % (type(exc).__name__, exc))
+            except Exception:
+                pass
+            return None
 
     # ------------------------------------------------------------------
     # 预取
@@ -211,7 +279,7 @@ class ReplyPipeline:
             st["dirty"] = True
             self.log("预取结果已过时（%s 又来新消息），重新拉一次" % cid)
             return
-        body = str(text or "").strip()
+        body = _strip_dsml_text(str(text or "")).strip()
         if body:
             st["draft"] = body
             st["draft_ts"] = self.now()

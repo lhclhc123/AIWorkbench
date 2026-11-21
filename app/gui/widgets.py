@@ -141,10 +141,20 @@ def tool_label(content):
 
 
 def strip_tool_markup(text):
-    """去掉流式文本里的 <tool_call>...</tool_call>（含只输出了一半的尾巴）。"""
+    """去掉流式文本里的 <tool_call>...</tool_call>（含只输出了一半的尾巴）。
+
+    ★ v9.22.x：DeepSeek 的 DSML 标记也一并剥掉（用户实测流式正文里会直接
+      显示 `<｜｜DSML｜｜ invoke …>`）。清洗实现统一走 app.agent.strip_dsml，
+      这里延迟 import，避免 gui 模块在极端情况下把 agent 的依赖带进来。
+    """
     if not text:
         return ""
-    s = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
+    try:
+        from ..agent import strip_dsml
+        s = strip_dsml(text)
+    except Exception:                       # noqa: BLE001
+        s = text
+    s = re.sub(r"<tool_call>.*?</tool_call>", "", s, flags=re.DOTALL)
     s = re.sub(r"<tool_call>.*", "", s, flags=re.DOTALL)
     s = re.sub(r"<tool_?c?a?l?l?$", "", s)
     return s.strip()

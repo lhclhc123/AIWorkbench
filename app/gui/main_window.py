@@ -20,9 +20,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton,
     QScrollArea, QFrame, QLabel, QMessageBox, QApplication,
     QStackedWidget, QFileDialog, QTextEdit, QComboBox, QDialog,
-    QSystemTrayIcon, QMenu, QSplitter,
+    QSystemTrayIcon, QMenu, QSplitter, QGraphicsOpacityEffect,
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import (Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation,
+                          QEvent, QEasingCurve)
 from PyQt6.QtGui import QKeySequence, QShortcut, QTextCursor, QGuiApplication
 
 from .. import (config, llm_client, workspace as ws_mod, agent as agent_mod,
@@ -74,6 +75,195 @@ _NO_MODAL = bool(os.environ.get("AIWORKBENCH_TEST"))
 
 # 只读命令（查版本、列目录、看 git 状态…）不弹确认框，直接放行。
 _is_readonly_command = agent_mod.is_readonly_command
+
+
+class ScanCapsule(QWidget):
+    """全局右上角的「扫描进度」悬浮胶囊（v9.22.12）。
+
+    用户原话：「进度条想更新的进度条一样，全局右上角显示」。要求：
+      * 无边框、半透明圆角，浮在主窗口内容区右上角（不是对话框里）；
+      * 一行写完：``扫描中 12/57 · 当前会话名 · 1.2 MB/s``；
+      * 右侧 ``×`` = 停止（等价于点「停止助理」）；
+      * 完成后停留 2 秒显示「扫描完成 · 共 N 条」再淡出；被停止显示「已停止」；
+      * 主窗口最小化 / 隐藏时不显示，但**状态保留**，下次显示时补上。
+
+    ⚠ 本仓库铁律：``setVisible(True)`` 必须放在 ``addWidget`` / 给定父控件**之后**，
+    否则控件会在那一瞬间变成一个真实顶层窗口（闪一下又消失）。
+    所以本类只在 `__init__(parent)` 里带父控件创建，`show_state()` 里才 show()。
+    """
+
+    stop_clicked = pyqtSignal()
+    # 文案变长/变短后宽度会变，通知主窗口重新贴右上角
+    size_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ScanCapsule")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 不抢焦点：胶囊只做展示，点它不该把输入框的焦点弄丢
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFixedHeight(36)
+        self.setStyleSheet(
+            "#ScanCapsule{background:rgba(24,28,34,205);"
+            "border:1px solid rgba(255,255,255,34);border-radius:18px;}"
+            "#ScanCapsule QLabel{background:transparent;color:#eef3f8;"
+            "font-size:12px;}")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 3, 5, 3)
+        lay.setSpacing(8)
+        self.dot = QLabel("●")
+        self.dot.setStyleSheet("color:#5ac8fa;font-size:11px;")
+        lay.addWidget(self.dot)
+        self.lab_main = QLabel("扫描中")
+        self.lab_main.setStyleSheet("color:#ffffff;font-size:12px;font-weight:bold;")
+        lay.addWidget(self.lab_main)
+        self.lab_sub = QLabel("")
+        self.lab_sub.setStyleSheet("color:#c8d2dc;font-size:12px;")
+        lay.addWidget(self.lab_sub)
+        self.btn_stop = QPushButton("×")
+        self.btn_stop.setFixedSize(26, 26)
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setToolTip("停止扫描（等价于点「停止助理」）")
+        self.btn_stop.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,26);color:#ffffff;"
+            "border:none;border-radius:13px;font-size:16px;font-weight:bold;}"
+            "QPushButton:hover{background:rgba(255,90,90,190);}")
+        self.btn_stop.clicked.connect(self.stop_clicked.emit)
+        lay.addWidget(self.btn_stop)
+
+        # 状态（隐藏时也要记住，恢复窗口后补显示）
+        self._busy = False
+        self._done_text = ""
+        self._main_text = "扫描中"
+        self._sub_text = ""
+
+        # 淡出动画
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._anim = QPropertyAnimation(self._effect, b"opacity", self)
+        self._anim.setDuration(320)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.finished.connect(self._on_fade_done)
+        self._fading = False
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._fade_out)
+
+        # 创建时先藏起来（此时父控件已给，不会变成顶层窗口）
+        super().setVisible(False)
+
+    # ---------- 对外接口 ----------
+    def show_progress(self, i, n, name="", speed_bps=0.0):
+        """更新进度并显示（主窗口隐藏时只记状态，不真的弹出来）。"""
+        self._busy = True
+        self._done_text = ""
+        self._main_text = "扫描中 %d/%d" % (int(i), int(n)) if n else "扫描中"
+        parts = []
+        if name:
+            parts.append(str(name))
+        if speed_bps and speed_bps > 0:
+            parts.append(assistant_mod.human_speed(speed_bps))
+        self._sub_text = " · ".join(parts)
+        self._render()
+        self._reveal()
+
+    def show_message(self, text, busy=False):
+        """只显示一条文字（例如「正在测速…」）。"""
+        self._busy = bool(busy)
+        self._main_text = str(text or "")
+        self._sub_text = ""
+        self._done_text = ""
+        self._render()
+        self._reveal()
+
+    def finish(self, text, seconds=2.0):
+        """完成后停留 N 秒再淡出（被停止时也走这里，只是文案不同）。"""
+        self._busy = False
+        self._main_text = str(text or "扫描完成")
+        self._sub_text = ""
+        self._done_text = self._main_text
+        self.dot.setStyleSheet("color:#34c759;font-size:11px;")
+        self._render()
+        self._reveal()
+        self._hide_timer.start(int(max(0.2, float(seconds)) * 1000))
+
+    def stop_now(self):
+        """立刻收起（用户点停止 → 界面必须马上回到空闲态）。"""
+        self._hide_timer.stop()
+        self._anim.stop()
+        self._fading = False
+        self._busy = False
+        self._done_text = ""
+        super().setVisible(False)
+        self._effect.setOpacity(1.0)
+
+    def is_busy(self):
+        return bool(self._busy)
+
+    # ---------- 内部 ----------
+    def _render(self):
+        self.lab_main.setText(self._main_text)
+        self.lab_sub.setText(self._sub_text)
+        self.lab_sub.setVisible(bool(self._sub_text))
+        self.dot.setStyleSheet(
+            "color:%s;font-size:11px;" % ("#5ac8fa" if self._busy else "#34c759"))
+        # 宽度跟着内容走（上限避免长会话名把胶囊拉横）
+        hint = self.sizeHint()
+        self.setFixedWidth(max(180, min(520, hint.width())))
+        # 宽度变了 → 让主窗口重新摆位（否则文案变长会溢出右边界）
+        try:
+            self.size_changed.emit()
+        except Exception:
+            pass
+
+    def _reveal(self):
+        """真正的 show 只在这里发生（父控件已存在）。"""
+        if not self._can_show():
+            return
+        self._hide_timer.stop()
+        self._anim.stop()
+        self._fading = False
+        self._effect.setOpacity(1.0)
+        if not super().isVisible():
+            super().setVisible(True)
+        self.raise_()
+
+    def _can_show(self):
+        """窗口最小化 / 隐藏 / 收进托盘时不弹（状态仍保留）。"""
+        try:
+            win = self.window()
+            if win is None:
+                return False
+            if win.isMinimized() or not win.isVisible():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _fade_out(self):
+        if self._fading:
+            return
+        self._fading = True
+        self._anim.stop()
+        self._anim.setStartValue(max(0.0, float(self._effect.opacity())))
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def _on_fade_done(self):
+        if not self._fading:
+            return
+        self._fading = False
+        super().setVisible(False)
+        self._effect.setOpacity(1.0)
+        # 淡出即代表这次扫描的展示结束；否则恢复窗口时会再次弹出旧文案
+        self._done_text = ""
+
+    def restore_if_needed(self):
+        """主窗口重新显示 / 从最小化恢复时补上胶囊（状态还留着）。"""
+        if self._busy or self._done_text:
+            self._reveal()
 
 
 class TitleWorker(QThread):
@@ -500,6 +690,18 @@ class MainWindow(QMainWindow):
         self._card_collapsed = {}
         # 重建后要恢复的滚动位置：(是否贴底, 旧值)
         self._pending_scroll = (True, 0)
+        # ★ v9.22.12（⑥）：切/开对话后必须**从最底部**开始显示。
+        #   `_stick_next_render` 一次性生效：下一次渲染无条件贴底（不吃"当前是否贴底"）。
+        self._stick_next_render = True
+        # 用户当前是否"贴着底"：流式追加时只有在贴底才自动跟随（原有行为）；
+        # 由 verticalScrollBar().valueChanged 维护，rangeChanged 时用它补一次贴底。
+        self._follow_bottom = True
+        # 「加载更早」进行中：禁止 rangeChanged 把视线拽回底部
+        self._restoring_history = False
+        # ★ v9.22.12（⑦）：工具卡片渲染用的本次调用上下文（名字/参数/开始时间）
+        self._tool_ctx = {}
+        # 标签扫描的增量结果缓存 {cid: row}（②）
+        self._im_scan_rows = {}
         # 助理：钉钉消息 -> AI 处理 -> 结果发回钉钉
         # ★ v9.18.0（需求 8）：配置文件跟其它内部数据一起收进 `.awb/`，
         #   工作区根目录只留产物（见 workspace._migrate_layout）。
@@ -979,46 +1181,11 @@ class MainWindow(QMainWindow):
         self._quit_requested = True
         self.close()
 
-    def closeEvent(self, event):
-        """默认「关窗口 = 收进托盘」，真正退出走托盘菜单的退出。"""
-        try:
-            self.scheduler.stop()
-            self.scheduler.save()
-        except Exception:
-            pass
-        for hk in getattr(self, "hotkeys", []) or []:
-            try:
-                hk.stop()
-            except Exception:
-                pass
-        if (self.tray is not None and not self._quit_requested
-                and self.settings.get("tray_on_close", True)):
-            event.ignore()
-            self.hide()
-            try:
-                self.tray.showMessage(
-                    ver.APP_NAME, "已收进托盘，按 "
-                    + (self.settings.get("hotkey_show") or "Ctrl+Alt+Space")
-                    + " 随时叫回来。",
-                    QSystemTrayIcon.MessageIcon.Information, 4000)
-            except Exception:
-                pass
-            return
-        try:
-            if self.tray is not None:
-                self.tray.hide()
-        except Exception:
-            pass
-        # 真正退出：收拾 DeepSeek 网页通道（停本机服务 / 断开 CDP / 关掉我们拉起的浏览器）
-        try:
-            self._dsw_timer.stop()
-        except Exception:
-            pass
-        try:
-            self.dsw.shutdown()
-        except Exception:
-            pass
-        event.accept()
+    # ★ v9.22.12：这里原本还有一份 `closeEvent`（"关窗口 = 收进托盘"那版）。
+    #   同一个类里定义两次，后定义的必然覆盖前一个 —— 于是真正生效的是文件
+    #   末尾那份只做落盘 + super().closeEvent() 的版本，点 X 直接退进程：
+    #   「收进托盘」设置形同虚设、定时任务当场全停、钉钉不再收消息。
+    #   现已合并到文件末尾的 `closeEvent`（全类只留一处）。**别在这里再加回来。**
 
     # ================= 主题 =================
     def _apply_theme(self):
@@ -1374,6 +1541,40 @@ class MainWindow(QMainWindow):
         # 面板顶部的「✕ 收起」= 折叠这一栏（网页不销毁、登录态保留）
         self.page_browser.back_requested.connect(self.hide_browser)
 
+        # ★ v9.22.12（④）：全局右上角的扫描进度悬浮胶囊。
+        #   ⚠ 用 `ScanCapsule(父控件)` 创建 —— 父控件在构造时就给了，
+        #     之后 `show()` 才不会瞬间变成独立顶层窗口（本仓库铁律）。
+        #     它不参与任何 Layout，位置在 `_place_scan_capsule()` 里按窗口尺寸算。
+        self.scan_capsule = ScanCapsule(self.centralWidget())
+        self.scan_capsule.stop_clicked.connect(self._on_scan_capsule_stop)
+        self.scan_capsule.size_changed.connect(self._place_scan_capsule)
+        self.scan_capsule.hide()
+        self._place_scan_capsule()
+
+        # ★ v9.22.12：钉钉通知中心（通知类消息 → 置顶 + 投屏 + 必须点确认）。
+        #   ⚠ 必须放在 __init__ 末尾：attach 要按主窗口当前的屏幕几何摆弹窗，
+        #     太早的话窗口还没 size，弹窗会摆到屏幕左上角去。
+        try:
+            from . import notify_popup
+            self.notify_center = notify_popup.attach(self)
+        except Exception as exc:                      # noqa: BLE001
+            self.notify_center = None
+            try:
+                self._safe_asst_log("通知中心挂载失败：%s: %s"
+                                    % (type(exc).__name__, exc))
+            except Exception:
+                pass
+
+        # ★ v9.22.12：希沃面板的两个懒取值函数。
+        #   page_getter 传的是 ensure=False 的那版 —— 只是点开设置页，
+        #   不该顺手把 Chromium 拉起来（一百多 MB / 几百毫秒）。
+        try:
+            self.page_settings.bind_seewo(
+                page_getter=self._seewo_page_now,
+                ws_getter=lambda: (getattr(self.workspace, "path", "") or ""))
+        except Exception:
+            pass
+
         self.statusBar().showMessage("就绪")
 
     # ================= 对话页 =================
@@ -1439,6 +1640,13 @@ class MainWindow(QMainWindow):
         self.chat_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.chat_scroll.setWidget(self.chat_container)
         right.addWidget(self.chat_scroll, 1)
+        # ★ v9.22.12（⑥）：滚动跟随状态。
+        #   · valueChanged：用户手动上滑 → 不再自动跟随（原有行为）；
+        #   · rangeChanged：图片 / 代码块 / 字体异步撑高后范围会变，贴底时补一次，
+        #     否则「打开对话先显示在中间，过一会儿才到底」。
+        _sb = self.chat_scroll.verticalScrollBar()
+        _sb.valueChanged.connect(self._on_chat_scrolled)
+        _sb.rangeChanged.connect(self._on_chat_range_changed)
 
         self.plan_panel = PlanPanel()
         right.addWidget(self.plan_panel)
@@ -1897,8 +2105,11 @@ class MainWindow(QMainWindow):
             #   历史消息重建时就退化成孤零零的「工具」两个字（用户明确投诉）。
             #   think 消息同理带上 label，方便前端区分多轮思考。
             meta = {"model": m.get("_model", "")}
+            text = str(content)
             if r == "tool":
                 nm = str(m.get("name") or m.get("tool") or "")
+                if not nm:
+                    nm = self._tool_name_from_content(text)
                 if nm:
                     meta["name"] = nm
                 a = m.get("args")
@@ -1906,10 +2117,22 @@ class MainWindow(QMainWindow):
                     a = m.get("arguments")
                 if a not in (None, "", {}, []):
                     meta["args"] = a
+                try:
+                    secs = float(m.get("_elapsed") or m.get("elapsed") or 0)
+                except Exception:
+                    secs = 0.0
+                if secs > 0:
+                    meta["duration"] = "%.1fs" % secs
+                # ★ v9.22.12（⑦）：展开区（tool-capsule 的 <pre>）拿的是 text。
+                #   只要 text 为空，展开就是一片空白（用户："点展开怎么什么都没有"）。
+                #   统一拼成「工具 / 参数 / 状态 / 耗时 / 结果」的结构化正文，
+                #   空项显式占位 —— 前端不需要改，展开一定有内容。
+                if not text.strip() or (nm and nm not in text and len(text) < 120):
+                    text = self._tool_card_text(m, text)
             out.append({
                 "id": str(m.get("id", "") or ""),
                 "role": r,
-                "text": str(content),
+                "text": text,
                 "meta": meta,
             })
         return out
@@ -3706,6 +3929,86 @@ class MainWindow(QMainWindow):
         """收起右侧浏览器面板（面板顶部 ✕ / 再点一次右边缘窄条）。"""
         self.show_browser(False)
 
+    # ================= 希沃共享屏幕：页面桥（v9.22.12） =================
+    def _seewo_page_now(self, ensure=False):
+        """取内置浏览器的当前页。**只能在主线程调用**（Qt 控件不是线程安全的）。
+
+        Args:
+            ensure: True —— 允许顺手把右侧那一栏展开、把 Chromium 拉起来。
+                    定时任务用这个（那时候没人点过浏览器，pane 还是 None）。
+                    False —— 只拿现成的。设置面板用这个：点开设置不该白吃
+                    一百多 MB 内存，也不该莫名其妙弹出一栏网页。
+
+        Returns:
+            QWebEngineView（可被 `seewo_steps.as_page()` 直接吃）。
+        """
+        bp = getattr(self, "page_browser", None)
+        if bp is None:
+            return None
+        pane = getattr(bp, "pane", None)
+        if pane is None and ensure:
+            try:
+                self.show_browser(True)
+            except Exception:
+                pass
+            pane = getattr(bp, "pane", None)
+        if pane is None:
+            return None
+        try:
+            view = pane.current_view()
+        except Exception:
+            view = None
+        return view or pane
+
+    def _seewo_page_from_any_thread(self, timeout=30.0):
+        """**任意线程**都能调：把取页面的动作送回主线程，等结果。
+
+        为什么非这样不可：`Scheduler` 的 ``share_cb`` 跑在调度线程里，而
+        ``BrowserPage.ensure_pane()`` 要 new 一个 QWebEngineView —— 在非 UI
+        线程里建 Qt 控件在 Windows 上是随机崩，不是每次都崩，所以最难查。
+        """
+        try:
+            if self._on_ui_thread():
+                return self._seewo_page_now(ensure=True)
+        except Exception:
+            pass
+        box, done = {}, threading.Event()
+
+        def _grab():
+            try:
+                box["page"] = self._seewo_page_now(ensure=True)
+            except Exception:
+                box["page"] = None
+            finally:
+                done.set()
+
+        try:
+            self._ui(_grab)
+        except Exception:
+            return None
+        done.wait(float(timeout or 30.0))
+        return box.get("page")
+
+    def _install_seewo_runner(self):
+        """把 ``kind="seewo_share"`` 的定时任务接到 `app/seewo.py` 上。
+
+        每次换工作区都要重装一遍 —— ``make_scheduler_runner`` 把工作区路径
+        闭包进去了（配置去那个工作区的 ``.awb/seewo.json`` 里读）。
+        """
+        try:
+            from .. import seewo as _seewo_mod
+            runner = _seewo_mod.make_scheduler_runner(
+                self._seewo_page_from_any_thread, self.workspace.path)
+            self.scheduler.set_share_runner(runner)
+            return runner
+        except Exception as exc:                     # noqa: BLE001
+            try:
+                self._sched_log("希沃任务接线失败：%s: %s"
+                                % (type(exc).__name__, exc))
+            except Exception:
+                pass
+            return None
+
     def _open_preview_file(self):
         """右侧「预览」小按钮：展开右栏 → 选一个本地文件 → 交给面板预览。
 
@@ -3747,6 +4050,42 @@ class MainWindow(QMainWindow):
         super().showEvent(ev)
         QTimer.singleShot(0, self._apply_browser_split)
         self._sync_browser_chip()
+        # ★ v9.22.12（④）：窗口重新显示 → 把扫描胶囊按当前真实尺寸摆好并补显示
+        self._place_scan_capsule()
+        try:
+            self.scan_capsule.restore_if_needed()
+        except Exception:
+            pass
+
+    def changeEvent(self, ev):                   # noqa: N802（Qt 回调）
+        """最小化 / 恢复：胶囊跟着藏 / 补显示（状态不清）。"""
+        super().changeEvent(ev)
+        if ev is not None and ev.type() == QEvent.Type.WindowStateChange:
+            try:
+                if self.isMinimized():
+                    self.scan_capsule.hide()
+                else:
+                    self._place_scan_capsule()
+                    self.scan_capsule.restore_if_needed()
+            except Exception:
+                pass
+
+    def _place_scan_capsule(self):
+        """把胶囊钉在内容区右上角（不参与布局，纯浮层）。"""
+        cap = getattr(self, "scan_capsule", None)
+        host = self.centralWidget()
+        if cap is None or host is None:
+            return
+        try:
+            cap.adjustSize()
+            w = cap.width()
+            h = cap.height()
+            x = max(8, int(host.width()) - int(w) - 20)
+            y = 10
+            cap.move(x, y)
+            cap.raise_()
+        except Exception:
+            pass
 
     def resizeEvent(self, ev):                   # noqa: N802（Qt 回调）
         """窗口尺寸变化时补一次分栏比例。
@@ -3758,6 +4097,7 @@ class MainWindow(QMainWindow):
         """
         super().resizeEvent(ev)
         self._apply_browser_split()
+        self._place_scan_capsule()
 
     def _on_browser_fetched(self, res):
         """内嵌浏览器「交给 AI 分析当前页」的回执（v9.18.0 需求 2）。
@@ -4815,6 +5155,9 @@ class MainWindow(QMainWindow):
         self.scheduler = _sched_mod.Scheduler(self.workspace.path,
                                              run_cb=self._run_scheduled,
                                              log_cb=self._sched_log)
+        # ★ v9.22.12：希沃共享屏幕的定时执行体（每次换工作区都要重装，
+        #   因为它把工作区路径闭包进去了 —— 配置在 <工作区>/.awb/seewo.json）
+        self._install_seewo_runner()
         self.scheduler.start()
         self.ding.update(self._ding_cfg())
         self.speaker.engine = self.settings.get("tts_engine", "sapi")
@@ -4881,6 +5224,8 @@ class MainWindow(QMainWindow):
         # ★ v9.20.0：新对话 = 分页窗口重算（还没消息，等价于 fold=0）
         self._fold_auto = True
         self._fold_n = 0
+        # ★ v9.22.12（⑥）：新建对话同样要求「从最底部开始」
+        self._stick_next_render = True
         self._conv_gen = int(getattr(self, "_conv_gen", 0)) + 1   # 作废在途的延迟渲染
         self._sync_team_bar()          # ★ v9.18.0（需求 13）：新对话 = 默认不使用团队
         self._render()
@@ -4978,6 +5323,12 @@ class MainWindow(QMainWindow):
             # ★ v9.20.0：新对话进来 = 分页窗口重算（只铺最近一页）
             self._fold_auto = True
             self._fold_n = 0
+            # ★ v9.22.12（⑥）：打开（切换）到任何对话都必须**从最底部**开始显示。
+            #   一次性标志，下一次 _render_full 无条件贴底 —— 即使上一个对话
+            #   当时停在中间（旧实现会把那个位置带过来，用户看到的就是
+            #   「点开对话先显示在中间」）。用户手动往上滚过也照样回到底部，
+            #   因为这是"新打开一个对话"，不是刷新。
+            self._stick_next_render = True
             # ★ v9.18.0（需求 13）：团队选择是**每个对话自己的**（存在 conv["team_id"]），
             #   切过来要把团队条同步成这个对话记的那一支，否则会串台。
             self._sync_team_bar()
@@ -5852,11 +6203,32 @@ class MainWindow(QMainWindow):
 
     # ================= 助理（钉钉消息 -> AI -> 发回钉钉） =================
     def _assistant_toggle(self, start):
+        """启停助理。
+
+        ★ v9.22.12（①）：停止时**同时**停掉正在跑的标签扫描，并且立刻复位界面
+        （按钮文字 / 可用性、进度、状态文字），不等后台 dws 子进程收尾。
+        重复点「停止」是幂等的：状态始终是「未运行」，不会卡在「停止中」。
+        """
         if start:
             self._asst_queue.clear()
             self.assistant.start()
-        else:
-            self.assistant.stop()
+            return
+        scanning = False
+        try:
+            scanning = (bool(self.assistant.scanner.running())
+                        or bool(self.scan_capsule.is_busy()))
+        except Exception:
+            scanning = False
+        # 只有真的在扫描时才走「停止扫描」（避免没扫描也往日志里写一行）
+        if scanning:
+            self._im_scan_stop("已停止")
+        self.assistant.stop()
+        # 双保险：state 信号已经会让页面复位；这里再同步一次，保证 1.5 秒内可交互
+        try:
+            self.page_assistant.set_running(False)
+            self.page_assistant.set_scan_state("已停止")
+        except Exception:
+            pass
 
     # ---------- ★ v9.20.0：IM 助手底座（持久化 / 上下文 / 定时 / 日志本） ----------
     def _init_im(self):
@@ -6429,84 +6801,210 @@ class MainWindow(QMainWindow):
 
     # ---------- 标签页 ----------
     def _im_tag_scan(self):
-        """首次全量扫描：读全部会话 → 让 AI 一个个打关系标签。"""
+        """首次全量扫描：读全部会话 → 让 AI 一个个打关系标签。
+
+        ★ v9.22.12：换成 ``assistant.TagScanService``（后台线程 + 可停止）。
+          · 再点一次按钮 = 停止（幂等），不会「点了没反应」；
+          · 每个会话扫完就 ``partial`` 推一条，界面增量 append（②）；
+          · 官方号在采集前跳过（③）；
+          · 并发度按实测带宽自适应（⑤）；
+          · 进度同时喂给全局右上角胶囊（④）。
+        """
         if getattr(self, "im_store", None) is None:
             return
-        w = getattr(self, "_im_scan_thread", None)
-        if w is not None and w.isRunning():
-            self.page_assistant.set_scan_state("正在扫描中，请稍等…")
+        svc = getattr(self.assistant, "scanner", None)
+        if svc is not None and svc.running():
+            # 正在扫描 → 这个按钮变成「停止」。用户点两次也不会卡住。
+            self._im_scan_stop("已停止（用户取消）")
             return
         if not self.ding.dws_available():
             self.page_assistant.set_scan_state("没找到 dws，先把「集成 → 钉钉」配好")
             self._im_scan_set(busy=False, i=0, n=0, name="",
                               message="没找到 dws，先到「集成 → 钉钉」配置")
             return
+        if svc is None:
+            svc = assistant_mod.TagScanService(self.assistant)
+            self.assistant.scanner = svc
+        # 每轮扫描前清空增量缓存（② 的界面侧数据源）
+        self._im_scan_rows = {}
+        try:
+            self.page_assistant.list_tags.clear()
+            self.page_assistant._tag_by_id = {}
+        except Exception:
+            pass
         self.page_assistant.set_scan_state("正在读取钉钉会话列表…")
         self._im_scan_set(busy=True, i=0, n=0, name="",
                           message="正在读取钉钉会话列表…")
-        self._safe_asst_log("开始扫描全部会话并打标签（一次一个会话，会慢一些）")
+        self._safe_asst_log("开始扫描全部会话并打标签（可随时点「停止助理」中止）")
+        try:
+            svc.progress.disconnect()
+            svc.partial.disconnect()
+            svc.skipped.disconnect()
+            svc.done.disconnect()
+            svc.log.disconnect()
+        except Exception:
+            pass
+        svc.progress.connect(self._im_scan_progress)
+        svc.partial.connect(self._im_scan_partial)
+        svc.skipped.connect(
+            lambda nm: self._safe_asst_log("已跳过官方号：%s" % nm))
+        svc.done.connect(self._im_tag_scan_done)
+        svc.log.connect(self._safe_asst_log)
+        # ④ 全局胶囊：一开始就出现（读取列表阶段也要有反馈）
+        try:
+            self.scan_capsule.show_progress(0, 0, "正在读取会话列表…", 0.0)
+        except Exception:
+            pass
+        try:
+            max_convs = int(self.im_store.settings().get("scan_max_convs") or 0)
+        except Exception:
+            max_convs = 0
+        svc.start(self.im_store, self.ding, self._im_llm, max_convs=max_convs)
+        self._im_scan_thread = svc
 
-        outer = self
+    def _im_scan_stop(self, message="已停止"):
+        """停止标签扫描，并**立刻**把界面切回空闲态（不等后台线程收尾）。
 
-        class _ScanWorker(QThread):
-            progress = pyqtSignal(int, int, str)
-            done = pyqtSignal(dict)
+        用户要求：点停止后界面在 1.5 秒内可交互、按钮可用、进度消失。
+        后台的 dws 子进程可能还要几十毫秒~几秒才收尾，但界面绝不能等它 ——
+        ``scanner.stop()`` 只是置一个 Event，here 立即复位所有可见状态。
+        """
+        svc = getattr(self.assistant, "scanner", None)
+        was = False
+        try:
+            if svc is not None:
+                was = bool(svc.stop("已停止"))
+        except Exception:
+            was = False
+        self._im_scan_thread = None
+        try:
+            self.page_assistant.set_scan_state(str(message or "已停止"))
+        except Exception:
+            pass
+        self._im_scan_set(busy=False, message=str(message or "已停止"))
+        try:
+            self.scan_capsule.finish("已停止", seconds=2.0)
+        except Exception:
+            pass
+        # 已扫到的结果保留，不回滚 —— 只是不再继续
+        if was:
+            self._safe_asst_log(str(message or "已停止"))
 
-            def __init__(self, store, ding, llm, parent=None):
-                super().__init__(parent)
-                self.store = store
-                self.ding = ding
-                self.llm = llm
-                self.aborted = False
+    def _on_scan_capsule_stop(self):
+        """右上角胶囊的 ×：等价于点「停止助理」。"""
+        self._im_scan_stop("已停止")
+        # 如果轮询也在跑，一起停（用户点的就是「停止助理」）
+        try:
+            if self.assistant.running():
+                self.assistant.stop()
+        except Exception:
+            pass
 
-            def run(self):
-                try:
-                    from ..im import tags as _imtags
-                    res = _imtags.scan_and_tag(
-                        self.store, self.ding, self.llm,
-                        progress=lambda i, n, nm: self.progress.emit(int(i), int(n), str(nm)))
-                except Exception as exc:
-                    res = {"ok": False, "reason": f"{type(exc).__name__}: {exc}",
-                           "tagged": 0, "total": 0, "convs": []}
-                self.done.emit(res)
-
-        w = _ScanWorker(self.im_store, self.ding, self._im_llm, outer)
-        w.progress.connect(self._im_scan_progress)
-        w.done.connect(self._im_tag_scan_done)
-        self._im_scan_thread = w
-        w.start()
-
-    def _im_scan_progress(self, i, n, nm):
-        """扫描进度（扫描线程的 progress 信号 → Qt 页 + Web 页都显示）。"""
-        text = "正在扫描 %s/%s：%s" % (i, n, nm)
+    def _im_scan_progress(self, i, n, nm, speed=0.0):
+        """扫描进度（后台线程信号 → Qt 页 + Web 页 + 右上角胶囊）。"""
+        text = ("正在扫描 %s/%s：%s" % (i, n, nm)) if n else str(nm or "正在扫描…")
+        if speed:
+            text += " · %s" % assistant_mod.human_speed(speed)
         try:
             self.page_assistant.set_scan_state(text)
         except Exception:
             pass
         self._im_scan_set(busy=True, i=int(i), n=int(n), name=str(nm),
                           message=text)
+        try:
+            self.scan_capsule.show_progress(int(i), int(n), str(nm), float(speed or 0))
+        except Exception:
+            pass
+
+    def _im_scan_partial(self, row):
+        """② 增量结果：扫完一个会话就 append 一行，**不整表重建**。"""
+        row = dict(row or {})
+        cid = str(row.get("cid") or "")
+        if not cid:
+            return
+        self._im_scan_rows[cid] = row
+        page = getattr(self, "page_assistant", None)
+        if page is None:
+            return
+        lst = getattr(page, "list_tags", None)
+        tag_by = getattr(page, "_tag_by_id", None)
+        if lst is None or tag_by is None or not hasattr(page, "_tag_item"):
+            # 页面结构变了（兼容旧版）：退回整表刷新，功能不丢
+            try:
+                page.set_im_data(tags=list(self._im_scan_rows.values()))
+            except Exception:
+                pass
+            return
+        name = str(row.get("name") or cid)
+        kind = str(row.get("kind") or "group")
+        tag = str(row.get("tag") or "")
+        tag_by[cid] = {"id": cid, "name": name, "kind": kind, "tag": tag}
+        try:
+            # 已经渲染过（重扫）→ 原地改文字，不重复插入
+            for idx in range(lst.count()):
+                it = lst.item(idx)
+                if it is not None and str(it.data(Qt.ItemDataRole.UserRole)) == cid:
+                    it.setText(page._tag_item(cid, name, kind, tag).text())
+                    it.setData(Qt.ItemDataRole.UserRole + 1, tag)
+                    return
+            lst.addItem(page._tag_item(cid, name, kind, tag))
+        except Exception:
+            pass
 
     def _im_tag_scan_done(self, res):
         self._im_scan_thread = None
         res = dict(res or {})
+        stopped = bool(res.get("stopped"))
         if not res.get("ok"):
             reason = res.get("reason") or "未知原因"
-            self.page_assistant.set_scan_state(f"扫描失败：{reason}")
-            self._im_scan_set(busy=False,
-                              message="扫描失败：%s" % reason)
-            self._safe_asst_log(f"扫描失败：{res.get('reason')}")
+            try:
+                self.page_assistant.set_scan_state(f"扫描失败：{reason}")
+            except Exception:
+                pass
+            self._im_scan_set(busy=False, message="扫描失败：%s" % reason)
+            try:
+                self.scan_capsule.finish("扫描失败", seconds=2.5)
+            except Exception:
+                pass
+            self._safe_asst_log(f"扫描失败：{reason}")
             return
-        done_text = ("扫描完成：共 %s 个会话，打上 %s 个标签（拿不准的留空了，你可以自己改）"
-                     % (res.get("total"), res.get("tagged")))
-        self.page_assistant.set_scan_state(done_text)
-        self._im_scan_set(busy=False, i=int(res.get("total") or 0),
-                          n=int(res.get("total") or 0), message=done_text)
-        self._safe_asst_log(
-            "扫描完成：%s 个会话 / %s 个标签" % (res.get("total"), res.get("tagged")))
+        total = int(res.get("total") or 0)
+        tagged = int(res.get("tagged") or 0)
+        skipped = int(res.get("skipped") or 0)
+        if stopped:
+            done_text = ("已停止：已扫描 %s 个会话 / 打上 %s 个标签（结果已保留）"
+                         % (total, tagged))
+        else:
+            done_text = ("扫描完成：共 %s 个会话，打上 %s 个标签"
+                         "（拿不准的留空了，你可以自己改）" % (total, tagged))
+        if skipped:
+            done_text += "，已跳过 %s 个官方号" % skipped
         try:
-            self.im_store.set_settings(scanned=True)
+            self.page_assistant.set_scan_state(done_text)
         except Exception:
             pass
+        self._im_scan_set(busy=False, i=total, n=total, message=done_text)
+        if stopped:
+            # 停止时胶囊已经在 _im_scan_stop 里显示过「已停止」，这里别再闪一次
+            try:
+                if self.scan_capsule.is_busy():
+                    self.scan_capsule.finish("已停止 · 已保留 %d 条" % tagged,
+                                             seconds=2.0)
+            except Exception:
+                pass
+        else:
+            try:
+                self.scan_capsule.finish("扫描完成 · 共 %d 条" % tagged, seconds=2.0)
+            except Exception:
+                pass
+        self._safe_asst_log(
+            "扫描%s：%s 个会话 / %s 个标签 / 跳过官方号 %s 个"
+            % ("已停止" if stopped else "完成", total, tagged, skipped))
+        if not stopped:
+            try:
+                self.im_store.set_settings(scanned=True)
+            except Exception:
+                pass
         self._im_refresh_all()
 
     def _im_tag_saved(self, cid, tag):
@@ -6624,6 +7122,17 @@ class MainWindow(QMainWindow):
                 hub.observe(dict(msg, kind=msg.get("kind") or kind))
         except Exception as exc:
             self._safe_asst_log(f"消息落盘失败（不影响处理）：{type(exc).__name__}: {exc}")
+        # ★ v9.22.12：通知类消息（家长请假 / 调课 / 检查通知 / 会议…）→ 置顶 +
+        #   直接投到屏幕 + 必须点确认才关。
+        #   ⚠ 刻意放在 `auto_reply` 判断**之外**：代回开不开，主任都得看到这条。
+        #   `deliver()` 内部按 conv_id+msgid 去重，和 im_pipe.on_message 里那次
+        #   调用撞在一起也不会弹两次窗（只是 SQL 级去重，不是两条记录）。
+        try:
+            from ..im import notify_center as _ncs
+            _ncs.deliver_message(msg)
+        except Exception as exc:
+            self._safe_asst_log(
+                f"通知投递失败（不影响回复）：{type(exc).__name__}: {exc}")
         who = msg.get("conv") or msg.get("sender") or "钉钉"
         # 本方法在 IM/Stream 工作线程里跑：状态栏必须走信号（v9.22.4）
         self.status_flash.emit(
@@ -8753,9 +9262,37 @@ class MainWindow(QMainWindow):
         else:
             self._live_interval = max(140, min(400, int(cost_seconds * 1000 * 3)))
 
+    @staticmethod
+    def _parse_tool_desc(desc):
+        """把 ``tool_start`` 的描述拆成 ``(工具名, 参数)``。
+
+        chat_worker 的格式是 ``f"{name}  {json}"``（两个空格），
+        历史/其它通道也有 ``"name（args）"`` 的写法。
+        """
+        s = str(desc or "").strip()
+        if not s:
+            return "", None
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*[（(]([\s\S]*)[）)]\s*$", s)
+        if m:
+            return m.group(1), m.group(2)
+        m = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s+([\s\S]*)$", s)
+        if m:
+            raw = m.group(2).strip()
+            try:
+                return m.group(1), json.loads(raw)
+            except Exception:
+                return m.group(1), raw
+        return s.split("（")[0].split("(")[0].strip(), None
+
     def _on_tool_start(self, desc, cid=None):
         if cid is not None and not self._is_current(cid):
             return
+        # ★ v9.22.12（⑦）：记住这次调用的工具名 / 参数 / 开始时间，
+        #   结果回来时拼成「工具 / 参数 / 耗时 / 结果」的完整卡片正文 ——
+        #   否则卡片只有「工具」两个字，点开一片空白。
+        name, args = self._parse_tool_desc(desc)
+        self._tool_ctx = {"name": name, "args": args,
+                          "desc": str(desc or ""), "started": time.time()}
         # ★ v9.21.0 web 版：工具开始推给网页（工具胶囊）
         if self._web_engine and self._web_bridge is not None:
             self._web_bridge.send_tool_start(desc)
@@ -8777,13 +9314,25 @@ class MainWindow(QMainWindow):
             run.pending_tool.append({"role": "thinking", "content": _think})
         run.live_text = ""
         run.live_card = None
-        run.pending_tool.append({"role": "tool", "content": result})
+        # ★ v9.22.12（⑦）：把工具名 / 参数 / 耗时一起带进这条过程消息。
+        ctx = dict(getattr(self, "_tool_ctx", {}) or {})
+        try:
+            elapsed = max(0.0, time.time() - float(ctx.get("started") or 0.0))
+        except Exception:
+            elapsed = 0.0
+        entry = {"role": "tool", "content": result,
+                 "name": ctx.get("name") or "",
+                 "args": ctx.get("args"),
+                 "_elapsed": round(elapsed, 2) if elapsed > 0 else 0.0}
+        run.pending_tool.append(entry)
         self._live_touch(cid)      # ★ v9.22.8：工具过程也一起落盘
         if not self._is_current(cid):
             return
         # ★ v9.21.0 web 版：工具结果推给网页（工具胶囊收起）
         if self._web_engine and self._web_bridge is not None:
-            self._web_bridge.send_tool_result(result)
+            # 结构化正文（含工具名/参数/耗时/结果占位）—— 前端 <pre> 直接展示，
+            # 空结果也绝不会是一片空白。
+            self._web_bridge.send_tool_result(self._tool_card_text(entry, result))
             return
         self.statusBar().clearMessage()
         self._refresh_chips()
@@ -9121,6 +9670,54 @@ class MainWindow(QMainWindow):
         sb = self.chat_scroll.verticalScrollBar()
         if force or sb.value() >= sb.maximum() - 40:
             sb.setValue(sb.maximum())
+            self._follow_bottom = True
+
+    # ---------- ★ v9.22.12（⑥）：打开对话从最底部开始 ----------
+    def _on_chat_scrolled(self, value):
+        """用户滚到哪，决定之后流式追加要不要跟着滚（原有行为的显式化）。"""
+        try:
+            sb = self.chat_scroll.verticalScrollBar()
+            mx = sb.maximum()
+            # 内容还没铺开（max=0）时不能把「贴底」误判成 False，否则后续
+            # rangeChanged 的补贴底就失效了 —— 正好是「打开对话停在中间」的成因。
+            if mx <= 0:
+                self._follow_bottom = True
+                return
+            self._follow_bottom = int(value) >= mx - 40
+        except Exception:
+            pass
+
+    def _on_chat_range_changed(self, _minimum, maximum):
+        """内容高度变了：原来贴着底就继续贴着底（图片/代码块异步撑高后补一次）。"""
+        if getattr(self, "_restoring_history", False):
+            return
+        if not getattr(self, "_follow_bottom", False):
+            return
+        try:
+            sb = self.chat_scroll.verticalScrollBar()
+            sb.setValue(int(maximum))
+        except Exception:
+            pass
+
+    def _settle_bottom(self):
+        """再等一帧 + 一个小延时各补一次贴底。
+
+        为什么不能只 `QTimer.singleShot(0, ...)`：那一刻布局还没算完
+        （QTextBrowser 撑高、图片解码、字体 metrics 都在后面），
+        `maximum()` 还是旧值，滚不到真正的底。这里连补三次，最后一次
+        留 60ms 给异步撑高 —— 同时 `rangeChanged` 还会再兜一次。
+        """
+        sb = self.chat_scroll.verticalScrollBar()
+
+        def _again():
+            try:
+                sb.setValue(sb.maximum())
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _again)
+        QTimer.singleShot(0, _again)      # 套一层：等 Qt 处理完上一帧的布局事件
+        QTimer.singleShot(60, _again)
 
     def _card_key(self, msg, index, role):
         """折叠状态键：与会变动的下标解耦。
@@ -9181,14 +9778,23 @@ class MainWindow(QMainWindow):
             0, int(getattr(self, "_fold_n", 0) or 0) - CHAT_PAGE_SIZE)
         sb = self.chat_scroll.verticalScrollBar()
         self._pending_scroll_off = max(0, sb.maximum() - sb.value())
+        # ★ v9.22.12：往前翻历史期间禁止「贴底跟随」，否则内容变高会把人拽回底部
+        self._restoring_history = True
         self._render_full(stick=False)
 
     def _render_full(self, stick=None):
+        # ★ v9.22.12（⑥）：刚切换 / 打开一个对话 → 无条件从最底部开始，
+        #   不吃"当前是否贴底"（旧实现的判断基于上一个对话的滚动位置，
+        #   于是打开长对话经常停在中间）。
+        if getattr(self, "_stick_next_render", False):
+            stick = True
+            self._stick_next_render = False
         # 重建前先记住滚动状态：stick=True 强制贴底；否则沿用"当前是否贴底"。
         # 这就是「一发新消息就跳到最上面」的根因修复 —— 重建后延后一帧再恢复。
         sb = self.chat_scroll.verticalScrollBar()
         at_bottom = True if stick is True else (sb.value() >= sb.maximum() - 40)
         old_value = sb.value()
+        self._follow_bottom = bool(at_bottom)
 
         plan = (self.conv or {}).get("plan")
         display = list(self.conv.get("messages", [])) if self.conv else []
@@ -9348,8 +9954,20 @@ class MainWindow(QMainWindow):
         footer = ""
         if role == "assistant" and m.get("_model"):
             footer = "实际使用模型：" + m["_model"]
-        label = tool_label(content) if role == "tool" else None
-        stats = file_write_stats(content) if role == "tool" else None
+        if role == "tool":
+            # ★ v9.22.12（⑦）：展开后绝不能是空白。
+            #   老实现直接把 `content` 塞给卡片；一旦这条工具消息的 content 是空串
+            #   （或只有一句「[成功]」），展开后就是一片大白板，标题还只剩「工具」
+            #   两个字 —— 用户 2026-11-16 原话就是这个。
+            #   这里渲染时补一层结构化摘要（工具名 / 参数 / 状态 / 耗时 / 结果），
+            #   空项显式写「（无参数）」「（无输出）」，绝不静默留空。
+            raw_content = content or ""
+            content = self._tool_card_text(m, raw_content)
+            label = self._tool_card_label(m, raw_content)
+            stats = file_write_stats(raw_content)
+        else:
+            label = None
+            stats = None
         card = MessageCard.from_text(role, content, footer_text=footer,
                                      label=label, index=i,
                                      stats=stats, collapsed=collapsed,
@@ -9372,6 +9990,98 @@ class MainWindow(QMainWindow):
                 lambda collapsed, k=self._card_key(m, i, role):
                     self._card_collapsed.__setitem__(k, collapsed))
         return card
+
+    # ---------- ★ v9.22.12（⑦）：工具卡片绝不空白 ----------
+    @staticmethod
+    def _tool_name_from_content(content):
+        """从工具结果文本里尽力还原真实工具名（老历史消息没有 name 字段时用）。"""
+        s = str(content or "")
+        m = re.search(r"（系统已执行工具\s*([A-Za-z][A-Za-z0-9_]*)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"\[(?:成功|失败|跳过)\]\s*([A-Za-z][A-Za-z0-9_]*)\s", s)
+        if m:
+            return m.group(1)
+        m = re.match(r"\s*([A-Za-z][A-Za-z0-9_]*)\s*[（(]", s)
+        if m:
+            return m.group(1)
+        return ""
+
+    def _tool_card_label(self, m, content):
+        """工具卡片折叠时那一行标题：优先真实工具名 → 再退回内容推断。"""
+        name = str((m or {}).get("name") or (m or {}).get("tool") or "").strip()
+        if not name:
+            name = self._tool_name_from_content(content)
+        if name:
+            try:
+                verb = tool_verb(name)
+            except Exception:
+                verb = name
+            return "%s（%s）" % (verb, name) if verb != name else name
+        try:
+            return tool_label(content)
+        except Exception:
+            return "工具"
+
+    @staticmethod
+    def _pretty_args(args, limit=1200):
+        """参数美化：dict/list 走 JSON（保证中文不转义），其他按原样截断。"""
+        if args is None or args == "" or args == {} or args == []:
+            return "（无参数）"
+        try:
+            if isinstance(args, str):
+                s = args.strip()
+                if s[:1] in ("{", "["):
+                    try:
+                        return json.dumps(json.loads(s), ensure_ascii=False,
+                                          indent=2)[:limit]
+                    except Exception:
+                        return s[:limit]
+                return s[:limit]
+            return json.dumps(args, ensure_ascii=False, indent=2)[:limit]
+        except Exception:
+            return str(args)[:limit]
+
+    def _tool_card_text(self, m, content):
+        """把一条工具消息渲染成**一定有内容**的卡片正文。
+
+        结构：工具名 / 参数 / 状态 / 耗时 / 结果。任何一项为空都写占位
+        （``（无参数）`` / ``（无输出）``），绝不让展开区变成一片空白。
+        """
+        m = m or {}
+        raw = str(content or "")
+        name = str(m.get("name") or m.get("tool") or "").strip() \
+            or self._tool_name_from_content(raw)
+        args = m.get("args")
+        if args is None:
+            args = m.get("arguments")
+        status = "成功"
+        head = raw.lstrip()
+        for pre, txt in (("[错误]", "失败"), ("[拒绝]", "已拒绝"),
+                         ("[取消]", "已取消"), ("[跳过]", "已跳过"),
+                         ("[提示]", "提示"), ("[成功]", "成功")):
+            if head.startswith(pre):
+                status = txt
+                break
+        try:
+            secs = float(m.get("_elapsed") or m.get("elapsed") or 0)
+        except Exception:
+            secs = 0.0
+        lines = ["工具：%s" % (name or "（未记录工具名，可能是旧版本消息）"),
+                 "参数：%s" % self._pretty_args(args)]
+        if secs > 0:
+            lines.append("耗时：%.1f 秒" % secs)
+        lines.append("状态：%s" % status)
+        lines.append("")
+        lines.append("结果：")
+        # 去掉状态前缀，正文更好读（前缀信息已经在「状态」里了）
+        body = head
+        for pre in ("[成功]", "[提示]", "[跳过]", "[取消]", "[拒绝]", "[错误]"):
+            if body.startswith(pre):
+                body = body[len(pre):].lstrip()
+                break
+        lines.append(body if body.strip() else "（无输出）")
+        return "\n".join(lines)
 
     def _copy_msg(self, m):
         QGuiApplication.clipboard().setText(m.get("content") or "")
@@ -9409,12 +10119,17 @@ class MainWindow(QMainWindow):
         if off is not None:
             self._pending_scroll_off = None
             sb.setValue(max(0, sb.maximum() - int(off)))
+            self._restoring_history = False
             return
         at_bottom, old = getattr(self, "_pending_scroll", (True, 0))
         if at_bottom:
             sb.setValue(sb.maximum())
+            # ★ v9.22.12（⑥）：布局这一刻往往还没最终稳定，先补几帧，再靠
+            #   rangeChanged 兜底 —— 保证「打开对话就在底部」而不是停在中间。
+            self._settle_bottom()
         else:
             sb.setValue(min(old, max(sb.maximum(), 0)))
+        self._restoring_history = False
 
     def _stack_welcome(self):
         self._clear_chat()
@@ -9444,14 +10159,54 @@ class MainWindow(QMainWindow):
             self._open_workspace(dlg.selected)
 
     def closeEvent(self, event):
-        # ★ v9.22.8：真正退出前，把「正在生成但还没写完」的回复立刻落盘。
-        #   收进托盘不算退出（后台还在继续生成），所以只在真退出时做。
+        """关窗口 = **收进托盘**（默认）；真退出走托盘菜单「退出」/ 关掉托盘选项。
+
+        ★ v9.22.12：这个类以前把 `closeEvent` 定义了**两次**（Python 后定义覆盖
+          前一个），所以"收进托盘"那段从来没生效过 —— 点 X 直接退进程。后果：
+          设置里「关闭时收进托盘」是摆设、主任的定时任务当场全停、钉钉不再收消息。
+          现在全类只此一处，并且把"停服务"严格挪进**真退出**分支：
+          收进托盘时**任何后台服务都不停**（定时任务/热键/钉钉/自动回复继续跑）。
+
+        顺序有讲究，别乱动：
+            ① 先判断走哪条路（收托盘 / 真退）
+            ② 真退出才落盘半截回复（用户要求：没写完的回复也必须留住）
+            ③ 再停调度器并 save()（先 stop 再 save，避免两个线程同时写 tasks.json）
+            ④ 最后才是 DeepSeek 网页通道 / 托盘图标
+        """
+        quitting = bool(self._quit_requested) or not self.settings.get(
+            "tray_on_close", True)
+        if not quitting and self.tray is not None:
+            # ---- 收进托盘：后台服务一个都不停 ----
+            event.ignore()
+            self.hide()
+            try:
+                self.tray.showMessage(
+                    ver.APP_NAME, "已收进托盘，按 "
+                    + (self.settings.get("hotkey_show") or "Ctrl+Alt+Space")
+                    + " 随时叫回来。",
+                    QSystemTrayIcon.MessageIcon.Information, 4000)
+            except Exception:
+                pass
+            return
+
+        # ---- 真退出 ----
+        # ① 正在生成、还没写完的回复立刻落盘（收托盘不算退出，所以只在真退出做）
         try:
-            if (self._quit_requested
-                    or not self.settings.get("tray_on_close", True)):
-                self._live_flush_all(force=True)
+            self._live_flush_all(force=True)
         except Exception:
             pass
+        # ② 先停调度器再存盘：反过来的话调度线程可能正好在写同一个文件
+        try:
+            self.scheduler.stop()
+            self.scheduler.save()
+        except Exception:
+            pass
+        # ③ 热键 / 语音 / TTS / 钉钉流 / MCP
+        for hk in getattr(self, "hotkeys", []) or []:
+            try:
+                hk.stop()
+            except Exception:
+                pass
         try:
             self.speaker.stop()
         except Exception:
@@ -9468,7 +10223,38 @@ class MainWindow(QMainWindow):
             self.voice.cancel()
         except Exception:
             pass
-        super().closeEvent(event)
+        # ④ 通知中心：把还挂在屏幕上的弹窗收掉（别在退出动画里闪一下）
+        try:
+            nc = getattr(self, "notify_center", None)
+            if nc is not None:
+                nc.shutdown()
+        except Exception:
+            pass
+        # ⑤ 主任特供版：给保活留一个「用户是主动退出」的窗口，别退了又自己跳出来。
+        #    主版没有 director_runtime 这个模块 → ImportError 直接跳过。
+        try:
+            from .. import director_runtime as _drt      # noqa: WPS433
+            try:
+                _drt.set_pause(1800, self.workspace.path, reason="user_quit")
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # ⑥ DeepSeek 网页通道（停本机服务 / 断开 CDP / 关掉我们拉起的浏览器）
+        try:
+            self._dsw_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.dsw.shutdown()
+        except Exception:
+            pass
+        try:
+            if self.tray is not None:
+                self.tray.hide()
+        except Exception:
+            pass
+        event.accept()
 
 
 def _asr_ok(settings):

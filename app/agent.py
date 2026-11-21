@@ -19,6 +19,7 @@ import time
 import shlex
 import shutil
 import fnmatch
+import difflib
 import zipfile
 import tempfile
 import subprocess
@@ -145,6 +146,18 @@ TOOL_ALIAS = {
     "batch_form": "web_form_batch", "query_site": "web_form_batch",
     "批量查询": "web_form_batch", "网站查询": "web_form_batch",
     "gh": "github", "github_api": "github", "git_hub": "github",
+    # ★ v9.22.x：模型实测爱写的高频错名（会直接让这一轮"什么也没干"）
+    #   · git_clone：没有这个工具，git 操作统一走 git_op；
+    #     真要 clone 就落回 run_command（`git clone …`）。
+    #   · run_str / run_str_cmd：想跑字符串命令 -> run_command
+    #   · run_py / python_run：其实就是 run_python
+    #   · write_file_by_python：模型想"用 Python 写文件" -> 还是 write_file
+    "git_clone": "run_command",
+    "run_str": "run_command", "run_str_cmd": "run_command",
+    "exec_command": "run_command", "shell_exec": "run_command",
+    "run_py": "run_python", "python_run": "run_python",
+    "run_python_code": "run_python",
+    "write_file_by_python": "write_file", "write_by_python": "write_file",
     # 并行后台任务 + 团队（模型爱用的各种叫法）
     "background": "run_bg", "run_background": "run_bg", "bg": "run_bg",
     "async_run": "run_bg", "run_async": "run_bg", "parallel": "run_bg",
@@ -448,7 +461,13 @@ def _degraded_call(text):
 # 不加这层兜底，模型「想调 run_python 却调不动」，收尾时就会假装已执行 ——
 # 正是用户最反感的「看着干完了、其实没验」。
 # ---------------------------------------------------------------------------
-_DSML_BAR = "[｜|]"
+# ⚠ 实测模型（DeepSeek 系）吐出来的是**两根**竖线：`<｜｜DSML｜｜ calls>`，
+#   也有三根 / 半角单根的写法。这里必须 `{1,3}` ——
+#   早先写的 `[｜|]` 只认单根，于是整段 DSML 一条都解析不出来：
+#   `_dsml_calls()` 返回 [] → 这一轮"没有工具调用" → 模型整段输出被当成
+#   最终答复 → DSML 原文进了聊天正文和钉钉消息；参数也全丢（write_file
+#   只拿到 path 拿不到 content）。`app/team_presets.py` 早就用的 `{1,3}`。
+_DSML_BAR = "[｜|]{1,3}"
 _DSML_INVOKE_RE = re.compile(
     r"<\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR +
     # ⚠ 工具名首字符必须允许 Unicode：TOOL_ALIAS 里有中文别名（"打包"/"打包exe"/
@@ -488,9 +507,13 @@ def _dsml_calls(text):
         return []
     out = []
     for m in _DSML_INVOKE_RE.finditer(text):
-        name = _dsml_name(m.group(1))
-        if name not in KNOWN_TOOLS:
-            continue          # 不是已知工具就别认，免得把普通文本误当调用
+        raw_name = (m.group(1) or "").strip()
+        name = _dsml_name(raw_name)
+        # ★ 未知工具名**绝不静默丢弃**（v9.22.x）。
+        #   实测模型会写 git_clone / run_str 这类不存在的工具名；以前这里 continue，
+        #   于是整段 DSML 解析结果变空 → 这一轮"没有工具调用" → 模型那段 DSML
+        #   被当成最终答复直接发给用户。现在原样保留，交给 AgentRunner._dispatch：
+        #   能按别名 / 模糊匹配纠正的就执行，纠正不了就回一条明确的「未知工具」回执。
         args = {}
         for pm in _DSML_PARAM_RE.finditer(m.group(2) or ""):
             key = pm.group(1).strip()
@@ -510,8 +533,145 @@ def _dsml_calls(text):
         # 有的模型仍套一层 {"arguments": {...}} 壳 —— 拆开合并
         if len(args) == 1 and isinstance(args.get("arguments"), dict):
             args = args["arguments"]
-        out.append({"name": name, "arguments": args})
+        entry = {"name": name, "arguments": args}
+        # 名字被归一过（别名 / 大小写 / 连字符）→ 记下原名，工具回执里要注明
+        # 「已按 xxx 纠正」，让模型知道自己写歪了，下一轮别再写错。
+        if raw_name and name != raw_name:
+            entry["_corrected_from"] = raw_name
+        out.append(entry)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 「把 DSML 标记从正文里彻底剔掉」的唯一实现（v9.22.x）。
+#
+# 用户报障原话：生成的回复正文里出现大批 `<｜｜DSML｜｜ calls>` /
+# `<｜｜DSML｜｜ invoke name="dingtalk_push">` / `<｜｜DSML｜｜ parameter …>`，
+# 而且这些标签**直接发进了钉钉消息**。
+#
+# 背景：`_dsml_calls()` 认 DSML 是为了**执行**工具；但模型把同一段标记
+# 也原样留在了正文里。解析成功后如果没有工具可执行（或改名失败），这段
+# 正文就是"最终答复"，标签顺着 聊天窗口 → 钉钉 一路交付给用户。
+#
+# 约束：
+#   · 只处理 DSML 标记，**不碰正文、不碰代码块**，也不剥团队专属文案
+#     （那部分在 team_presets.strip_team_noise 里，本函数不掺和）；
+#   · 单根 / 双根 / 三根竖线都认，大小写不敏感；
+#   · 闭合缺失时一路吃到文末，防半截标记漏网。
+# ---------------------------------------------------------------------------
+_DSML_TAG_HEAD = r"<\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*"
+_DSML_TAG_TAIL = r"<\s*/\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*"
+
+# 整块：<…DSML… calls> … </…DSML… calls>（闭合缺失时吃到文末）
+_DSML_STRIP_CALLS_RE = re.compile(
+    _DSML_TAG_HEAD + r"calls\s*>.*?(?:" + _DSML_TAG_TAIL + r"calls\s*>|\Z)",
+    re.DOTALL | re.IGNORECASE)
+# 单条 invoke（calls 闭合丢了时剩下的残块）
+_DSML_STRIP_INVOKE_RE = re.compile(
+    _DSML_TAG_HEAD + r"invoke\b[^>]*>.*?(?:"
+    + _DSML_TAG_TAIL + r"invoke\s*>|\Z)",
+    re.DOTALL | re.IGNORECASE)
+# 单条 parameter（invoke 闭合也丢了时的残块）。遇到下一个开标签就停，
+# 免得把后面的正文一起吃掉。
+_DSML_STRIP_PARAM_RE = re.compile(
+    _DSML_TAG_HEAD + r"parameter\b[^>]*>.*?(?:"
+    + _DSML_TAG_TAIL + r"parameter\s*>|(?=" + _DSML_TAG_HEAD + r")|\Z)",
+    re.DOTALL | re.IGNORECASE)
+# 孤立开 / 闭标签本身（含 calls / invoke / parameter 等字样）
+_DSML_STRIP_TAG_RE = re.compile(
+    r"<\s*/?\s*" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*[A-Za-z_]*\s*/?>",
+    re.IGNORECASE)
+# 被截断的残片（没有 '>' 收尾，模型输出到一半就断了）——从标记处吃到文末
+_DSML_STRIP_DANGLING_RE = re.compile(
+    r"<\s*/?\s*" + _DSML_BAR + r"\s*DSML.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def strip_dsml(text):
+    """把 DeepSeek DSML 工具调用标记从一段正文里彻底删掉。
+
+    任何会变成「给用户看的最终文本」的出口都必须过一遍这里（聊天正文、
+    钉钉消息、团队产出、子代理产出）。只删 DSML 标记，正文其余内容原样保留。
+
+    Args:
+        text: 原始文本（可能是 None）。
+
+    Returns:
+        清掉 DSML 标记后的文本；不含 DSML 字样时**原样返回**（不做 strip）。
+    """
+    if not text:
+        return ""
+    s = str(text)
+    if "dsml" not in s.lower():
+        return s
+    before = s
+    s = _DSML_STRIP_CALLS_RE.sub("", s)
+    s = _DSML_STRIP_INVOKE_RE.sub("", s)
+    s = _DSML_STRIP_PARAM_RE.sub("", s)
+    s = _DSML_STRIP_TAG_RE.sub("", s)
+    s = _DSML_STRIP_DANGLING_RE.sub("", s)
+    # ⚠ 一个字都没删就原样返回：正文里只是提到 "DSML" 这个词（比如代码块）
+    #   时，绝不能顺手改它的空白 / 缩进。
+    if s == before:
+        return s
+    return s.strip()
+
+
+# ---------------------------------------------------------------------------
+# 工具名写歪时的纠正 / 可执行回执（v9.22.x）
+#
+# 实测模型会写 `git_clone` / `run_str` / `run_py` / `write_file_by_python`
+# 这类不存在的名字。老实现遇到不在 KNOWN_TOOLS 的名字直接 `continue`，
+# 模型以为"调过了"，用户看到的是"说要做、一步没做"。
+# ---------------------------------------------------------------------------
+def fuzzy_tool_name(name, cutoff=0.75):
+    """把模型写歪的工具名纠正成 KNOWN_TOOLS 里的真实工具名。
+
+    Args:
+        name: 模型给的工具名（可能是别名 / 近似名 / 大小写混写）。
+        cutoff: difflib 相似度阈值，默认 0.75（够严，不会瞎猜）。
+
+    Returns:
+        纠正后的真实工具名；纠正不了返回 ""。
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower().replace("-", "_")
+    if low in KNOWN_TOOLS:
+        return low
+    alias = TOOL_ALIAS.get(low) or TOOL_ALIAS.get(raw)
+    if alias in KNOWN_TOOLS:
+        return alias
+    hit = difflib.get_close_matches(low, list(KNOWN_TOOLS), n=1, cutoff=cutoff)
+    return hit[0] if hit else ""
+
+
+# 报错回执里**永远**要出现的常用工具清单。
+# 为什么固定一小段而不是把 KNOWN_TOOLS 全列上：全列有 78 个，塞进工具结果会把
+# 上下文撑爆（这个回执每轮都会回灌给模型）；但只给「最接近的候选」又不够——
+# 模型经常需要的是另一个方向的工具（要写文档却编了个 doc_maker），看不到就继续瞎猜。
+# 因此这里固定给一组高频入口，两端都覆盖到，剩下的靠候选名。
+_COMMON_TOOLS_HINT = ("read_file、write_file、edit_lines、list_dir、"
+                      "create_document、use_skill、run_python、run_command、"
+                      "web_search、schedule_task")
+
+
+def unknown_tool_message(name):
+    """未知工具名的**可执行回执**：给出最接近的候选 + 固定常用清单，让模型自救重试。"""
+    raw = (name or "").strip() or "（空名字）"
+    low = raw.lower().replace("-", "_")
+    # cutoff 0.4 是刻意放宽的：编造名往往只差一两个字母（git_clone / run_str），
+    # 太严就等于什么都没给。宁可多给几个不相关的候选，也别让模型无路可走。
+    cands = [c for c in difflib.get_close_matches(low, list(KNOWN_TOOLS),
+                                                  n=3, cutoff=0.4)
+             if c]
+    if cands:
+        return (f'[错误] 未知工具 "{raw}"。可用工具里最接近的是：'
+                f'{"、".join(cands)}。常用工具还包括：{_COMMON_TOOLS_HINT}。'
+                f'请从 KNOWN_TOOLS 里选一个重试。')
+    return (f'[错误] 未知工具 "{raw}"。没有找到足够接近的工具。'
+            f'常用工具：{_COMMON_TOOLS_HINT}。'
+            f'请从 KNOWN_TOOLS 里选一个重试。')
 
 
 # ---------------------------------------------------------------------------
@@ -562,10 +722,15 @@ TOOL_BODY_RE = re.compile(
 
 
 def strip_tool_text(text):
-    """把所有工具调用标记从一段文字里去掉，返回剩下的正文（已 strip）。"""
+    """把所有工具调用标记从一段文字里去掉，返回剩下的正文（已 strip）。
+
+    ★ v9.22.x：DSML 标记也在这里一并剥掉。以前只剥 <tool_call>，模型吐的
+      `<｜｜DSML｜｜ invoke …>` 会原样留在正文里（子代理产出 / 界面最终答复都中招）。
+    """
     if not text:
         return ""
-    return TOOL_BODY_RE.sub("", TOOL_BLOCK_RE.sub("", str(text))).strip()
+    s = strip_dsml(str(text))
+    return TOOL_BODY_RE.sub("", TOOL_BLOCK_RE.sub("", s)).strip()
 
 
 def _xmlarg_value(raw):
@@ -590,8 +755,8 @@ def _xmlarg_calls(text):
     out = []
     for m in _XMLARG_CALL_RE.finditer(text):
         name = _dsml_name(m.group(1))
-        if name not in KNOWN_TOOLS:
-            continue          # 不是已知工具就别认，免得把普通文本误当调用
+        # ★ 未知工具名不要 continue（v9.22.x）：静默丢弃会让模型以为"调过了"。
+        #   原样保留，交给 AgentRunner._dispatch 走模糊纠正 / 明确错误回执。
         args = {}
         for pm in _XMLARG_PAIR_RE.finditer(m.group(2) or ""):
             key = (pm.group(1) or "").strip()
@@ -610,7 +775,7 @@ def _xmlarg_calls(text):
         return out
     for m in _XMLARG_BARE_RE.finditer(text):
         name = _dsml_name(m.group(1))
-        if name not in KNOWN_TOOLS:
+        if not name:
             continue
         obj = _loads_lenient((m.group(2) or "").strip())
         if isinstance(obj, dict):
@@ -619,7 +784,8 @@ def _xmlarg_calls(text):
         return out
     for m in _XMLARG_NOARG_RE.finditer(text):
         name = _dsml_name(m.group(1))
-        if name in KNOWN_TOOLS:
+        if name:
+            # 零参数也保留未知名字：写错工具名时要能回一条明确的错误回执
             out.append({"name": name, "arguments": {}})
     return out
 
@@ -2999,6 +3165,11 @@ class AgentRunner:
         t = TOOL_ALIAS.get(low)
         if t:
             return t
+        # ★ v9.22.x：写歪的名字（git_clone / run_str…）也归一成真实工具名，
+        #   让界面 / 日志记录的是"实际执行的到底是谁"。
+        fz = fuzzy_tool_name(raw)
+        if fz:
+            return fz
         try:
             if self.skills.find(raw):
                 return "use_skill"
@@ -3016,6 +3187,14 @@ class AgentRunner:
             args = {}
         t0 = time.time()
         out = self._dispatch(name, args, confirm_cb)
+        # ★ v9.22.x：解析阶段把写歪的名字纠正过来时，回执里必须说清楚。
+        #   否则模型会以为自己调的是原来那个名字，下一轮继续写错。
+        #   ⚠ 注意**追加在末尾**，不能加在开头：上层有
+        #     `result.startswith("[成功]")` 判定 write_done 的逻辑，
+        #     在开头插一段提示会把"真的写成功了"误判成没写。
+        _orig = str(call.get("_corrected_from") or "").strip()
+        if _orig and _orig != name:
+            out = (f"{out}\n（提示：工具名「{_orig}」已按「{name}」纠正后执行。）")
         try:
             self.trace.add(
                 self.canonical_name(name), args, out,
@@ -3512,7 +3691,12 @@ class AgentRunner:
                 raw = _sec.normalize_path(raw) or raw
                 # 末尾带分隔符（out/、out\）说明把它当目录用了，直接拒绝，
                 # 否则会造出一个名叫 out 的文件，把后面所有 out/xxx 都堵死
-                if (not raw or raw == "." or _dir_like or raw.endswith(("/", "\\"))):
+                if not raw:
+                    # ★ v9.22.x：path 也缺就别猜，明确报错（绝不写文件）。
+                    return ("[错误] write_file 失败：缺少 path 参数。"
+                            "请重新调用，arguments 里必须同时包含 path 和 content"
+                            "（例：{\"path\":\"out/a.txt\",\"content\":\"这里是正文\"}）。")
+                if raw == "." or _dir_like or raw.endswith(("/", "\\")):
                     return (f"[错误] path 必须是一个文件名，不能是目录：{raw!r}。"
                             f"例：out/deep.txt 或 桌面\\a.txt")
                 if os.path.isabs(raw) or os.path.splitdrive(raw)[0]:
@@ -3546,7 +3730,11 @@ class AgentRunner:
                 #   所以这里做**最后一道硬闸**：内容为空就拒绝 + 明确告诉它怎么补。
                 #   宁可让模型多跑一轮，也绝不落一个空文件。
                 content = None
-                for _k in ("content", "text", "body", "data", "code", "source"):
+                # ★ v9.22.x：模型写 content 的名字五花八门（text / body / code /
+                #   data / contents / source 都见过）。任意一个出现都当正文，
+                #   不能因为叫法不同就把整篇内容丢掉。
+                for _k in ("content", "contents", "text", "body",
+                           "data", "code", "source"):
                     _v = args.get(_k)
                     if isinstance(_v, str) and _v.strip():
                         content = _v
@@ -3568,7 +3756,9 @@ class AgentRunner:
                     else:
                         _why = "content 是空字符串"
                     return (
-                        f"[错误] 我**没有写入** {path}：{_why}{_old}。\n"
+                        f"[错误] write_file 失败：缺少 content 参数"
+                        f"（只收到 path={path}）。我**没有写入**这个文件：{_why}{_old}。\n"
+                        "请重新调用，arguments 里必须同时包含 path 和 content。\n"
                         "空文件是有害的，所以宁可让你重发一次也不落盘。\n"
                         "请二选一重发：\n"
                         "  · 一步写完（内容短、没有换行麻烦）：\n"
@@ -4100,10 +4290,14 @@ class AgentRunner:
                     return f"[错误] 无法创建临时脚本：{e}"
                 try:
                     try:
-                        to = float(args.get("timeout") or 60)
+                        # ★ v9.22.x：默认 60 → 120 秒（用户实测 60 秒把正常的长任务掐断），
+                        #   上限 300 → 600 秒（真慢的脚本让它能一次跑完，别逼模型反复重试），
+                        #   下限 5 → 10 秒（太短连解释器启动都不够）。
+                        #   ⚠ 仍然是**有限**等待，绝不改成无限等。
+                        to = float(args.get("timeout") or 120)
                     except Exception:
-                        to = 60
-                    to = max(5, min(to, 300))
+                        to = 120.0
+                    to = max(10, min(to, 600))
                     # ★ 把工作目录塞进 PYTHONPATH。
                     #   代码是「先写成 %TEMP% 下的临时 .py 再执行」的，所以
                     #   sys.path[0] 是 %TEMP% 而**不是**工作目录 ——
@@ -4127,7 +4321,9 @@ class AgentRunner:
                             + f"退出码：{_rc}\n输出：\n```\n{out}\n```"
                             + _rc_hint(_rc, out))
                 except subprocess.TimeoutExpired:
-                    return "[错误] Python 代码执行超时"
+                    return (f"[错误] Python 代码执行超时（已等 {int(to)} 秒）。\n"
+                            "可以在 arguments 里加 `timeout`（最大 600）再试一次；"
+                            "如果是长循环，建议改用 run_bg 后台跑，再用 bg_status 查结果。")
                 except Exception as e:
                     return f"[错误] Python 代码执行失败：{e}"
                 finally:
@@ -5056,11 +5252,28 @@ class AgentRunner:
 
             else:
                 low = (name or "").lower().replace("-", "_")
-                target = TOOL_ALIAS.get(low)
+                target = TOOL_ALIAS.get(low) or fuzzy_tool_name(name)
                 if target and target != name:
+                    # git_clone 的真实参数是 url/path，而 run_command 要 command ——
+                    # 顺手翻译一次，别让模型因为"参数键不同"又空转一轮。
+                    call_args = dict(args)
+                    if low == "git_clone" and not str(
+                            call_args.get("command") or "").strip():
+                        url = str(call_args.get("url") or call_args.get("repo")
+                                  or call_args.get("repository") or "").strip()
+                        if url:
+                            dest = str(call_args.get("path") or call_args.get("dir")
+                                       or call_args.get("dest")
+                                       or call_args.get("target") or "").strip()
+                            cmd = "git clone " + '"' + url.replace('"', '') + '"'
+                            if dest:
+                                cmd += ' "' + dest.replace('"', '') + '"'
+                            call_args = {"command": cmd}
                     # 走 execute() 而不是 _dispatch()，让追踪日志记下"实际执行的是谁"
-                    return self.execute({"name": target, "arguments": args},
-                                        confirm_cb)
+                    res = self.execute({"name": target, "arguments": call_args},
+                                       confirm_cb)
+                    # 追加在末尾（不能加开头：上层用 startswith("[成功]") 判写入成功）
+                    return (f"{res}\n（提示：工具名「{name}」已按「{target}」纠正后执行。）")
                 # 名字像某个技能（slug 或技能名）-> 自动换成 use_skill 取步骤
                 try:
                     s = self.skills.find(name)
@@ -5070,10 +5283,9 @@ class AgentRunner:
                     return self.execute(
                         {"name": "use_skill", "arguments": {"name": s["slug"]}},
                         confirm_cb)
-                names = ", ".join(sorted(KNOWN_TOOLS))
-                return (f"[错误] 未知工具：{name}。可用工具只有：{names}。"
-                        f"请从这份清单里挑一个重新调用。"
-                        f"如果要做的是某个技能的流程，用 use_skill 传技能名。")
+                # ★ v9.22.x：纠不出来也必须回一条**可执行**的错误回执 ——
+                #   以前直接 continue（在解析阶段）等于什么都没发生，模型以为调过了。
+                return unknown_tool_message(name)
         except ValueError as e:
             return f"[错误] {e}"
         except Exception as e:

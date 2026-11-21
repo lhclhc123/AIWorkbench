@@ -45,6 +45,7 @@ IM 助手是在后台线程里等模型回话的。一旦模型端点卡住，**
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,119 @@ def _log(msg):
         fn(str(msg))
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# ★ v9.22.12：外发前的清洗（DSML / 工具调用 / 模型自称前缀）
+# ---------------------------------------------------------------------------
+# 背景：模型（尤其 DeepSeek / SCNet）偶尔会把**工具调用语法**原样写进正文，
+# 或者以「助手：」「AI：」开头。这些东西一旦被当成回复发到钉钉群里，
+# 主任的脸就丢大了 —— 所以在 `replyproc` 把 text 交出去之前统一剥掉。
+#
+# 顺序很重要：**先清洗，再判置信度**（调用方拿到的一定是干净正文）。
+# 本节的清洗是**幂等**的，对干净文本零改动（探针会断言中文/emoji 原样往返）。
+_DSML_SEP = r"[｜|]{1,3}"
+_DSML_HEAD = r"<\s*" + _DSML_SEP + r"\s*DSML\s*" + _DSML_SEP + r"\s*"
+_DSML_TAIL = r"<\s*/\s*" + _DSML_SEP + r"\s*DSML\s*" + _DSML_SEP + r"\s*"
+
+# 整块 DSML（闭合缺失时吃到文末，避免半截标记漏网）
+_DSML_BLOCK_PATTERNS = (
+    re.compile(_DSML_HEAD + r"calls\b[^>]*>.*?(?:" + _DSML_TAIL + r"calls\s*>|\Z)",
+               re.I | re.S),
+    re.compile(_DSML_HEAD + r"invoke\b[^>]*>.*?(?:" + _DSML_TAIL + r"invoke\s*>|\Z)",
+               re.I | re.S),
+    re.compile(_DSML_HEAD + r"parameter\b[^>]*>.*?(?:" + _DSML_TAIL + r"parameter\s*>"
+               r"|(?=" + _DSML_HEAD + r")|\Z)", re.I | re.S),
+)
+# 孤立的开/闭标签：<｜DSML｜ calls> / </｜DSML｜ invoke>
+_DSML_TAG = re.compile(_DSML_HEAD + r"[A-Za-z_]*\s*/?>", re.I)
+_DSML_TAG_CLOSE = re.compile(r"<\s*/\s*" + _DSML_SEP + r"\s*DSML\s*" + _DSML_SEP
+                             + r"\s*[A-Za-z_]*\s*>", re.I)
+# 被截断的残片（没有 '>' 收尾）—— 从标记处吃到文末
+_DSML_DANGLING = re.compile(r"<\s*" + _DSML_SEP + r"\s*DSML.*\Z", re.I | re.S)
+
+# 通用工具调用残留（OpenAI/Qwen 风格）
+_TOOL_BLOCK = re.compile(r"<\s*tool_call\b[^>]*>.*?(?:<\s*/\s*tool_call\s*>|\Z)",
+                         re.I | re.S)
+_TOOL_TAG = re.compile(r"<\s*/?\s*tool_call\b[^>]*>", re.I)
+_ARG_BLOCK = re.compile(r"<\s*arg_(?:key|value)\b[^>]*>.*?"
+                        r"(?:<\s*/\s*arg_(?:key|value)\s*>|(?=<\s*arg_)|"
+                        r"<\s*/\s*tool_call\s*>|\Z)", re.I | re.S)
+_ARG_TAG = re.compile(r"<\s*/?\s*arg_(?:key|value)\b[^>]*>", re.I)
+
+# 模型自称前缀（只剥开头那一小段，不动正文）
+_SPEAKER_PREFIX = re.compile(
+    r"^\s*(?:助手|AI助手|AI|ai|人工智能|小助手|机器人|回复|答复|回答|答)\s*[:：]\s*")
+# 「拿不准」哨兵：绝不能原样发出去
+_UNCERTAIN_LITERAL = "[[UNCERTAIN]]"
+
+
+def _strip_dsml_local(text):
+    """本地兜底：`app.agent.strip_dsml` 还没落地时用这套正则。"""
+    s = str(text or "")
+    for pattern in _DSML_BLOCK_PATTERNS:
+        s = pattern.sub("", s)
+    s = _DSML_TAG.sub("", s)
+    s = _DSML_TAG_CLOSE.sub("", s)
+    s = _DSML_DANGLING.sub("", s)
+    return s
+
+
+def _strip_dsml(text):
+    """优先用 `app.agent.strip_dsml`（全项目统一口径）；拿不到就退回本地正则。
+
+    延迟导入的原因：`app.agent` 只应在真正出现 '<' 时被拖进来 —— 绝大多数回复
+    一个 '<' 都没有，没必要为它多付一次 import 开销（子进程尤其在意启动时间）。
+    """
+    s = str(text or "")
+    if "<" not in s and "｜" not in s and "DSML" not in s.upper():
+        return s
+    try:
+        from app.agent import strip_dsml as _agent_strip   # 同事正在加；没有就兜底
+        out = _agent_strip(s)
+        if isinstance(out, str):
+            return out
+    except Exception:
+        pass
+    return _strip_dsml_local(s)
+
+
+def sanitize_reply(text):
+    """★ 外发前的最后一道清洗：DSML / 工具调用 / 参数标签 / 模型自称前缀。
+
+    纯函数、幂等；**干净文本原样返回**（探针会断言中文 + emoji 不被改动）。
+
+    Args:
+        text: 模型产出的原始正文。
+
+    Returns:
+        可直接发到钉钉的正文（可能为空字符串）。
+    """
+    s = str(text or "")
+    if not s:
+        return ""
+
+    # 1) DSML（优先复用 app.agent.strip_dsml）
+    s = _strip_dsml(s)
+    # 2) 通用工具调用残留（整块优先，再清孤立标签）
+    s = _TOOL_BLOCK.sub("", s)
+    s = _TOOL_TAG.sub("", s)
+    s = _ARG_BLOCK.sub("", s)
+    s = _ARG_TAG.sub("", s)
+    # 3) 「拿不准」哨兵绝不外发（调用方会根据空正文走兜底）
+    s = s.replace(_UNCERTAIN_LITERAL, "")
+    s = re.sub(r"\[\[\s*UNCERTAIN\s*\]\]", "", s, flags=re.I)
+    # 4) 模型自称前缀（可能连着写好几层，最多剥 3 次）
+    for _ in range(3):
+        newer = _SPEAKER_PREFIX.sub("", s, count=1)
+        if newer == s:
+            break
+        s = newer
+    # 5) 空白归一（只做"去行尾空白 / 压掉多余空行"，不动正文本身的对齐）
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 
 def _project_root():
@@ -313,7 +427,10 @@ def worker_main(req_path) -> int:
             text = _fake_call(str(extra["_test_fake"]))
         else:
             text = _real_call(messages, model, timeout)
-        res = {"ok": True, "text": text if isinstance(text, str) else str(text),
+        # ★ v9.22.12：模型原始输出先清洗再落盘 —— 保证拿到 resp.json 的任何调用方
+        #   都不可能把 DSML / 工具调用 / 「助手：」前缀发到钉钉里。
+        clean = sanitize_reply(text if isinstance(text, str) else str(text))
+        res = {"ok": True, "text": clean,
                "error": "", "ms": round((time.perf_counter() - t0) * 1000.0, 1),
                "pyqt_loaded": _pyqt_loaded()}
     except Exception as e:
@@ -491,7 +608,9 @@ def request(messages, model="glm-4-flash", timeout=180, extra=None) -> dict:
         if not isinstance(res, dict):
             return done(False, error="结果文件格式不对")
         if res.get("ok"):
-            return done(True, text=res.get("text") or "")
+            # ★ v9.22.12：父进程再洗一次（幂等）。这样即使子进程是旧版本
+            #   （打包后 exe 未更新 / 探针直接调 worker_main），外发正文也干净。
+            return done(True, text=sanitize_reply(res.get("text") or ""))
         return done(False, error=res.get("error") or "子进程返回失败（无原因）")
     except Exception as e:      # 兜底：这条路径上任何意外都不该炸到调用方
         _log("replyproc.request 异常：%s: %s" % (type(e).__name__, e))
